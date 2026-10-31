@@ -26,6 +26,7 @@ dev = [
     "pytest",
     "pytest-asyncio",
     "pytest-cov",
+    "respx",
     "ruff==0.6.0",
     "mypy",
     "pre-commit",

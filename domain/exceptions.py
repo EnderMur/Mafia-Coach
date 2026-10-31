@@ -17,3 +17,11 @@ class RolesConfigError(ConfigError):
 
 class UnknownRoleError(DomainError):
     """Raised when a role identifier is not registered."""
+
+
+class LLMError(DomainError):
+    """Raised when the language-model layer fails."""
+
+
+class LLMConnectionError(LLMError):
+    """Raised when the language-model service cannot be reached."""
