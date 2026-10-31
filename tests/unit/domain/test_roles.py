@@ -82,7 +82,7 @@ def test_role_is_frozen() -> None:
     """Role attributes cannot be reassigned after construction."""
     role = load_real_roles().all_roles()[0]
     with pytest.raises(ValidationError):
-        role.name_ru = "Изменение"  # type: ignore[misc]
+        role.name_ru = "Изменение"
 
 
 @pytest.mark.parametrize(
