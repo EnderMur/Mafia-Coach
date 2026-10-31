@@ -210,23 +210,23 @@ roles:
     name_ru: "Дон"
     faction: mafia
     category: active
-    night_actions: [kill, check_commissioner]
+    night_actions: [kill]
     can_kill: true
-    can_check: true
+    can_check: false
     can_heal: false
-    notes: "Решает, кто стреляет. Обычно ведёт себя как активный мирный."
-    bot_aliases: ["Дон", "Дон мафии"]
+    notes: "Выбирает, кто умрёт этой ночью от Мафии."
+    bot_aliases: ["Дон"]
 
   - id: commissioner
     name_ru: "Комиссар Каттани"
     faction: town
     category: active
-    night_actions: [check]
+    night_actions: [check, kill]
     can_kill: true        # выстрел по результатам проверки
     can_check: true
     can_heal: false
-    notes: "Стреляет после проверки. Не должен стрелять без проверки."
-    bot_aliases: ["Комиссар Каттани", "Комиссар"]
+    notes: "Стреляет после проверки."
+    bot_aliases: ["Комиссар Каттани", "Комиссар", "Каттани"]
 
   - id: civilian
     name_ru: "Мирный житель"
@@ -236,7 +236,7 @@ roles:
     can_kill: false
     can_check: false
     can_heal: false
-    notes: "Голосует днём, ночью спит."
+    notes: "Голосует днём, ночью спит. Часто прикрытие для Мафии и Убийцы."
     bot_aliases: ["Мирный житель", "Мирный"]
 ```
 

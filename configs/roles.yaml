@@ -1,0 +1,340 @@
+# Полный список ролей клуба. Источник: rules/Mafia_rules.txt.
+# Поля обязательны (кроме notes) — см. README.md §3.2.
+
+roles:
+  # ===== Мирные (10) =====
+
+  - id: commissioner
+    name_ru: "Комиссар Каттани"
+    faction: town
+    category: active
+    night_actions: [check, kill]
+    can_kill: true
+    can_check: true
+    can_heal: false
+    notes: >
+      Стреляет после проверки. Не убивает Убийцу. При проверке Убийцы и
+      защищённого Адвокатом показывает 'Мирный житель'. Любовница может
+      блокировать проверку, стрельбу и голосование. Стрелять без проверки —
+      плохая игра по мета-правилам клуба.
+    bot_aliases:
+      - "Комиссар Каттани"
+      - "Комиссар"
+      - "Каттани"
+
+  - id: sergeant
+    name_ru: "Сержант"
+    faction: town
+    category: active
+    night_actions: []
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Базового ночного действия нет — оно появляется только при наследовании
+      места Комиссара. Пока Комиссар жив — не проверяет, только видит его
+      проверки. При смерти Комиссара занимает его место (получает check и
+      kill). Убийца может его убить. Журналист видит его гостей. Любовница
+      блокирует голос и письмо днём.
+    bot_aliases:
+      - "Сержант"
+      - "Серж"
+
+  - id: doctor
+    name_ru: "Доктор"
+    faction: town
+    category: active
+    night_actions: [heal]
+    can_kill: false
+    can_check: false
+    can_heal: true
+    notes: >
+      Лечит активные мирные роли после их раскрытия. Может вылечить себя
+      только 1 раз за игру. Не лечит от Убийцы. Может вылечить Камикадзе
+      от Дон/Комиссар/Маньяк (не от Убийцы). Может 'вылечить' превращённого
+      Оборотня и узнать, кто он. Может быть раскрыт Журналистом.
+    bot_aliases:
+      - "Доктор"
+      - "Док"
+
+  - id: mistress
+    name_ru: "Любовница"
+    faction: town
+    category: active
+    night_actions: [block]
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Посещает Дон/Маньяк/Поджигатель — блокирует их ночное действие,
+      голос и письмо днём. Не блокирует Убийцу. Не мешает Журналисту и
+      Адвокату действовать ночью, но блокирует их голос/письмо днём. Если
+      Дон убивает её в ночь посещения — Дон может голосовать и писать. Может
+      быть раскрыта Журналистом.
+    bot_aliases:
+      - "Любовница"
+
+  - id: bum
+    name_ru: "Бомж"
+    faction: town
+    category: active
+    night_actions: [visit, learn_role]
+    can_kill: false
+    can_check: true
+    can_heal: false
+    notes: >
+      Идёт за бутылкой к игроку, которого убьют этой же ночью. Узнаёт роль
+      только если это Дон, Комиссар или Маньяк. Убийцу не видит. Может
+      быть раскрыт Журналистом.
+    bot_aliases:
+      - "Бомж"
+
+  - id: civilian
+    name_ru: "Мирный житель"
+    faction: town
+    category: passive
+    night_actions: []
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Голосует днём, ночью спит. Часто прикрытие для Мафии и Убийцы.
+    bot_aliases:
+      - "Мирный житель"
+      - "Мирный"
+
+  - id: lucky
+    name_ru: "Счастливчик"
+    faction: town
+    category: passive
+    night_actions: []
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Пассивная защита от Дон и Маньяка — при попытке убийства выживает.
+      Уведомление о попытке не приходит. Дальше играет как Мирный житель.
+    bot_aliases:
+      - "Счастливчик"
+
+  - id: kamikaze
+    name_ru: "Камикадзе"
+    faction: town
+    category: passive
+    night_actions: []
+    can_kill: true
+    can_check: false
+    can_heal: false
+    notes: >
+      ПАССИВНО, по триггеру: если убит Дон/Маньяк/Мафия — забирает убийцу
+      с собой. Если повешен, а Дон/Маньяк/Мафия не открыты — забирает
+      одного на своё усмотрение. Не может забрать Убийцу и другого
+      Камикадзе. Доктор лечит его от Дон/Комиссар/Маньяк.
+    bot_aliases:
+      - "Камикадзе"
+      - "Камик"
+
+  - id: suicide
+    name_ru: "Самоубийца"
+    faction: town
+    category: passive
+    night_actions: []
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Побеждает только если повешен днём. Убийство ночью или выживание —
+      не победа.
+    bot_aliases:
+      - "Самоубийца"
+
+  - id: mayor
+    name_ru: "Мэр"
+    faction: town
+    category: passive
+    night_actions: []
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Голос на дневном голосовании = 2. При Аферисте на нём — ник виден
+      в голосовании, голос всё равно = 2.
+    bot_aliases:
+      - "Мэр"
+
+  # ===== Мафия (5) =====
+
+  - id: don
+    name_ru: "Дон"
+    faction: mafia
+    category: active
+    night_actions: [kill]
+    can_kill: true
+    can_check: false
+    can_heal: false
+    notes: >
+      Выбирает, кто умрёт этой ночью от Мафии. Только голос Дона решает.
+      Не убивает Убийцу/Мафию/Маг. Убив Камикадзе — умирает вместе с ним.
+      Если Любовница навестила его в ночь, когда он убил её или пытался
+      убить — может голосовать и писать. Защита жертвы работает от Дон и
+      Маньяка одновременно.
+    bot_aliases:
+      - "Дон"
+
+  - id: mafia
+    name_ru: "Мафия"
+    faction: mafia
+    category: active
+    night_actions: []
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Базовой ночной активности нет — она появляется только при наследовании
+      места Дона. Помогает Дону убивать. Бомж не видит Мафию. При смерти
+      Дона — один из Мафии занимает его место (получает kill).
+    bot_aliases:
+      - "Мафия"
+
+  - id: lawyer
+    name_ru: "Адвокат"
+    faction: mafia
+    category: active
+    night_actions: [protect]
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Защищает Мафию/Дон/Убийцу/Журналиста. Защищённый Комиссаром видится
+      как 'Мирный житель' и не может быть повешен в этот день. Себя может
+      защитить 1 раз за игру. Любовница не мешает защите, но блокирует
+      голос и письмо.
+    bot_aliases:
+      - "Адвокат"
+
+  - id: killer
+    name_ru: "Убийца"
+    faction: mafia
+    category: active
+    night_actions: [kill]
+    can_kill: true
+    can_check: false
+    can_heal: false
+    notes: >
+      Убивает Бомж/Доктор/Любовница/Сержант/Камикадзе/Маньяк/Поджигатель.
+      Не может убить Комиссара — при попытке умирает сам. Любовница не
+      блокирует его убийство, голос и письмо (уведомления о её посещении он
+      не получает). Журналист не видит его гостей. Доктор может вылечить
+      его от Дон/Маньяк/Комиссар/Любовница.
+    bot_aliases:
+      - "Убийца"
+
+  - id: journalist
+    name_ru: "Журналист"
+    faction: mafia
+    category: active
+    night_actions: [investigate]
+    can_kill: false
+    can_check: true
+    can_heal: false
+    notes: >
+      Ночью смотрит, кто к кому ходил. Ищет Любовницу, Доктора, Маньяка,
+      Поджигателя, Бомжа. Гостей Комиссара и Убийцы не видит. Любовница
+      блокирует его голос и письмо, но не расследование.
+    bot_aliases:
+      - "Журналист"
+      - "Жур"
+
+  # ===== Нейтральные (6) =====
+
+  - id: maniac
+    name_ru: "Маньяк"
+    faction: neutral
+    category: active
+    night_actions: [kill]
+    can_kill: true
+    can_check: false
+    can_heal: false
+    notes: >
+      Убивает всех, кроме Мага. При попытке убить Камикадзе — умирает сам.
+      Не бьёт одного игрока две ночи подряд. Защита спасёт от Дон и Маньяка
+      одновременно. Любовница не блокирует попытку убить Мага (решение
+      остаётся за Магом).
+    bot_aliases:
+      - "Маньяк"
+
+  - id: arsonist
+    name_ru: "Поджигатель"
+    faction: neutral
+    category: active
+    night_actions: [burn, choose_target]
+    can_kill: true
+    can_check: false
+    can_heal: false
+    notes: >
+      Каждую ночь выбирает одного игрока. В любую ночь может поджечь (себя
+      выбирает) — умирает вместе с ранее выбранными. Доктор лечит от него,
+      защита работает. Не может поджечь Убийцу.
+    bot_aliases:
+      - "Поджигатель"
+      - "Поджиг"
+
+  - id: swindler
+    name_ru: "Аферист"
+    faction: neutral
+    category: active
+    night_actions: [choose_target]
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      Посещает игрока ночью, потом может пользоваться его именем на дневном
+      голосовании. Если посетил Мэра — ник Мэра в голосовании, голос всё
+      ещё = 2. Побеждает, если выживает.
+    bot_aliases:
+      - "Аферист"
+
+  - id: snitch
+    name_ru: "Стукач"
+    faction: neutral
+    category: active
+    night_actions: [check]
+    can_kill: false
+    can_check: true
+    can_heal: false
+    notes: >
+      Ночью проверяет того же игрока, что и Комиссар. Если попал в ту же
+      цель — роль проверенного объявляется в общий чат.
+    bot_aliases:
+      - "Стукач"
+
+  - id: mage
+    name_ru: "Маг"
+    faction: neutral
+    category: passive
+    night_actions: []
+    can_kill: true
+    can_check: false
+    can_heal: false
+    notes: >
+      ПАССИВНО, по триггеру: если Дон, Маньяк или Комиссар пытаются его
+      убить — попытка проваливается, Маг получает выбор: помиловать или
+      убить.
+    bot_aliases:
+      - "Маг"
+
+  - id: werewolf
+    name_ru: "Оборотень"
+    faction: neutral
+    category: passive
+    night_actions: []
+    can_kill: false
+    can_check: false
+    can_heal: false
+    notes: >
+      ПАССИВНО: если убьёт Мафия — в следующую ночь становится Мафией.
+      Если Комиссар — становится Сержантом. Маньяк и Убийца убивают
+      насмерть. При одновременном убийстве Дон+Комиссар — погибает.
+      Побеждает только за Мирных.
+    bot_aliases:
+      - "Оборотень"
