@@ -545,8 +545,8 @@ Get-Content logs\reasoning.log -Tail 50
 | Соединение отклонено (сервер выключен) | `llm.connect_timeout_sec` = 5 с → `LLMConnectionError`, в UI баннер «LM Studio недоступен», повтор при следующем событии |
 | Модель не найдена (`404`) | `LLMError: model not found` + подсказка сверить `llm.model` с `/v1/models`; ретраев нет (бессмысленно) |
 | Таймаут генерации | `llm.request_timeout_sec` (120 с) → ретрай |
-| `429` / `5xx` | экспоненциальный backoff от `retry_backoff_sec` (2 → 4 → 8 с) |
-| Все ретраи исчерпаны | `max_retries: 3` (не больше), событие помечается `analysis_failed`, партия продолжается |
+| `429` / `5xx` | экспоненциальный backoff от `retry_backoff_sec` (2 → 4 с; при `max_retries: 3` выполняются ровно 3 попытки и 2 паузы) |
+| Все ретраи исчерпаны | `max_retries: 3` (не больше), событие помечается `analysis_failed`, партия продолжается; бюджет `max_retries` действует на ВЕСЬ вызов analyze(), включая schema-fallback и validation-retry — суммарно ≤ 3 HTTP-запросов |
 | Невалидный JSON | один повторный запрос, затем отказ |
 | Пустой `analysis` | валидно: значит «данных мало», в таблице показывается `—` |
 

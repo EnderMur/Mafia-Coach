@@ -68,6 +68,19 @@ messages, earlier predictions, and an optional summary of club heuristics. The
 template presents those values in labeled context sections and contains no
 hard-coded role catalogue.
 
+## Reasoning channel
+
+Reasoning for the Reasoning Window and `logs/reasoning.log` is taken ONLY from
+`delta.reasoning_content` (vLLM/Qwen-style) or `delta.reasoning` (some LM Studio
+builds). `delta.content` is used exclusively to accumulate the final JSON and is
+NEVER passed to the reasoning channel. If the loaded model does not emit
+dedicated reasoning (a non-thinking model), the channel remains empty; this is
+expected behavior, not an error.
+
+The HTTP-request budget for one `analyze()` or `analyze_stream()` call is limited
+to `max_retries` (≤ 3) and includes schema fallback and validation retry. A 404
+does not consume retry budget.
+
 ## 6. Version notes
 
 This document describes the v1 structured response contract. Context building,
