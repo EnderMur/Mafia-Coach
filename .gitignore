@@ -179,3 +179,21 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# Mafia Coach — специфичные для проекта шаблоны
+data/sessions/*
+data/db/*
+data/datasets/*
+logs/*
+!data/sessions/.gitkeep
+!data/db/.gitkeep
+!data/datasets/.gitkeep
+!logs/.gitkeep
+
+*.session
+*.session-journal
+*.db
+*.db-journal
+*.sqlite*
+configs/settings.yaml
+.DS_Store
+Thumbs.db

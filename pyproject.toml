@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mafia-coach"
+version = "0.1.0"
+description = "Локальный ассистент-тренер для игры в мафию в Telegram (userbot + LM Studio)"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "telethon",
+    "httpx",
+    "pydantic>=2",
+    "pydantic-settings",
+    "pyyaml",
+    "jinja2",
+    "loguru",
+    "tenacity",
+    "rich",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "ruff==0.6.0",
+    "mypy",
+    "pre-commit",
+]
+training = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["*.md"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+exclude = [
+    ".venv",
+    "data",
+    "logs",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.setuptools.packages.find]
+include = ["app*", "domain*", "infra*", "features*"]

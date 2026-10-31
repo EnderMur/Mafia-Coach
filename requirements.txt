@@ -1,0 +1,9 @@
+telethon
+httpx
+pydantic>=2
+pydantic-settings
+pyyaml
+jinja2
+loguru
+tenacity
+rich
