@@ -13,7 +13,7 @@ from infra.logging.setup import get_logger, setup_logging
 
 @pytest.fixture
 def logger_isolated() -> Iterator[None]:
-    """Remove global loguru sinks before and after each test."""
+    """Start and finish each test with all global loguru sinks removed."""
     logger.remove()
     try:
         yield
