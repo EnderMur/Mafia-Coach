@@ -75,16 +75,32 @@ def test_no_send_tokens_in_source() -> None:
 
 
 def test_events_only_newmessage() -> None:
-    """Only events.NewMessage is used; edited, deleted, chat, and user events are absent."""
+    """Only events.NewMessage is parsed; deleted, chat, and user events are absent."""
     text = Path("infra/telegram/client.py").read_text(encoding="utf-8")
     assert "events.NewMessage" in text
     for forbidden_event in (
-        "events.MessageEdited",
         "events.MessageDeleted",
         "events.ChatAction",
         "events.UserUpdate",
     ):
         assert forbidden_event not in text, f"forbidden event: {forbidden_event}"
+
+
+def test_edited_message_only_for_warning() -> None:
+    """events.MessageEdited may appear only as a warning-log watcher, never as parser input."""
+    import re
+
+    text = Path("infra/telegram/client.py").read_text(encoding="utf-8")
+    matches = list(re.finditer(r"events\.MessageEdited", text))
+    assert matches, "expected a log-only handler for edited messages"
+    for match in matches:
+        snippet = text[match.start() : match.start() + 400]
+        lowered = snippet.lower()
+        assert (
+            "warn" in lowered or "warning" in lowered
+        ), "events.MessageEdited without warning context"
+        # The edited event must never be handed to a user handler directly.
+        assert "self._handlers" not in snippet
 
 
 def test_readonly_docstring_present() -> None:

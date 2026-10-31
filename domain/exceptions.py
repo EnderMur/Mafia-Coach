@@ -29,3 +29,23 @@ class LLMConnectionError(LLMError):
 
 class TelegramNotConnectedError(DomainError):
     """Raised when a Telegram operation requires an active authorized session."""
+
+
+class TelegramFloodWaitError(DomainError):
+    """Telegram rate-limited the request; retry after ``wait_seconds``."""
+
+    __slots__ = ("wait_seconds",)
+
+    def __init__(self, wait_seconds: int, message: str = "") -> None:
+        """Initialize the error with the server-provided retry delay.
+
+        Args:
+            wait_seconds: Number of seconds Telegram asks the client to wait.
+            message: Optional custom message; a default hint is built when empty.
+        """
+        self.wait_seconds = wait_seconds
+        super().__init__(message or f"Telegram FloodWait: retry after {wait_seconds}s")
+
+
+class TelegramAccessError(DomainError):
+    """Telegram refused access (private chat, admin rights, kicked from chat, etc.)."""
