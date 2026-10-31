@@ -1,0 +1,23 @@
+Партия
+ID партии: {{ game_id }}
+
+Текущая фаза
+Фаза: {{ current_phase }}
+Игровой день: {{ current_day }}
+
+Игроки
+{% for player in players %}- ID {{ player.player_id }}; имя: {{ player.display_name }}; жив: {{ player.alive }}; известная роль: {{ player.known_role if player.known_role else "неизвестна" }}
+{% else %}- Список игроков пуст.
+{% endfor %}
+Последние сообщения
+{% for message in recent_messages %}- {{ message.ts }} — {{ message.author_name }}: {{ message.text }}
+{% else %}- Сообщений нет.
+{% endfor %}
+{% if previous_predictions %}Прошлые предсказания
+{% for prediction in previous_predictions %}- {{ prediction }}
+{% endfor %}{% endif %}
+{% if club_notes_summary %}Сводка эвристик
+{{ club_notes_summary }}
+{% endif %}Что нужно сделать
+Верни предсказания ролей в JSON по системной схеме. Используй только переданные
+имена игроков и их идентификаторы; кратко обоснуй выводы на русском языке.

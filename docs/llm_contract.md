@@ -1,0 +1,74 @@
+# LLM Contract — Mafia Coach
+
+## 1. Endpoint
+
+The configured endpoint is `POST {llm.base_url}/chat/completions`, using the
+OpenAI-compatible local model server. The configured model identifier and
+request parameters are supplied by application configuration.
+
+Streaming is enabled only for the reasoning channel. The final structured
+response is assembled after generation completes.
+
+## 2. AnalysisResponse schema (v1)
+
+| Field | Type | Required | Constraints |
+|---|---|---:|---|
+| `analysis` | list of `PlayerPrediction` | yes | May be empty |
+| `analysis[].player_id` | integer | yes | Must belong to the current game |
+| `analysis[].player_name` | string | yes | Non-empty display name |
+| `analysis[].suspected_role` | string | yes | Canonical configured role name |
+| `analysis[].confidence` | float | yes | Inclusive range 0.0–1.0 |
+| `analysis[].alternative` | `AlternativePrediction` or null | no | Optional second hypothesis |
+| `analysis[].alternative.role` | string | yes when present | Canonical configured role name |
+| `analysis[].alternative.confidence` | float | yes when present | Inclusive range 0.0–1.0 |
+| `analysis[].reasons` | list of strings | yes | Between one and five entries |
+| Primary and alternative confidence total | float | when alternative exists | At most 1.0 |
+| `game_read` | string | yes | Non-empty summary |
+| `reasoning` | string | yes | Non-empty explanation |
+
+The response and nested prediction models are immutable and reject undeclared
+fields. The `analysis` collection may be empty when no usable predictions remain.
+
+## 3. Contextual validation
+
+JSON is parsed and validated against the Pydantic schema. Schema errors are
+returned to the caller for retry handling.
+
+1. Confidence values outside the supported range are clamped with a warning.
+2. Unknown role names are passed to the optional alias resolver. Unresolved
+   primary roles cause that prediction to be dropped; unresolved alternatives
+   are removed while retaining the primary prediction.
+3. Predictions for player identifiers outside the active game are dropped.
+4. If primary and alternative confidence total exceeds one beyond floating
+   point tolerance, both values are normalized proportionally and a warning is
+   returned.
+5. Contextual issues are warnings; structurally invalid JSON data is an error.
+
+## 4. Errors and retries
+
+| Situation | Expected handling |
+|---|---|
+| Connection refused | Report a connection error and retry on a later event |
+| Model not found | Report a non-retryable model error |
+| Request timeout | Retry according to configured policy |
+| Rate limit or server error | Exponential backoff, bounded by configured retries |
+| Invalid JSON | Request JSON-only output once, then report an LLM error |
+| Empty analysis | Accept as a valid response |
+
+The transport and retry implementation are separate from these static schemas.
+
+## 5. Prompts
+
+`system.jinja` receives the configured Russian role names and the generated JSON
+Schema. It establishes the analysis task, requires Russian-language output, and
+requires the response to conform to `AnalysisResponse`.
+
+`analyze.jinja` receives game and phase identifiers, player snapshots, recent
+messages, earlier predictions, and an optional summary of club heuristics. The
+template presents those values in labeled context sections and contains no
+hard-coded role catalogue.
+
+## 6. Version notes
+
+This document describes the v1 structured response contract. Context building,
+request transport, and streaming orchestration are implemented in later layers.
