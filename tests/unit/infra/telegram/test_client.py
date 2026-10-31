@@ -5,17 +5,30 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from loguru import logger
 from pydantic import ValidationError
 from telethon import events  # type: ignore[import-untyped]
-from telethon.errors import RPCError  # type: ignore[import-untyped]
+from telethon.errors import (  # type: ignore[import-untyped]
+    ChannelInvalidError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
+    FloodWaitError,
+    RPCError,
+    UserNotParticipantError,
+)
 from telethon.tl.types import Chat, User  # type: ignore[import-untyped]
 
-from domain.exceptions import ConfigError, DomainError, TelegramNotConnectedError
+from domain.exceptions import (
+    ConfigError,
+    DomainError,
+    TelegramAccessError,
+    TelegramFloodWaitError,
+    TelegramNotConnectedError,
+)
 from infra.telegram.client import TelegramClientWrapper, TelegramConfig
 
 API_ID = 123456
@@ -265,9 +278,15 @@ async def test_add_message_handler_registers_new_message_filter(tmp_path: Path) 
         return None
 
     wrapper.add_message_handler(handler, chat_id=CHAT_ID)
-    fake.add_event_handler.assert_called_once()
-    registered_handler, builder = fake.add_event_handler.call_args.args
-    assert registered_handler is handler
+    new_message_calls = [
+        call.args
+        for call in fake.add_event_handler.call_args_list
+        if isinstance(call.args[1], events.NewMessage)
+    ]
+    assert len(new_message_calls) == 1
+    registered_handler, builder = new_message_calls[0]
+    # The user handler is wrapped by the de-duplicator, not registered directly.
+    assert registered_handler is not handler
     assert isinstance(builder, events.NewMessage)
     assert builder.chats == [CHAT_ID]
     assert builder.incoming is True
@@ -389,3 +408,457 @@ async def test_aclose_disconnects_owned_client_idempotently(tmp_path: Path) -> N
         wrapper2 = TelegramClientWrapper(config=config)
         await wrapper2.aclose()
         owned_sync_disconnect.disconnect.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# step-6b: rate-limit / access mapping, iter_dialogs, dedup, cleanup, edited
+# ---------------------------------------------------------------------------
+
+
+def make_flood(wait: int) -> FloodWaitError:
+    """Build a Telethon FloodWaitError carrying ``wait`` seconds without network I/O."""
+    return FloodWaitError(request=None, capture=wait)
+
+
+def make_dialog(
+    dialog_id: int,
+    title: str = "Chat",
+    *,
+    is_group: bool = False,
+    is_channel: bool = False,
+) -> SimpleNamespace:
+    """Build a minimal dialog-like object accepted by iter_dialogs()."""
+    return SimpleNamespace(id=dialog_id, title=title, is_group=is_group, is_channel=is_channel)
+
+
+def dialog_iter(items: list[Any]) -> Any:
+    """Return a callable producing an async iterator over ``items``."""
+
+    async def _iter(*_args: Any, **_kwargs: Any) -> AsyncIterator[Any]:
+        for item in items:
+            yield item
+
+    return _iter
+
+
+def failing_dialog_iter(error: Exception) -> Any:
+    """Return a callable producing an async iterator that raises ``error``."""
+
+    async def _iter(*_args: Any, **_kwargs: Any) -> AsyncIterator[Any]:
+        raise error
+        yield  # pragma: no cover - keeps this an async generator
+
+    return _iter
+
+
+async def make_connected_wrapper(tmp_path: Path, **overrides: Any) -> TelegramClientWrapper:
+    """Build a connected wrapper backed by a fake client (no real Telethon calls)."""
+    config = make_config(tmp_path, **overrides)
+    fake = make_fake_client()
+    wrapper = TelegramClientWrapper(config=config, client=fake)
+    await wrapper.connect()
+    return wrapper
+
+
+async def test_get_chat_flood_wait_maps_to_domain_error(tmp_path: Path) -> None:
+    """1. get_chat() maps FloodWaitError to TelegramFloodWaitError with wait_seconds."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.get_entity = AsyncMock(side_effect=make_flood(30))
+
+    with pytest.raises(TelegramFloodWaitError) as excinfo:
+        await wrapper.get_chat(CHAT_ID)
+    assert excinfo.value.wait_seconds == 30
+    assert "30" in str(excinfo.value)
+
+
+async def test_list_recent_messages_flood_wait_maps_to_domain_error(tmp_path: Path) -> None:
+    """2. list_recent_messages() maps FloodWaitError to TelegramFloodWaitError."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_messages = MagicMock(side_effect=failing_dialog_iter(make_flood(5)))
+
+    with pytest.raises(TelegramFloodWaitError) as excinfo:
+        await wrapper.list_recent_messages(chat_id=CHAT_ID, limit=5)
+    assert excinfo.value.wait_seconds == 5
+
+
+async def test_iter_dialogs_flood_wait_maps_to_domain_error(tmp_path: Path) -> None:
+    """3. iter_dialogs() maps FloodWaitError to TelegramFloodWaitError."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_dialogs = MagicMock(side_effect=failing_dialog_iter(make_flood(60)))
+
+    with pytest.raises(TelegramFloodWaitError) as excinfo:
+        await wrapper.iter_dialogs()
+    assert excinfo.value.wait_seconds == 60
+
+
+@pytest.mark.parametrize(
+    "error", [ChannelPrivateError(request=None), ChatAdminRequiredError(request=None)]
+)
+async def test_get_chat_access_errors_map_to_access_error(tmp_path: Path, error: Exception) -> None:
+    """4-5. get_chat() maps private-channel and admin-required errors to TelegramAccessError."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.get_entity = AsyncMock(side_effect=error)
+
+    with pytest.raises(TelegramAccessError, match="access denied"):
+        await wrapper.get_chat(CHAT_ID)
+
+
+async def test_list_recent_messages_access_error_maps_to_access_error(tmp_path: Path) -> None:
+    """6. list_recent_messages() maps UserNotParticipantError to TelegramAccessError."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_messages = MagicMock(
+        side_effect=failing_dialog_iter(UserNotParticipantError(request=None))
+    )
+
+    with pytest.raises(TelegramAccessError, match="UserNotParticipantError"):
+        await wrapper.list_recent_messages(chat_id=CHAT_ID, limit=3)
+
+
+async def test_iter_dialogs_access_error_maps_to_access_error(tmp_path: Path) -> None:
+    """iter_dialogs() maps ChannelInvalidError to TelegramAccessError."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_dialogs = MagicMock(
+        side_effect=failing_dialog_iter(ChannelInvalidError(request=None))
+    )
+
+    with pytest.raises(TelegramAccessError, match="ChannelInvalidError"):
+        await wrapper.iter_dialogs()
+
+
+async def test_iter_dialogs_rpc_error_maps_to_config_error(tmp_path: Path) -> None:
+    """iter_dialogs() maps a generic RPCError to ConfigError."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_dialogs = MagicMock(
+        side_effect=failing_dialog_iter(RPCError(None, "FLOOD_PREMIUM"))
+    )
+
+    with pytest.raises(ConfigError, match="telegram RPC error"):
+        await wrapper.iter_dialogs()
+
+
+async def test_iter_dialogs_keeps_only_groups_and_channels(tmp_path: Path) -> None:
+    """7. iter_dialogs(groups_only=True) drops private chats and bots."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_dialogs = MagicMock(
+        side_effect=dialog_iter(
+            [
+                make_dialog(-1001, "Mafia Group", is_group=True),
+                make_dialog(-1002, "Mafia Channel", is_channel=True),
+                make_dialog(42, "Private chat"),
+                make_dialog(43, "TrueMafiaBot", is_group=False),
+            ]
+        )
+    )
+
+    dialogs = await wrapper.iter_dialogs(groups_only=True)
+    assert dialogs == [
+        {"id": -1001, "title": "Mafia Group", "kind": "group"},
+        {"id": -1002, "title": "Mafia Channel", "kind": "channel"},
+    ]
+
+
+async def test_iter_dialogs_groups_only_false_returns_all_kinds(tmp_path: Path) -> None:
+    """8. iter_dialogs(groups_only=False) keeps every dialog kind."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_dialogs = MagicMock(
+        side_effect=dialog_iter(
+            [
+                make_dialog(-1001, "Mafia Group", is_group=True),
+                make_dialog(42, "Private chat"),
+            ]
+        )
+    )
+
+    dialogs = await wrapper.iter_dialogs(groups_only=False)
+    assert [d["kind"] for d in dialogs] == ["group", "other"]
+    assert dialogs[1]["title"] == "Private chat"
+
+
+async def test_iter_dialogs_passes_limit_to_client(tmp_path: Path) -> None:
+    """9. iter_dialogs() forwards dialogs_limit to the Telethon client."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    captured: dict[str, Any] = {}
+
+    async def _iter(*_args: Any, **kwargs: Any) -> AsyncIterator[Any]:
+        captured.update(kwargs)
+        for item in [make_dialog(-1001, "Mafia Group", is_group=True)]:
+            yield item
+
+    wrapper._client.iter_dialogs = MagicMock(side_effect=_iter)
+    await wrapper.iter_dialogs(dialogs_limit=7)
+    assert captured["limit"] == 7
+
+
+async def test_iter_dialogs_empty_result(tmp_path: Path) -> None:
+    """10. iter_dialogs() returns an empty list when Telegram yields nothing."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    wrapper._client.iter_dialogs = MagicMock(side_effect=dialog_iter([]))
+
+    assert await wrapper.iter_dialogs() == []
+
+
+async def test_iter_dialogs_before_connect_raises(tmp_path: Path) -> None:
+    """11. iter_dialogs() before connect() raises TelegramNotConnectedError."""
+    config = make_config(tmp_path)
+    wrapper = TelegramClientWrapper(config=config, client=make_fake_client())
+
+    with pytest.raises(TelegramNotConnectedError):
+        await wrapper.iter_dialogs()
+
+
+def make_event(msg_id: int | None, chat_id: int | None) -> SimpleNamespace:
+    """Build a minimal NewMessage-like event with the given ids."""
+    return SimpleNamespace(message=SimpleNamespace(id=msg_id), chat_id=chat_id)
+
+
+def last_registered_wrapper(fake: AsyncMock) -> Any:
+    """Return the most recently registered NewMessage handler wrapper."""
+    calls = [
+        call.args
+        for call in fake.add_event_handler.call_args_list
+        if isinstance(call.args[1], events.NewMessage)
+    ]
+    return calls[-1][0]
+
+
+async def test_add_message_handler_deduplicates_by_message_id(tmp_path: Path) -> None:
+    """12. duplicate (chat_id, msg_id) events invoke the handler only once."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    calls: list[Any] = []
+
+    async def handler(event: Any) -> None:
+        calls.append(event)
+
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID, deduplicate=True)
+    wrapped = last_registered_wrapper(wrapper._client)
+
+    event = make_event(10, CHAT_ID)
+    await wrapped(event)
+    assert await wrapped(event) is None  # duplicate: handler is NOT called
+    assert len(calls) == 1
+
+    await wrapped(make_event(11, CHAT_ID))
+    assert len(calls) == 2
+
+
+async def test_add_message_handler_without_dedup_forwards_duplicates(tmp_path: Path) -> None:
+    """13. deduplicate=False forwards every duplicate event to the handler."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    calls: list[Any] = []
+
+    async def handler(event: Any) -> None:
+        calls.append(event)
+
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID, deduplicate=False)
+    wrapped = last_registered_wrapper(wrapper._client)
+
+    event = make_event(10, CHAT_ID)
+    await wrapped(event)
+    await wrapped(event)
+
+    assert len(calls) == 2
+    assert wrapper._seen_ids == set()
+
+
+async def test_dedup_window_is_trimmed_after_limit(tmp_path: Path) -> None:
+    """14. the seen-id window is cleared once it grows past 10_000 entries."""
+    wrapper = await make_connected_wrapper(tmp_path)
+
+    async def handler(_event: Any) -> None:
+        return None
+
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID)
+    wrapped = last_registered_wrapper(wrapper._client)
+
+    for msg_id in range(1, 10_001):
+        await wrapped(make_event(msg_id, CHAT_ID))
+    assert len(wrapper._seen_ids) == 10_000
+
+    await wrapped(make_event(10_001, CHAT_ID))
+    assert wrapper._seen_ids == {(CHAT_ID, 10_001)}
+
+
+async def test_dedup_forwards_events_without_ids(tmp_path: Path) -> None:
+    """Events without message id or chat id are forwarded without bookkeeping."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    calls: list[Any] = []
+
+    async def handler(event: Any) -> None:
+        calls.append(event)
+
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID)
+    wrapped = last_registered_wrapper(wrapper._client)
+
+    await wrapped(SimpleNamespace(message=None, chat_id=CHAT_ID))
+    await wrapped(make_event(5, None))
+
+    assert len(calls) == 2
+    assert wrapper._seen_ids == set()
+
+
+async def test_synchronous_user_handler_is_supported(tmp_path: Path) -> None:
+    """A plain synchronous callback is invoked and its None result is tolerated."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    calls: list[Any] = []
+
+    def handler(event: Any) -> None:
+        calls.append(event)
+
+    wrapper.add_message_handler(cast(Any, handler), chat_id=CHAT_ID)
+    wrapped = last_registered_wrapper(wrapper._client)
+
+    assert await wrapped(make_event(21, CHAT_ID)) is None
+    assert len(calls) == 1
+
+
+async def test_remove_all_handlers_removes_each_handler(tmp_path: Path) -> None:
+    """15. remove_all_handlers() detaches every registered handler exactly once."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    fake = wrapper._client
+    fake.remove_event_handler = MagicMock()
+
+    async def handler(_event: Any) -> None:
+        return None
+
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID)
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID)
+    wrapped_handlers = [wrapped for _user, wrapped in wrapper._handlers]
+    edited_handler = wrapper._edited_warn_handler
+
+    await wrapper.remove_all_handlers()
+    await wrapper.remove_all_handlers()
+
+    assert wrapper._handlers == []
+    assert wrapper._edited_warn_handler is None
+    assert wrapper._seen_ids == set()
+    removed = [call.args[0] for call in fake.remove_event_handler.call_args_list]
+    for expected in wrapped_handlers:
+        assert removed.count(expected) == 1
+    assert removed.count(edited_handler) == 1
+
+
+async def test_remove_all_handlers_swallows_cleanup_errors(tmp_path: Path) -> None:
+    """remove_all_handlers() ignores errors raised by the client during cleanup."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    fake = wrapper._client
+    fake.remove_event_handler = MagicMock(side_effect=RuntimeError("boom"))
+
+    async def handler(_event: Any) -> None:
+        return None
+
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID)
+    await wrapper.remove_all_handlers()
+    assert wrapper._handlers == []
+
+
+async def test_remove_all_handlers_awaits_async_removal(tmp_path: Path) -> None:
+    """remove_all_handlers() awaits an awaitable remove_event_handler result."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    fake = wrapper._client
+    fake.remove_event_handler = AsyncMock()
+
+    async def handler(_event: Any) -> None:
+        return None
+
+    wrapper.add_message_handler(handler, chat_id=CHAT_ID)
+    await wrapper.remove_all_handlers()
+    assert fake.remove_event_handler.await_count == 2
+
+
+async def test_remove_all_handlers_works_before_connect(tmp_path: Path) -> None:
+    """16. remove_all_handlers() is a safe no-op before connect() is called."""
+    config = make_config(tmp_path)
+    wrapper = TelegramClientWrapper(config=config, client=make_fake_client())
+
+    await wrapper.remove_all_handlers()
+    await wrapper.remove_all_handlers()
+    assert wrapper._handlers == []
+
+
+async def test_connect_registers_edited_message_warning_handler(tmp_path: Path) -> None:
+    """17. connect() registers a log-only handler for events.MessageEdited."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    edited_calls = [
+        call.args
+        for call in wrapper._client.add_event_handler.call_args_list
+        if call.args[1] is events.MessageEdited
+    ]
+
+    assert len(edited_calls) == 1
+    registered, builder = edited_calls[0]
+    assert registered is wrapper._edited_warn_handler
+    assert builder is events.MessageEdited
+
+
+async def test_reconnect_does_not_duplicate_edited_handler(tmp_path: Path) -> None:
+    """Reconnecting keeps exactly one MessageEdited warning handler registered."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    await wrapper.disconnect()
+    await wrapper.connect()
+
+    edited_calls = [
+        call.args
+        for call in wrapper._client.add_event_handler.call_args_list
+        if call.args[1] is events.MessageEdited
+    ]
+    assert len(edited_calls) == 1
+
+
+async def test_edited_message_handler_logs_warning(tmp_path: Path) -> None:
+    """18. the edited-message handler logs a warning and never touches user handlers."""
+    wrapper = await make_connected_wrapper(tmp_path)
+    handler = wrapper._edited_warn_handler
+    assert handler is not None
+
+    records: list[str] = []
+    sink_id = logger.add(lambda msg: records.append(msg.record["message"]), level="WARNING")
+    try:
+        await handler(SimpleNamespace(chat_id=CHAT_ID, message=SimpleNamespace(id=99)))
+    finally:
+        logger.remove(sink_id)
+
+    assert any("edited message" in record and "99" in record for record in records)
+
+
+@pytest.mark.parametrize("error", [make_flood(12), ChannelPrivateError(request=None)])
+async def test_connect_maps_rpc_errors_to_domain_errors(tmp_path: Path, error: Exception) -> None:
+    """connect() maps flood/access RPC failures to the dedicated domain errors."""
+    config = make_config(tmp_path)
+    fake = make_fake_client()
+    fake.connect = AsyncMock(side_effect=error)
+    wrapper = TelegramClientWrapper(config=config, client=fake)
+
+    expected = TelegramFloodWaitError if isinstance(error, FloodWaitError) else TelegramAccessError
+    with pytest.raises(expected):
+        await wrapper.connect()
+    assert wrapper.is_connected is False
+
+
+@pytest.mark.parametrize("error", [make_flood(9), ChannelPrivateError(request=None)])
+async def test_resolve_me_id_maps_rpc_errors_to_domain_errors(
+    tmp_path: Path, error: Exception
+) -> None:
+    """_resolve_me_id() re-raises flood/access errors instead of degrading to None."""
+    config = make_config(tmp_path)
+    fake = make_fake_client()
+    fake.get_me = AsyncMock(side_effect=error)
+    wrapper = TelegramClientWrapper(config=config, client=fake)
+
+    expected = TelegramFloodWaitError if isinstance(error, FloodWaitError) else TelegramAccessError
+    with pytest.raises(expected):
+        await wrapper.connect()
+
+
+@pytest.mark.parametrize("error", [make_flood(4), ChannelInvalidError(request=None)])
+async def test_resolve_bot_id_maps_rpc_errors_to_domain_errors(
+    tmp_path: Path, error: Exception
+) -> None:
+    """_resolve_bot_id() re-raises flood/access errors from the entity lookup."""
+    config = make_config(tmp_path, bot_id=None, bot_username="@TrueMafiaBot")
+    fake = make_fake_client()
+    fake.get_entity = AsyncMock(side_effect=error)
+    wrapper = TelegramClientWrapper(config=config, client=fake)
+
+    expected = TelegramFloodWaitError if isinstance(error, FloodWaitError) else TelegramAccessError
+    with pytest.raises(expected):
+        await wrapper.connect()
