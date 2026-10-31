@@ -25,3 +25,7 @@ class LLMError(DomainError):
 
 class LLMConnectionError(LLMError):
     """Raised when the language-model service cannot be reached."""
+
+
+class TelegramNotConnectedError(DomainError):
+    """Raised when a Telegram operation requires an active authorized session."""
