@@ -251,13 +251,8 @@ def to_llm_messages(
 
 
 def _game_id(game_state: GameState) -> int:
-    """Return the game identifier of a state.
-
-    ``GameState`` still exposes the identifier only as a private attribute
-    (``domain/`` is out of scope here), so it is read directly instead of being
-    guessed from the event log, which is empty for a fresh game.
-    """
-    return game_state._game_id
+    """Return the game identifier through the public game-state API."""
+    return game_state.game_id
 
 
 def _response_schema_json(jinja_env: jinja2.Environment, override: str | None) -> str:

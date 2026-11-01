@@ -44,6 +44,13 @@ def event_time() -> datetime:
     return datetime(2025, 1, 1, tzinfo=UTC)
 
 
+def test_game_id_property(registry: RoleRegistry) -> None:
+    """The game id is available through a public read-only property."""
+    game = GameState(game_id=42, registry=registry)
+
+    assert game.game_id == 42
+
+
 def make_death(player_id: int = 1, game_id: int = 1) -> DeathEvent:
     """Build a death event for a registered player."""
     return DeathEvent(

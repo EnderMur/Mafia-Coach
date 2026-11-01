@@ -41,6 +41,11 @@ class GameState:
         self._phase = Phase.REGISTRATION
         self._day_number = 0
 
+    @property
+    def game_id(self) -> int:
+        """Public accessor for the game id."""
+        return self._game_id
+
     def register_player(
         self, player_id: int, display_name: str, username: str | None = None
     ) -> Player:
