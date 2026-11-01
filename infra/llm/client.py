@@ -68,6 +68,15 @@ class _TransientHTTP(Exception):
         self.body = body
 
 
+class _SchemaRejectedHTTP(Exception):
+    """Internal marker: the server refused the requested response format."""
+
+    def __init__(self, status: int, body: str = "") -> None:
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+        self.body = body
+
+
 class LMStudioClient(LLMClient):
     """Async client for LM Studio's OpenAI-compatible REST API."""
 
@@ -262,15 +271,26 @@ class LMStudioClient(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
     ) -> AnalysisResponse:
-        """Stream a final JSON response under one shared HTTP-request budget."""
+        """Stream a final JSON response under one shared HTTP-request budget.
+
+        The stream starts with ``response_format="json_schema"``. When the server
+        rejects that format (LM Studio accepts only ``json_schema`` or ``text``),
+        the request is retried once with ``response_format="text"`` inside the
+        same HTTP-request budget, and markdown fences are stripped before the
+        completed payload is validated.
+        """
         self._ensure_open()
-        payload = self._build_payload(messages, response_format="json_object")
-        payload["stream"] = True
         budget = self._max_retries
+        use_schema = True
         last_exc: Exception | None = None
 
         while budget > 0:
             budget -= 1
+            payload = self._build_payload(
+                messages,
+                response_format="json_schema" if use_schema else "text",
+            )
+            payload["stream"] = True
             try:
                 return await self._stream_once(
                     payload=payload,
@@ -278,9 +298,24 @@ class LMStudioClient(LLMClient):
                     role_names_ru=role_names_ru,
                     role_alias_resolver=role_alias_resolver,
                     on_reasoning_chunk=on_reasoning_chunk,
+                    allow_markdown_fence=not use_schema,
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as error:
                 raise LLMConnectionError(f"LM Studio недоступен: {error}") from error
+            except _SchemaRejectedHTTP as error:
+                if budget == 0:
+                    raise LLMError(f"HTTP {error.status}: {error.body}") from error
+                if use_schema:
+                    use_schema = False
+                    logger.bind(channel="llm").warning(
+                        "stream: falling back to response_format=text "
+                        "(server rejected json_schema)"
+                    )
+                    continue
+                # The plain-text fallback is already active, so spend one more
+                # unit of the shared budget instead of failing outright.
+                last_exc = error
+                continue
             except (
                 _TransientHTTP,
                 httpx.ReadTimeout,
@@ -321,6 +356,8 @@ class LMStudioClient(LLMClient):
             }
         elif response_format == "json_object":
             payload["response_format"] = {"type": "json_object"}
+        elif response_format == "text":
+            payload["response_format"] = {"type": "text"}
         elif response_format is not None:
             raise ValueError(f"unsupported response format: {response_format}")
         return payload
@@ -333,6 +370,7 @@ class LMStudioClient(LLMClient):
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None,
         on_reasoning_chunk: ReasoningSink | None,
+        allow_markdown_fence: bool = False,
     ) -> AnalysisResponse:
         """Perform one HTTP stream request and validate its completed JSON."""
         content: list[str] = []
@@ -347,6 +385,8 @@ class LMStudioClient(LLMClient):
                 raise _TransientHTTP(response.status_code, _snip(body))
             if response.status_code >= 300:
                 body = (await response.aread()).decode("utf-8", errors="replace")
+                if _is_response_format_rejection(response.status_code, body):
+                    raise _SchemaRejectedHTTP(response.status_code, _snip(body))
                 raise LLMError(f"HTTP {response.status_code}: {_snip(body)}")
 
             async for line in response.aiter_lines():
@@ -383,9 +423,12 @@ class LMStudioClient(LLMClient):
 
         if not done:
             raise LLMError("stream ended before [DONE]")
+        raw_text = "".join(content)
+        if allow_markdown_fence:
+            raw_text = _strip_markdown_fence(raw_text)
         try:
             result, warnings = validate_response(
-                "".join(content),
+                raw_text,
                 known_player_ids=known_player_ids,
                 role_names_ru=role_names_ru,
                 role_alias_resolver=role_alias_resolver,
@@ -424,3 +467,37 @@ class LMStudioClient(LLMClient):
 def _snip(text: str, n: int = 200) -> str:
     """Return at most n characters and an ellipsis when truncated."""
     return text[:n] + ("…" if len(text) > n else "")
+
+
+_RESPONSE_FORMAT_REJECTION_MARKERS = ("response_format", "json_schema", "must be")
+
+
+def _is_response_format_rejection(status: int, body: str) -> bool:
+    """Return whether a status/body pair reports an unsupported response format."""
+    if status not in (400, 422):
+        return False
+    lowered = body.lower()
+    return any(marker in lowered for marker in _RESPONSE_FORMAT_REJECTION_MARKERS)
+
+
+def _strip_markdown_fence(text: str) -> str:
+    """Remove one surrounding ```json fence from a plain-text model answer.
+
+    This is only applied to the ``response_format="text"`` fallback, where the
+    server is free to wrap the JSON payload in a markdown code block.
+    """
+    stripped = text.strip()
+    if not stripped.startswith("```"):
+        return stripped
+    body = stripped[3:]
+    newline_index = body.find("\n")
+    if newline_index == -1:
+        return stripped
+    info_string = body[:newline_index].strip().lower()
+    if info_string not in ("", "json"):
+        return stripped
+    body = body[newline_index + 1 :]
+    body = body.rstrip()
+    if body.endswith("```"):
+        body = body[:-3]
+    return body.strip()

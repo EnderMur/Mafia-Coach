@@ -711,3 +711,80 @@ async def test_aclose_does_not_close_or_disable_external_client() -> None:
     response = await external.get("http://mock.local/health")
     assert response.json() == {"ok": True}
     await external.aclose()
+
+
+SCHEMA_REJECTION_BODY = "'response_format.type' must be 'json_schema' or 'text'"
+
+
+def fenced_content(content: str = VALID_CONTENT) -> str:
+    """Wrap JSON content in a markdown code fence as a plain-text model answer."""
+    return f"```json\n{content}\n```"
+
+
+async def test_analyze_stream_uses_json_schema(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """The first stream request asks the server for a strict JSON schema."""
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=stream_response(),
+    )
+    response = await run_stream(client)
+    assert isinstance(response, AnalysisResponse)
+    assert route.call_count == 1
+    first_body: Any = json.loads(route.calls[0].request.content)
+    assert first_body["response_format"]["type"] == "json_schema"
+    assert first_body["stream"] is True
+
+
+async def test_analyze_stream_fallback_on_400_schema(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """A server rejecting json_schema is retried once with response_format=text."""
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": SCHEMA_REJECTION_BODY}),
+            stream_response(),
+        ],
+    )
+    response = await run_stream(client)
+    assert isinstance(response, AnalysisResponse)
+    assert route.call_count == 2
+    fallback_body: Any = json.loads(route.calls[1].request.content)
+    assert fallback_body["response_format"]["type"] == "text"
+
+
+async def test_analyze_stream_fallback_with_markdown_fence(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """A fenced plain-text fallback answer has its markdown fence stripped."""
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": SCHEMA_REJECTION_BODY}),
+            sse_response(
+                {"choices": [{"delta": {"content": fenced_content()}}]},
+                "[DONE]",
+            ),
+        ],
+    )
+    response = await run_stream(client)
+    assert isinstance(response, AnalysisResponse)
+    assert response.analysis[0].player_id == 100
+    assert route.call_count == 2
+
+
+async def test_analyze_stream_budget_with_fallback(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """The json_schema downgrade shares one budget of at most three requests."""
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        side_effect=[
+            httpx.Response(400, json={"error": SCHEMA_REJECTION_BODY}),
+            httpx.Response(400, json={"error": SCHEMA_REJECTION_BODY}),
+            stream_response(),
+        ],
+    )
+    response = await run_stream(client)
+    assert isinstance(response, AnalysisResponse)
+    # Schema rejection (1) + first text attempt (2) + successful retry (3).
+    assert route.call_count == 3
+    assert route.call_count <= client.max_retries
