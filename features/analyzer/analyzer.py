@@ -27,6 +27,39 @@ from infra.llm.schemas import AnalysisResponse
 DEFAULT_REASONING_MAX_CHARS: Final[int] = 4096
 
 
+def _partial_reasoning(max_chars: int, chunks: list[str]) -> str:
+    """Return the reasoning streamed before a failure, clipped to ``max_chars``.
+
+    Preserve partial reasoning even if the structured response never arrived.
+
+    Args:
+        max_chars: configured maximum, ``llm.reasoning_max_chars``.
+        chunks: reasoning fragments collected so far.
+
+    Returns:
+        The clipped text, or ``""`` when the model streamed nothing.
+    """
+    return _truncate_reasoning("".join(chunks), max_chars) or ""
+
+
+def _truncate_reasoning(reasoning_full: str, max_chars: int) -> str:
+    """Clip streamed reasoning to ``max_chars`` and record the omission.
+
+    Args:
+        reasoning_full: everything the model streamed before the response ended
+            (or before the request failed).
+        max_chars: configured maximum, ``llm.reasoning_max_chars``.
+
+    Returns:
+        The clipped text, with a ``[truncated, total N]`` marker when something
+        was cut. Empty input yields an empty string.
+    """
+    truncated = reasoning_full[:max_chars]
+    if len(reasoning_full) > max_chars:
+        truncated += f"\n[truncated, total {len(reasoning_full)}]"
+    return truncated
+
+
 @dataclass(frozen=True)
 class AnalysisResult:
     """Outcome of one analyzer cycle."""
@@ -127,6 +160,7 @@ class GameAnalyzer:
                 error=f"connection: {error}",
                 duration_sec=max(0.0, time.perf_counter() - start),
                 reasoning_chars=sum(len(chunk) for chunk in reasoning_buffer),
+                reasoning_text=_partial_reasoning(self._reasoning_max_chars, reasoning_buffer),
             )
         except ValidationError as error:
             llm_error = LLMError(f"invalid response: {error}")
@@ -136,6 +170,7 @@ class GameAnalyzer:
                 error=str(llm_error),
                 duration_sec=max(0.0, time.perf_counter() - start),
                 reasoning_chars=sum(len(chunk) for chunk in reasoning_buffer),
+                reasoning_text=_partial_reasoning(self._reasoning_max_chars, reasoning_buffer),
             )
         except LLMError as error:
             logger.bind(channel="llm").error("analysis_failed: {}", str(error))
@@ -144,12 +179,11 @@ class GameAnalyzer:
                 error=str(error),
                 duration_sec=max(0.0, time.perf_counter() - start),
                 reasoning_chars=sum(len(chunk) for chunk in reasoning_buffer),
+                reasoning_text=_partial_reasoning(self._reasoning_max_chars, reasoning_buffer),
             )
 
         reasoning_full = "".join(reasoning_buffer)
-        reasoning_truncated = reasoning_full[: self._reasoning_max_chars]
-        if len(reasoning_full) > self._reasoning_max_chars:
-            reasoning_truncated += f"\n[truncated, total {len(reasoning_full)}]"
+        reasoning_truncated = _truncate_reasoning(reasoning_full, self._reasoning_max_chars)
         if reasoning_truncated:
             logger.bind(channel="reasoning").info(reasoning_truncated)
 
@@ -175,7 +209,7 @@ class GameAnalyzer:
             duration_sec=max(0.0, time.perf_counter() - start),
             reasoning_chars=len(reasoning_full),
             warnings=tuple(warnings),
-            reasoning_text=reasoning_truncated,
+            reasoning_text=reasoning_truncated or "",
         )
 
     def _render_hints(self, hints: list[HeuristicHint]) -> str:

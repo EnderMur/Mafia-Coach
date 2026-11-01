@@ -429,3 +429,33 @@ async def test_orchestrator_shutdown_closes_ui(tmp_path: Path) -> None:
     await orchestrator.shutdown()
 
     assert ui.shutdown_calls == 1
+
+
+async def test_orchestrator_persist_player_on_registration(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    scanner = orchestrator._default_scanner(GAME_CHAT_ID)
+    await scanner._register_player(PLAYER_ID, "Вася")
+    player = result.repos.players.get_player(PLAYER_ID)
+    assert player is not None
+    assert player["username"] == "Вася"
+    await orchestrator.shutdown()
+
+
+async def test_orchestrator_persist_player_dedup(tmp_path: Path, monkeypatch) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    original = result.repos.players.upsert_player
+    calls = []
+
+    def upsert(**kwargs):
+        calls.append(kwargs)
+        original(**kwargs)
+
+    monkeypatch.setattr(result.repos.players, "upsert_player", upsert)
+    await asyncio.gather(
+        orchestrator._persist_player(PLAYER_ID, "Вася"),
+        orchestrator._persist_player(PLAYER_ID, "Вася"),
+    )
+    assert len(calls) == 1
+    await orchestrator.shutdown()

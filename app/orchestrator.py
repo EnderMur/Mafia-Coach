@@ -63,6 +63,8 @@ class Orchestrator:
         self._quit_event = asyncio.Event()
         self._command_task: asyncio.Task[None] | None = None
         self._shutdown_complete = False
+        self._registered_player_ids: set[int] = set()
+        self._player_persistence_lock = asyncio.Lock()
 
     def _default_scanner(self, chat_id: int) -> MessageScanner:
         """Build the production scanner with event persistence wired in."""
@@ -77,6 +79,7 @@ class Orchestrator:
             trigger_policy=self._result.trigger_policy,
             chat_id=chat_id,
             bot_id=bot_id or 0,
+            on_player_registered=self._persist_player,
             on_event=self._persist_event,
             on_reasoning=self._send_reasoning,
         )
@@ -174,6 +177,24 @@ class Orchestrator:
                 )
             await shutdown_result(self._result)
 
+    async def _persist_player(self, player_id: int, name: str) -> None:
+        """Insert a player once, before persisting predictions that reference it."""
+        async with self._player_persistence_lock:
+            if player_id in self._registered_player_ids:
+                return
+            try:
+                await asyncio.to_thread(
+                    self._result.repos.players.upsert_player,
+                    player_id=player_id,
+                    username=name,
+                    display_name=name,
+                )
+                self._registered_player_ids.add(player_id)
+            except Exception as error:  # noqa: BLE001 — best-effort persistence
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "persist_player failed: {}: {}", type(error).__name__, str(error)
+                )
+
     async def _persist_event(self, event: AnyEvent) -> None:
         """Persist one applied scanner event without blocking the event loop."""
         try:
@@ -192,16 +213,15 @@ class Orchestrator:
         if self._ui is None:
             return
         game_state = self._result.game_state
+        if game_state.game_id == 0:
+            return
         try:
             predictions = await asyncio.to_thread(
                 self._result.repos.predictions.list_predictions,
                 game_state.game_id,
             )
-        except Exception as error:  # noqa: BLE001 — UI is best-effort
-            logger.bind(channel=_LOGGER_CHANNEL).warning(
-                "cannot load UI predictions: {}",
-                str(error),
-            )
+        except Exception:  # noqa: BLE001 — UI is best-effort
+            logger.bind(channel=_LOGGER_CHANNEL).opt(exception=True).error("send_stats failed")
             predictions = []
 
         min_confidence = self._result.config.analysis.min_confidence_to_display
@@ -395,6 +415,9 @@ class Orchestrator:
             self._result.game_state = GameState(
                 game_id=game_id,
                 registry=self._result.registry,
+            )
+            logger.bind(channel=_LOGGER_CHANNEL).info(
+                "created game {} for chat_id={}", game_id, chat_id
             )
 
         await self._start_scanner(chat_id)

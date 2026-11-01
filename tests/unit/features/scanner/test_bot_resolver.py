@@ -555,3 +555,49 @@ def test_resolver_does_not_mutate_the_name_mapping() -> None:
     _resolve(_parse(BotMessageKind.VOTE, votes=[("Вася", "Призрак")]), name_to_id=mapping)
 
     assert mapping == NAME_TO_ID
+
+
+def test_markdown_link_in_death():
+    from features.parser.bot_messages import parse_bot_message
+
+    parsed = parse_bot_message("Сегодня повешен [Yulios](tg://user?id=1)", registry=REGISTRY)
+    assert parsed is not None
+    events = _resolve(parsed, {"Yulios": 1})
+    assert len(events) == 1
+    assert isinstance(events[0], DeathEvent)
+    assert events[0].payload.victim_name == "Yulios"
+
+
+def test_markdown_link_in_vote():
+    parsed = _parse(
+        BotMessageKind.VOTE, votes=[("[Вася](tg://user?id=100)", "[Петя](tg://user?id=101)")]
+    )
+    events = _resolve(parsed, NAME_TO_ID)
+    assert len(events) == 1
+    assert isinstance(events[0], VoteEvent)
+    assert events[0].payload.voter_id == 100
+    assert events[0].payload.target_id == 101
+    assert events[0].payload.target_name == "Петя"
+    fallback = _parse(BotMessageKind.VOTE, voter_name="**Вася**", target_name="*Петя*")
+    fallback_event = _resolve(fallback, NAME_TO_ID)[0]
+    assert isinstance(fallback_event, VoteEvent)
+    assert fallback_event.payload.target_id == 101
+
+
+def test_bold_name_in_role_reveal():
+    from features.parser.bot_messages import parse_bot_message
+
+    parsed = parse_bot_message("**Вася** был Мафией", registry=REGISTRY)
+    assert parsed is not None
+    events = _resolve(parsed, NAME_TO_ID)
+    assert len(events) == 1
+    assert isinstance(events[0], RoleRevealEvent)
+    assert events[0].payload.player_name == "Вася"
+
+
+def test_strip_returns_plain_when_no_markdown():
+    from features.scanner.bot_resolver import _strip_markdown
+
+    assert _strip_markdown("Вася") == "Вася"
+    assert _strip_markdown("[**Вася**](tg://user?id=1)") == "Вася"
+    assert _strip_markdown("*Петя*") == "Петя"
