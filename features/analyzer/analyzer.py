@@ -33,6 +33,10 @@ class AnalysisResult:
     response: AnalysisResponse | None
     error: str | None
     duration_sec: float
+    # elapsed wall time of one analyze() cycle, clamped to >= 0.
+    # Clamped because Windows QPC (perf_counter) can roll back on
+    # virtualized CI runners (vCPU migration) — negative duration
+    # has no semantic meaning.
     reasoning_chars: int
     warnings: tuple[str, ...] = ()
 
@@ -81,7 +85,7 @@ class GameAnalyzer:
         persistence failures are recorded as warnings while retaining the LLM
         response.
         """
-        start = time.monotonic()
+        start = time.perf_counter()
         hints = compute_hints(game_state=game_state, registry=self._registry)
         context = build_context(
             game_state=game_state,
@@ -119,7 +123,7 @@ class GameAnalyzer:
             return AnalysisResult(
                 response=None,
                 error=f"connection: {error}",
-                duration_sec=time.monotonic() - start,
+                duration_sec=max(0.0, time.perf_counter() - start),
                 reasoning_chars=sum(len(chunk) for chunk in reasoning_buffer),
             )
         except ValidationError as error:
@@ -128,7 +132,7 @@ class GameAnalyzer:
             return AnalysisResult(
                 response=None,
                 error=str(llm_error),
-                duration_sec=time.monotonic() - start,
+                duration_sec=max(0.0, time.perf_counter() - start),
                 reasoning_chars=sum(len(chunk) for chunk in reasoning_buffer),
             )
         except LLMError as error:
@@ -136,7 +140,7 @@ class GameAnalyzer:
             return AnalysisResult(
                 response=None,
                 error=str(error),
-                duration_sec=time.monotonic() - start,
+                duration_sec=max(0.0, time.perf_counter() - start),
                 reasoning_chars=sum(len(chunk) for chunk in reasoning_buffer),
             )
 
@@ -165,7 +169,7 @@ class GameAnalyzer:
         return AnalysisResult(
             response=response,
             error=None,
-            duration_sec=time.monotonic() - start,
+            duration_sec=max(0.0, time.perf_counter() - start),
             reasoning_chars=len(reasoning_full),
             warnings=tuple(warnings),
         )
