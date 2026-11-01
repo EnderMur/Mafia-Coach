@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -27,7 +28,7 @@ def test_missing_file_raises_config_error_with_path(tmp_path: Path) -> None:
     """A missing settings file is reported with its full path."""
     missing_path = tmp_path / "missing-settings.yaml"
 
-    with pytest.raises(ConfigError, match=str(missing_path)):
+    with pytest.raises(ConfigError, match=re.escape(str(missing_path))):
         load_config(missing_path)
 
 
