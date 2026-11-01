@@ -101,3 +101,31 @@ request transport, and streaming orchestration are implemented in later layers.
 - `analysis_failed` is only a log marker (`channel="llm"`, level `ERROR`), with
   no dedicated table. If a mechanism to retry an analysis later is needed, add a
   `status` column to `predictions` in step 12 or later.
+
+## Async DB
+
+SQLite через stdlib `sqlite3` с `check_same_thread=False`.
+Репозитории остаются **синхронными** (тестируются без asyncio).
+В async-контексте вызывающий оборачивает sync-метод в
+`asyncio.to_thread(...)`:
+
+```python
+# analyzer.py
+await asyncio.to_thread(
+    self._predictions_repo.insert_prediction,
+    game_id=game_id, player_id=player_id, ...
+)
+```
+
+Это работает, потому что:
+
+- Все записи сериализованы через один asyncio event loop.
+- `asyncio.to_thread` создаёт воркер-поток per-call (по умолчанию
+  `ThreadPoolExecutor` с `~min(32, os.cpu_count()+4)` воркерами) —
+  параллельные вызовы из разных корутин могут идти в разные
+  потоки, но по факту у нас один caller (orchestrator).
+- `check_same_thread=False` разрешает использование connection
+  из разных потоков; serialization — ответственность caller'а.
+
+Правило: в async-коде никогда не вызывать sync repo-методы
+напрямую. Всегда `await asyncio.to_thread(...)`.

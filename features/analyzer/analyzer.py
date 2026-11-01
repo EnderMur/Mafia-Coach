@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Final
@@ -155,7 +156,8 @@ class GameAnalyzer:
         if persist:
             for prediction in response.analysis:
                 try:
-                    self._predictions_repo.insert_prediction(
+                    await asyncio.to_thread(
+                        self._predictions_repo.insert_prediction,
                         game_id=game_state.game_id,
                         player_id=prediction.player_id,
                         predicted_role=prediction.suspected_role,
