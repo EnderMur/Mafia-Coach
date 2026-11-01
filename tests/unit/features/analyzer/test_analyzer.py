@@ -1,0 +1,648 @@
+"""Unit tests for high-level game analysis orchestration."""
+
+from __future__ import annotations
+
+import io
+import sqlite3
+from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import jinja2
+import pytest
+from loguru import logger
+from pydantic import ValidationError
+
+if TYPE_CHECKING:
+    from loguru import Record
+
+from domain.events import (
+    DeathEvent,
+    DeathPayload,
+    PhaseChangeEvent,
+    PhaseChangePayload,
+)
+from domain.exceptions import LLMConnectionError, LLMError
+from domain.game_state import GameState
+from domain.phases import Phase
+from domain.roles import RoleRegistry, load_roles
+from features.analyzer.analyzer import AnalysisResult, GameAnalyzer
+from infra.db.connection import connect
+from infra.db.migrations.runner import apply_migrations
+from infra.db.repositories.games import GamesRepository
+from infra.db.repositories.players import PlayersRepository
+from infra.db.repositories.predictions import PredictionsRepository
+from infra.llm.client import LLMClient, ReasoningSink
+from infra.llm.schemas import (
+    AlternativePrediction,
+    AnalysisResponse,
+    PlayerPrediction,
+)
+
+ROLES_PATH = Path(__file__).parents[4] / "configs" / "roles.yaml"
+BASE_TS = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class FakeLLMClient(LLMClient):
+    """Test double that returns predefined responses or errors."""
+
+    def __init__(self) -> None:
+        self._next_response: AnalysisResponse | None = None
+        self._next_error: Exception | None = None
+        self._next_reasoning = ""
+        self.calls: list[dict[str, Any]] = []
+
+    def set_response(self, response: AnalysisResponse, reasoning: str = "") -> None:
+        """Configure the next call to return a response and reasoning stream."""
+        self._next_response = response
+        self._next_error = None
+        self._next_reasoning = reasoning
+
+    def set_error(self, error: Exception) -> None:
+        """Configure the next call to raise an LLM error."""
+        self._next_error = error
+        self._next_response = None
+        self._next_reasoning = ""
+
+    async def healthcheck(self) -> None:
+        """Implement the no-op fake health check."""
+
+    async def analyze(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        known_player_ids: frozenset[int],
+        role_names_ru: frozenset[str],
+        role_alias_resolver: Callable[[str], str | None] | None = None,
+    ) -> AnalysisResponse:
+        """Delegate non-streaming calls to the fake streaming implementation."""
+        return await self.analyze_stream(
+            messages=messages,
+            known_player_ids=known_player_ids,
+            role_names_ru=role_names_ru,
+            role_alias_resolver=role_alias_resolver,
+        )
+
+    async def analyze_stream(
+        self,
+        *,
+        messages: list[dict[str, str]],
+        known_player_ids: frozenset[int],
+        role_names_ru: frozenset[str],
+        role_alias_resolver: Callable[[str], str | None] | None = None,
+        on_reasoning_chunk: ReasoningSink | None = None,
+        log_reasoning_chunks: bool = True,
+    ) -> AnalysisResponse:
+        """Record LLM arguments and return the configured fake result."""
+        call: dict[str, Any] = {
+            "messages": messages,
+            "known_player_ids": known_player_ids,
+            "role_names_ru": role_names_ru,
+            "role_alias_resolver": role_alias_resolver,
+            "on_reasoning_chunk": on_reasoning_chunk,
+            "log_reasoning_chunks": log_reasoning_chunks,
+        }
+        alias_resolutions: list[tuple[str, str | None]] = []
+        if self._next_response is not None and role_alias_resolver is not None:
+            for prediction in self._next_response.analysis:
+                alternative = prediction.alternative
+                if alternative is not None and alternative.role not in role_names_ru:
+                    alias_resolutions.append(
+                        (alternative.role, role_alias_resolver(alternative.role))
+                    )
+        call["alias_resolutions"] = alias_resolutions
+        self.calls.append(call)
+
+        if on_reasoning_chunk is not None and self._next_reasoning:
+            for chunk in self._next_reasoning:
+                on_reasoning_chunk(chunk)
+        if self._next_error is not None:
+            error = self._next_error
+            self._next_error = None
+            raise error
+        if self._next_response is None:
+            raise LLMError("FakeLLMClient: no response configured")
+        return self._next_response
+
+    async def aclose(self) -> None:
+        """Implement the no-op fake close operation."""
+
+
+@pytest.fixture
+def registry() -> RoleRegistry:
+    """Load the real configured role registry."""
+    return load_roles(ROLES_PATH)
+
+
+@pytest.fixture
+def jinja_env() -> jinja2.Environment:
+    """Create the environment used to render application prompt templates."""
+    return jinja2.Environment(
+        loader=jinja2.FileSystemLoader("infra/llm/prompts"),
+        autoescape=False,
+    )
+
+
+@pytest.fixture
+def memory_database() -> Iterator[tuple[sqlite3.Connection, PredictionsRepository]]:
+    """Create an in-memory SQLite database with all migrations applied."""
+    connection = connect(":memory:")
+    apply_migrations(connection)
+    try:
+        yield connection, PredictionsRepository(connection)
+    finally:
+        connection.close()
+
+
+def create_game_with_players(connection: sqlite3.Connection, player_ids: list[int]) -> int:
+    """Insert the foreign-key rows required for predictions and return the game id."""
+    game_id = GamesRepository(connection).create_game(
+        chat_id=1,
+        player_count=len(player_ids),
+    )
+    players_repository = PlayersRepository(connection)
+    for player_id in player_ids:
+        players_repository.upsert_player(
+            player_id=player_id,
+            username=None,
+            display_name=f"Player {player_id}",
+        )
+    return game_id
+
+
+def make_game_state(
+    registry: RoleRegistry,
+    *,
+    game_id: int = 1,
+    player_ids: tuple[int, ...] = (),
+) -> GameState:
+    """Build a game state and register the requested test players."""
+    game_state = GameState(game_id=game_id, registry=registry)
+    for player_id in player_ids:
+        game_state.register_player(player_id, f"Player {player_id}")
+    return game_state
+
+
+def make_prediction(
+    player_id: int,
+    role_name: str,
+    *,
+    confidence: float = 0.7,
+    reasons: list[str] | None = None,
+    alternative: AlternativePrediction | None = None,
+) -> PlayerPrediction:
+    """Build a valid prediction for a synthetic player."""
+    return PlayerPrediction(
+        player_id=player_id,
+        player_name=f"Player {player_id}",
+        suspected_role=role_name,
+        confidence=confidence,
+        alternative=alternative,
+        reasons=reasons if reasons is not None else ["observed behavior"],
+    )
+
+
+def make_response(predictions: list[PlayerPrediction]) -> AnalysisResponse:
+    """Build a valid model response around the given player predictions."""
+    return AnalysisResponse(
+        analysis=predictions,
+        game_read="A short game read.",
+        reasoning="A short response reasoning.",
+    )
+
+
+def is_reasoning_log(record: Record) -> bool:
+    """Select log records bound to the reasoning channel."""
+    return bool(record["extra"].get("channel") == "reasoning")
+
+
+def make_analyzer(
+    fake_llm: FakeLLMClient,
+    predictions_repo: PredictionsRepository,
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    *,
+    max_messages: int = 200,
+    reasoning_max_chars: int = 4096,
+) -> GameAnalyzer:
+    """Create a GameAnalyzer with test dependencies."""
+    return GameAnalyzer(
+        llm_client=fake_llm,
+        predictions_repo=predictions_repo,
+        registry=registry,
+        jinja_env=jinja_env,
+        max_messages=max_messages,
+        reasoning_max_chars=reasoning_max_chars,
+    )
+
+
+async def test_analyze_success_returns_response(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """A valid response is returned as a successful AnalysisResult."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    response = make_response([])
+    fake_llm.set_response(response)
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry), persist=False)
+
+    assert isinstance(result, AnalysisResult)
+    assert result.success is True
+    assert result.response is response
+    assert result.error is None
+    assert fake_llm.calls[0]["log_reasoning_chunks"] is False
+
+
+async def test_analyze_llm_error_returns_result_with_error(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """An LLMError becomes an unsuccessful result instead of escaping."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_error(LLMError("boom"))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry))
+
+    assert result.success is False
+    assert result.response is None
+    assert "boom" in (result.error or "")
+
+
+async def test_analyze_validation_error_returns_llm_error_result(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Direct response validation errors are translated into LLM errors."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    with pytest.raises(ValidationError) as validation_error:
+        AnalysisResponse.model_validate(
+            {"analysis": "not a list", "game_read": "ok", "reasoning": "ok"}
+        )
+    fake_llm.set_error(validation_error.value)
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry))
+
+    assert result.success is False
+    assert result.response is None
+    assert (result.error or "").startswith("invalid response:")
+
+
+async def test_analyze_llm_connection_error(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """A connection error is returned with the documented connection prefix."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_error(LLMConnectionError("refused"))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry))
+
+    assert result.success is False
+    assert result.response is None
+    assert (result.error or "").startswith("connection:")
+
+
+async def test_analyze_persists_predictions(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Every returned prediction is persisted with reasons joined by newlines."""
+    connection, repository = memory_database
+    player_ids = [100, 101]
+    game_id = create_game_with_players(connection, player_ids)
+    game_state = make_game_state(registry, game_id=game_id, player_ids=tuple(player_ids))
+    roles = registry.all_roles()
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(
+        make_response(
+            [
+                make_prediction(100, roles[0].name_ru, reasons=["first reason", "second reason"]),
+                make_prediction(101, roles[1].name_ru, confidence=0.4),
+            ]
+        )
+    )
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(game_state)
+
+    rows = repository.list_predictions(game_id)
+    assert result.success is True
+    assert len(rows) == 2
+    assert rows[0]["player_id"] == 100
+    assert rows[0]["predicted_role"] == roles[0].name_ru
+    assert rows[0]["confidence"] == pytest.approx(0.7)
+    assert rows[0]["reasoning"] == "first reason\nsecond reason"
+    assert rows[1]["player_id"] == 101
+
+
+async def test_analyze_persist_false_skips_db(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Disabling persistence leaves the in-memory predictions table empty."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, registry.all_roles()[0].name_ru)]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(
+        make_game_state(registry, game_id=game_id, player_ids=(100,)),
+        persist=False,
+    )
+
+    assert result.success is True
+    assert repository.list_predictions(game_id) == []
+
+
+async def test_analyze_persistence_failure_adds_warning(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """A repository failure is reported as a warning without losing the response."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+
+    class FailingPredictionsRepository(PredictionsRepository):
+        """Repository double that always fails to insert predictions."""
+
+        def insert_prediction(
+            self,
+            *,
+            game_id: int,
+            player_id: int,
+            predicted_role: str,
+            confidence: float,
+            reasoning: str,
+        ) -> int:
+            raise sqlite3.OperationalError("disk full")
+
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, registry.all_roles()[0].name_ru)]))
+    failing_repository = FailingPredictionsRepository(connection)
+    analyzer = make_analyzer(fake_llm, failing_repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry, game_id=game_id, player_ids=(100,)))
+
+    assert result.success is True
+    assert result.warnings
+    assert "persistence_failed" in result.warnings[0]
+    assert "disk full" in result.warnings[0]
+    assert repository.list_predictions(game_id) == []
+
+
+async def test_analyze_reasoning_truncated(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Long reasoning is truncated in logs but fully counted in the result."""
+    _, repository = memory_database
+    reasoning = "x" * 5000
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]), reasoning=reasoning)
+    analyzer = make_analyzer(
+        fake_llm,
+        repository,
+        registry,
+        jinja_env,
+        reasoning_max_chars=1000,
+    )
+    captured = io.StringIO()
+    sink_id = logger.add(
+        captured,
+        level="INFO",
+        format="{message}",
+        filter=is_reasoning_log,
+    )
+    try:
+        result = await analyzer.analyze(make_game_state(registry), persist=False)
+    finally:
+        logger.remove(sink_id)
+
+    logged_reasoning = captured.getvalue().rstrip("\n")
+    assert len(logged_reasoning) <= 1050
+    assert "[truncated, total 5000]" in logged_reasoning
+    assert result.reasoning_chars == 5000
+
+
+async def test_analyze_reasoning_not_truncated_when_short(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Short reasoning is logged unchanged and its full length is reported."""
+    _, repository = memory_database
+    reasoning = "r" * 100
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]), reasoning=reasoning)
+    analyzer = make_analyzer(
+        fake_llm,
+        repository,
+        registry,
+        jinja_env,
+        reasoning_max_chars=1000,
+    )
+    captured = io.StringIO()
+    sink_id = logger.add(
+        captured,
+        level="INFO",
+        format="{message}",
+        filter=is_reasoning_log,
+    )
+    try:
+        result = await analyzer.analyze(make_game_state(registry), persist=False)
+    finally:
+        logger.remove(sink_id)
+
+    assert captured.getvalue().rstrip("\n") == reasoning
+    assert result.reasoning_chars == 100
+
+
+async def test_analyze_passes_hints_to_context(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """An early lynch hint is rendered into the user prompt for the LLM."""
+    _, repository = memory_database
+    game_state = make_game_state(registry, game_id=1, player_ids=(100, 101, 102, 103))
+    game_state.apply(
+        PhaseChangeEvent(
+            ts=BASE_TS,
+            game_id=1,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION,
+                to_phase=Phase.DAY,
+                day_number=1,
+            ),
+        )
+    )
+    game_state.apply(
+        DeathEvent(
+            ts=BASE_TS,
+            game_id=1,
+            payload=DeathPayload(victim_id=100, victim_name="Player 100", cause="lynch"),
+        )
+    )
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(game_state, persist=False)
+
+    assert result.success is True
+    user_message = fake_llm.calls[0]["messages"][1]["content"]
+    assert "Линч случился в первые дни без аргументации" in user_message
+    assert "- [-0.50]" in user_message
+
+
+async def test_analyze_empty_players_ok(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """A game with no registered players succeeds with empty analysis."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [])
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry, game_id=game_id))
+
+    assert result.success is True
+    assert result.response is not None
+    assert result.response.analysis == []
+    assert repository.list_predictions(game_id) == []
+
+
+async def test_analyze_no_crash_on_validation_edge(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """A structurally valid response with zero predictions remains valid."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry), persist=False)
+
+    assert result.success is True
+    assert result.response is not None
+    assert result.response.analysis == []
+
+
+async def test_analyze_uses_game_id_from_game_state(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Predictions are stored under the state's public game id."""
+    connection, repository = memory_database
+    other_game_id = create_game_with_players(connection, [999])
+    target_game_id = create_game_with_players(connection, [100])
+    assert other_game_id != target_game_id
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, registry.all_roles()[0].name_ru)]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(
+        make_game_state(registry, game_id=target_game_id, player_ids=(100,))
+    )
+
+    assert result.success is True
+    assert repository.list_predictions(other_game_id) == []
+    assert len(repository.list_predictions(target_game_id)) == 1
+
+
+async def test_analyze_duration_positive(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """The analyzer reports a positive elapsed duration for a completed cycle."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry), persist=False)
+
+    assert result.duration_sec > 0
+
+
+async def test_analyze_known_player_ids_passed(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """The LLM client receives exactly the player ids in the game context."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    await analyzer.analyze(
+        make_game_state(registry, player_ids=(100, 101)),
+        persist=False,
+    )
+
+    assert fake_llm.calls[0]["known_player_ids"] == frozenset({100, 101})
+
+
+async def test_analyze_role_alias_resolver_works(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """An alternative role alias is resolved by the callback sent to the LLM."""
+    _, repository = memory_database
+    role_names = {role.name_ru for role in registry.all_roles()}
+    alias = next(
+        alias
+        for role in registry.all_roles()
+        for alias in role.bot_aliases
+        if alias not in role_names
+    )
+    resolved_role = registry.resolve_alias(alias)
+    assert resolved_role is not None
+    primary_role = next(
+        role for role in registry.all_roles() if role.name_ru != resolved_role.name_ru
+    )
+    prediction = make_prediction(
+        100,
+        primary_role.name_ru,
+        confidence=0.6,
+        alternative=AlternativePrediction(role=alias, confidence=0.2),
+    )
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([prediction]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(
+        make_game_state(registry, player_ids=(100,)),
+        persist=False,
+    )
+
+    assert result.success is True
+    assert fake_llm.calls[0]["alias_resolutions"] == [(alias, resolved_role.name_ru)]

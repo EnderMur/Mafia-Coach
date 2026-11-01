@@ -51,8 +51,13 @@ class LLMClient(ABC):
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
+        log_reasoning_chunks: bool = True,
     ) -> AnalysisResponse:
-        """Return validated analysis while forwarding reasoning chunks."""
+        """Return validated analysis while forwarding reasoning chunks.
+
+        Args:
+            log_reasoning_chunks: Log each reasoning chunk at DEBUG when true.
+        """
 
     @abstractmethod
     async def aclose(self) -> None:
@@ -270,6 +275,7 @@ class LMStudioClient(LLMClient):
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
+        log_reasoning_chunks: bool = True,
     ) -> AnalysisResponse:
         """Stream a final JSON response under one shared HTTP-request budget.
 
@@ -277,7 +283,9 @@ class LMStudioClient(LLMClient):
         rejects that format (LM Studio accepts only ``json_schema`` or ``text``),
         the request is retried once with ``response_format="text"`` inside the
         same HTTP-request budget, and markdown fences are stripped before the
-        completed payload is validated.
+        completed payload is validated. Reasoning chunks are always forwarded to
+        ``on_reasoning_chunk``; set ``log_reasoning_chunks=False`` to suppress
+        per-chunk DEBUG log entries.
         """
         self._ensure_open()
         budget = self._max_retries
@@ -298,6 +306,7 @@ class LMStudioClient(LLMClient):
                     role_names_ru=role_names_ru,
                     role_alias_resolver=role_alias_resolver,
                     on_reasoning_chunk=on_reasoning_chunk,
+                    log_reasoning_chunks=log_reasoning_chunks,
                     allow_markdown_fence=not use_schema,
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as error:
@@ -369,6 +378,7 @@ class LMStudioClient(LLMClient):
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None,
         on_reasoning_chunk: ReasoningSink | None,
+        log_reasoning_chunks: bool,
         allow_markdown_fence: bool = False,
     ) -> AnalysisResponse:
         """Perform one HTTP stream request and validate its completed JSON."""
@@ -414,7 +424,8 @@ class LMStudioClient(LLMClient):
                 if isinstance(reasoning_piece, str) and reasoning_piece:
                     if on_reasoning_chunk is not None:
                         on_reasoning_chunk(reasoning_piece)
-                    logger.bind(channel="reasoning").debug(reasoning_piece)
+                    if log_reasoning_chunks:
+                        logger.bind(channel="reasoning").debug(reasoning_piece)
 
                 content_piece = delta.get("content")
                 if isinstance(content_piece, str) and content_piece:

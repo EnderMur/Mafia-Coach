@@ -85,3 +85,19 @@ does not consume retry budget.
 
 This document describes the v1 structured response contract. Context building,
 request transport, and streaming orchestration are implemented in later layers.
+
+## Known limitations / TODO
+
+- `features/analyzer/context_builder.py::DEFAULT_RESPONSE_SCHEMA_JSON` is an
+  embedded copy of `AnalysisResponse.model_json_schema()`. It must not import
+  `infra/` because `features/analyzer` pure modules must remain infrastructure-free.
+  Drift is caught by `test_default_response_schema_matches_contract` in
+  `tests/unit/features/analyzer/`. **Whenever `AnalysisResponse` changes,
+  update `DEFAULT_RESPONSE_SCHEMA_JSON`.**
+- `predictions.reasoning` in the database stores `PlayerPrediction.reasons`
+  joined with `\n`, not the model's full chain of thought. The full chain of thought
+  is written to `logs/reasoning.log` through `channel="reasoning"` (one line per
+  cycle, truncated to `reasoning_max_chars`).
+- `analysis_failed` is only a log marker (`channel="llm"`, level `ERROR`), with
+  no dedicated table. If a mechanism to retry an analysis later is needed, add a
+  `status` column to `predictions` in step 12 or later.

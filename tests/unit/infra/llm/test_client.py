@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import io
 import json
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import httpx
 import pytest
 import pytest_asyncio
 import respx
 from loguru import logger
+
+if TYPE_CHECKING:
+    from loguru import Record
 
 from domain.exceptions import LLMConnectionError, LLMError
 from infra.llm.client import LMStudioClient, _snip
@@ -114,6 +118,11 @@ async def run_stream(client: LMStudioClient) -> AnalysisResponse:
         known_player_ids=frozenset({100}),
         role_names_ru=frozenset({ROLE_NAME}),
     )
+
+
+def is_reasoning_log(record: Record) -> bool:
+    """Select log records bound to the reasoning channel."""
+    return bool(record["extra"].get("channel") == "reasoning")
 
 
 async def test_healthcheck_ok(client: LMStudioClient, respx_mock: respx.MockRouter) -> None:
@@ -644,6 +653,69 @@ async def test_analyze_stream_reasoning_logged_without_content_leak(
     finally:
         logger.complete()
         logger.remove()
+
+
+async def test_analyze_stream_log_reasoning_chunks_false(
+    client: LMStudioClient,
+    respx_mock: respx.MockRouter,
+) -> None:
+    """Reasoning callbacks still work while per-chunk debug logging is disabled."""
+    respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=stream_response(),
+    )
+    captured = io.StringIO()
+    sink_id = logger.add(
+        captured,
+        level="DEBUG",
+        format="{message}",
+        filter=is_reasoning_log,
+    )
+    chunks: list[str] = []
+
+    def collect_reasoning(chunk: str) -> None:
+        chunks.append(chunk)
+
+    try:
+        response = await client.analyze_stream(
+            messages=MESSAGES,
+            known_player_ids=frozenset({100}),
+            role_names_ru=frozenset({ROLE_NAME}),
+            on_reasoning_chunk=collect_reasoning,
+            log_reasoning_chunks=False,
+        )
+    finally:
+        logger.remove(sink_id)
+
+    assert isinstance(response, AnalysisResponse)
+    assert "".join(chunks) == "A short explanation."
+    assert captured.getvalue() == ""
+
+
+async def test_analyze_stream_log_reasoning_chunks_true(
+    client: LMStudioClient,
+    respx_mock: respx.MockRouter,
+) -> None:
+    """The default continues to write each reasoning chunk to the log."""
+    respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=stream_response(),
+    )
+    captured = io.StringIO()
+    sink_id = logger.add(
+        captured,
+        level="DEBUG",
+        format="{message}",
+        filter=is_reasoning_log,
+    )
+    try:
+        response = await run_stream(client)
+    finally:
+        logger.remove(sink_id)
+
+    logged_reasoning = captured.getvalue()
+    assert isinstance(response, AnalysisResponse)
+    assert "A short " in logged_reasoning
+    assert "explanation." in logged_reasoning
+    assert "Player A" not in logged_reasoning
 
 
 async def test_analyze_stream_validation_error_does_not_retry(
