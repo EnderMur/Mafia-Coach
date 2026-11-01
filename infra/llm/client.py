@@ -308,8 +308,7 @@ class LMStudioClient(LLMClient):
                 if use_schema:
                     use_schema = False
                     logger.bind(channel="llm").warning(
-                        "stream: falling back to response_format=text "
-                        "(server rejected json_schema)"
+                        "stream: falling back to response_format=text (server rejected json_schema)"
                     )
                     continue
                 # The plain-text fallback is already active, so spend one more
@@ -498,6 +497,5 @@ def _strip_markdown_fence(text: str) -> str:
         return stripped
     body = body[newline_index + 1 :]
     body = body.rstrip()
-    if body.endswith("```"):
-        body = body[:-3]
+    body = body.removesuffix("```")
     return body.strip()

@@ -19,7 +19,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 _DEFAULT_OUTPUT = Path("tests/fixtures/telegram/real_game.json")
 
 

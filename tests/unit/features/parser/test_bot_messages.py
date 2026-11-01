@@ -9,16 +9,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
 from features.parser.bot_messages import (
+    _EMOJI_TO_ROLE_ID,
     BotMessageKind,
     BotMessageParse,
-    _EMOJI_TO_ROLE_ID,
     parse_bot_message,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -372,37 +372,31 @@ class TestFullDumpClassification:
         total = len(bot_msgs)
         parsed = 0
         unknown = 0
-        errors: list[str] = []
         by_kind: Counter[str] = Counter()
         results: list[BotMessageParse | None] = []
 
         for m in bot_msgs:
-            try:
-                r = parse_bot_message(m.get("text", ""), registry=registry)
-                results.append(r)
-                if r is not None:
-                    parsed += 1
-                    by_kind[r.kind.name] += 1
-                    if r.kind == BotMessageKind.UNKNOWN:
-                        unknown += 1
-            except Exception as exc:
-                errors.append(f"{exc}: {m.get('text', '')[:50]}")
+            r = parse_bot_message(m.get("text", ""), registry=registry)
+            results.append(r)
+            if r is not None:
+                parsed += 1
+                by_kind[r.kind.name] += 1
+                if r.kind == BotMessageKind.UNKNOWN:
+                    unknown += 1
 
         print(f"\n=== C3: real dump ({latest.name}) ===")
         print(f"bot_messages: {total}")
         print(f"parsed:       {parsed} ({100 * parsed / total:.1f}%)" if total else "parsed: 0")
         print(f"unknown:      {unknown} ({100 * unknown / total:.1f}%)" if total else "unknown: 0")
-        print(f"errors:       {len(errors)}")
         for kind, cnt in by_kind.most_common():
             print(f"  {kind:15s}: {cnt}")
 
-        # 0 exceptions
-        assert len(errors) == 0, f"Parser raised {len(errors)} exceptions"
+        # The direct parse loop above fails immediately if parsing raises.
 
-        # >= 95% classified (non-UNKNOWN)
+        # >= 97% classified (non-UNKNOWN)
         if total > 0:
             classified_pct = 100 * (parsed - unknown) / total
-            assert classified_pct >= 95, f"Only {classified_pct:.1f}% classified"
+            assert classified_pct >= 97, f"classified {classified_pct:.1f}%"
 
         # ROLE_REVEAL false-positive detector (step 7b-fix-1): a reveal is
         # only trusted at confidence 1.0 (grammatical form).  A high share
@@ -787,7 +781,7 @@ class TestRobustness:
     def test_bot_message_parse_is_frozen(self) -> None:
         """BotMessageParse should be immutable (frozen pydantic)."""
         p = BotMessageParse(kind=BotMessageKind.UNKNOWN, raw_text="test")
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             p.kind = BotMessageKind.DEATH
 
     def test_emoji_map_has_21_roles(self) -> None:
@@ -867,3 +861,96 @@ class TestRobustness:
         # "был Доном" could match role_reveal, but "Сегодня повешен" matches death first
         assert r.kind is BotMessageKind.DEATH
         assert r.death_cause == "lynch"
+
+
+# Step 7b-fix-2 regression coverage.
+@pytest.mark.parametrize(
+    ("text", "words"),
+    [
+        (
+            "Кто-то из жителей слышал, как Вася кричал перед смертью:\nМафия это Лена",
+            "Мафия это Лена",
+        ),
+        (
+            "Кто-то из жителей слышал, как Вася кричал перед смертью:\nПервая строка\nВторая строка",
+            "Первая строка\nВторая строка",
+        ),
+        ("Кто-то из жителей слышал, как Вася кричал перед смертью:\n", None),
+        ("Кто-то из жителей слышал, как 🕵️ X кричал перед смертью:\nПрощайте", "Прощайте"),
+    ],
+)
+def test_last_words(registry, text, words):
+    result = parse_bot_message(text, registry=registry)
+    assert result is not None and result.kind is BotMessageKind.LAST_WORDS
+    assert result.last_words == words
+    assert result.player_name
+
+
+@pytest.mark.parametrize(
+    ("text", "voter", "target"),
+    [
+        ("🇷🇺ℹ голосовал(а) за: Вася", "🇷🇺ℹ", "Вася"),
+        ("Вася голосовал(а) за: 🇷🇺ℹ", "Вася", "🇷🇺ℹ"),
+        ("Вася 🦱 голосовал(а) за: Петя", "Вася", "Петя"),
+        ("k голосовал(а) за: Вася", "k", "Вася"),
+        ("Вася голосовал(а) за: .", "Вася", None),
+        ("Вася голосовал(а) за: 🇧🇦", "Вася", "🇧🇦"),
+        ("Вася голосовал(а) за: v", "Вася", "v"),
+        ("Лена голосовал(а) за: .", "Лена", None),
+        ("🇧🇦 голосовал(а) за: Вася", "🇧🇦", "Вася"),
+        ("m голосовал(а) за: Петя", "m", "Петя"),
+    ],
+)
+def test_vote_emoji_short_names_and_abstain(registry, text, voter, target):
+    result = parse_bot_message(text, registry=registry)
+    assert result is not None and result.kind is BotMessageKind.VOTE
+    assert (result.voter_name, result.target_name) == (voter, target)
+    assert result.votes == [(voter, target)]
+
+
+def test_gift_simple(registry):
+    result = parse_bot_message("Вася подарил 💎5 к Пете!", registry=registry)
+    assert result is not None and result.kind is BotMessageKind.GIFT
+    assert (result.player_name, result.target_name) == ("Вася", "Пете")
+
+
+def test_gift_complex_names(registry):
+    result = parse_bot_message("🇷🇺ℹ | Вася | 💎 подарил 💎3 к 🕵️ | Петя | 💋!", registry=registry)
+    assert result is not None and result.kind is BotMessageKind.GIFT
+    assert (result.player_name, result.target_name) == ("Вася", "Петя")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Странно, этой ночью все остались в живых...",
+        "Недостаточно игроков для начала игры...",
+    ],
+)
+def test_new_system_messages(registry, text):
+    result = parse_bot_message(text, registry=registry)
+    assert result is not None and result.kind is BotMessageKind.SYSTEM
+
+
+def test_role_action_interaction(registry):
+    result = parse_bot_message(
+        "Сегодня 🤵🏻 Дон пытался убить Мага\nПосмотрим...", registry=registry
+    )
+    assert result is not None and result.kind is BotMessageKind.ROLE_ACTION
+    assert result.role_id == "don"
+
+
+def test_regressions_and_multiline_vote(registry):
+    cases = [
+        ("🤵🏻 Дон выбрал жертву", BotMessageKind.ROLE_ACTION),
+        ("Вася был Мафией", BotMessageKind.ROLE_REVEAL),
+        ("🌙 Кто-то был убит", BotMessageKind.DEATH),
+    ]
+    for text, kind in cases:
+        result = parse_bot_message(text, registry=registry)
+        assert result is not None and result.kind is kind
+    result = parse_bot_message(
+        "Вася голосовал(а) за: Петя\n\n\nЛена голосовал(а) за: Игорь", registry=registry
+    )
+    assert result is not None and result.kind is BotMessageKind.VOTE
+    assert result.votes == [("Вася", "Петя"), ("Лена", "Игорь")]

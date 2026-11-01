@@ -61,10 +61,9 @@ def test_transaction_rolls_back_on_exception() -> None:
     connection = connect(":memory:")
     try:
         connection.execute("CREATE TABLE sample (value INTEGER)")
-        with pytest.raises(RuntimeError, match="abort"):
-            with transaction(connection):
-                connection.execute("INSERT INTO sample VALUES (1)")
-                raise RuntimeError("abort")
+        with pytest.raises(RuntimeError, match="abort"), transaction(connection):
+            connection.execute("INSERT INTO sample VALUES (1)")
+            raise RuntimeError("abort")
         assert connection.execute("SELECT COUNT(*) FROM sample").fetchone()[0] == 0
         assert connection.in_transaction is False
     finally:

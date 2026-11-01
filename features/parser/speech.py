@@ -10,7 +10,6 @@ from __future__ import annotations
 import re
 from typing import Final
 
-
 DEFAULT_MAX_CHARS: Final[int] = 2000
 
 _EMOJI_PATTERN: Final[re.Pattern[str]] = re.compile(
@@ -31,7 +30,7 @@ _EMOJI_PATTERN: Final[re.Pattern[str]] = re.compile(
 _WHITESPACE_RUN: Final[re.Pattern[str]] = re.compile(r"[ \t]+")
 _BLANK_LINES_RUN: Final[re.Pattern[str]] = re.compile(r"\n{3,}")
 _CONTROL_CHARS: Final[re.Pattern[str]] = re.compile(
-    "[\U00000000-\U00000008\U0000000b\U0000000c" "\U0000000e-\U0000001f\U0000007f]"
+    "[\U00000000-\U00000008\U0000000b\U0000000c\U0000000e-\U0000001f\U0000007f]"
 )
 ELLIPSIS: Final[str] = "\u2026"
 
@@ -87,7 +86,7 @@ def truncate(text: str, max_chars: int = DEFAULT_MAX_CHARS) -> str:
         ValueError: если ``max_chars < 1``.
     """
     if isinstance(max_chars, bool) or not isinstance(max_chars, int):
-        raise ValueError(f"max_chars must be int, got {type(max_chars).__name__}")
+        raise TypeError(f"max_chars must be int, got {type(max_chars).__name__}")
     if max_chars < 1:
         raise ValueError(f"max_chars must be >= 1, got {max_chars}")
     if len(text) <= max_chars:

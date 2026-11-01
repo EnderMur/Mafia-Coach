@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import sqlite3
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 
@@ -33,7 +33,7 @@ def create_game(conn: sqlite3.Connection) -> int:
 
 def timestamp() -> datetime:
     """Return a timezone-aware event timestamp."""
-    return datetime(2025, 1, 1, 12, 30, tzinfo=timezone.utc)
+    return datetime(2025, 1, 1, 12, 30, tzinfo=UTC)
 
 
 def make_message(game_id: int, text: str = "Hello") -> MessageEvent:

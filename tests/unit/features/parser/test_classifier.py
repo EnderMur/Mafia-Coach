@@ -10,7 +10,6 @@ from features.parser.classifier import (
     classify_message,
 )
 
-
 BOT_ID = 4242
 
 
@@ -80,14 +79,14 @@ def test_zero_ids_match_as_bot() -> None:
 
 def test_bool_bot_id_rejected() -> None:
     """bool — подкласс int, но bot_id=True должен быть отклонён."""
-    with pytest.raises(ValueError, match="bot_id"):
+    with pytest.raises(TypeError, match="bot_id"):
         classify_message(text="привет", from_id=1, bot_id=True)
 
 
 @pytest.mark.parametrize("invalid_bot_id", ["42", 4.2, None])
 def test_non_int_bot_id_rejected(invalid_bot_id: object) -> None:
-    """Не-int bot_id отклоняется с ValueError."""
-    with pytest.raises(ValueError, match="bot_id"):
+    """Не-int bot_id отклоняется с TypeError."""
+    with pytest.raises(TypeError, match="bot_id"):
         classify_message(text="привет", from_id=1, bot_id=invalid_bot_id)  # type: ignore[arg-type]
 
 
