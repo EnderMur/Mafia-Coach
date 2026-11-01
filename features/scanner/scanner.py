@@ -14,7 +14,11 @@ stateful and asynchronous. It glues the pure pieces of the pipeline together:
 Event persistence is intentionally **not** done here: raw events are written to
 SQLite by the orchestrator (step 10), which owns repository lifetimes and the
 ``asyncio.to_thread`` offloading of the synchronous ``sqlite3`` calls
-(AI_INSTRUCTIONS.md §4, ``docs/llm_contract.md``).
+(AI_INSTRUCTIONS.md §4, ``docs/llm_contract.md``). Players, however, must be
+known to the database *before* the analyzer writes predictions, because
+``predictions.player_id`` references ``players(id)``; the scanner therefore
+announces every newly registered player through ``on_player_registered`` and
+lets the orchestrator decide where to store it.
 
 Concurrency model
 -----------------
@@ -45,7 +49,7 @@ from domain.roles import RoleRegistry
 from features.analyzer.analyzer import GameAnalyzer
 from features.parser.bot_messages import parse_bot_message
 from features.parser.classifier import MessageKind, classify_message
-from features.scanner.bot_resolver import resolve_bot_message
+from features.scanner.bot_resolver import _strip_markdown, resolve_bot_message
 from features.scanner.trigger_policy import TriggerPolicy
 from infra.telegram.client import TelegramClientWrapper
 
@@ -134,6 +138,7 @@ class MessageScanner:
         bot_id: int,
         on_event: Callable[[AnyEvent], Awaitable[None]] | None = None,
         on_reasoning: Callable[[str], Awaitable[None]] | None = None,
+        on_player_registered: Callable[[int, str], Awaitable[None]] | None = None,
     ) -> None:
         """Retain dependencies and initialize the empty scan state.
 
@@ -147,6 +152,10 @@ class MessageScanner:
             bot_id: Telegram id of the game bot.
             on_event: Optional async callback for each successfully applied event.
             on_reasoning: Optional async callback for successful analysis reasoning.
+            on_player_registered: Optional async callback invoked once per player
+                the first time it is introduced to ``GameState``. The
+                orchestrator uses it to persist the player in SQLite, so later
+                prediction rows satisfy the ``players(id)`` foreign key.
         """
         self._telegram = telegram
         self._game_state = game_state
@@ -159,9 +168,11 @@ class MessageScanner:
         # secondary callback under a distinct internal name to preserve it.
         self._event_callback = on_event
         self._on_reasoning_callback = on_reasoning
+        self._on_player_registered = on_player_registered
 
         self._name_to_id: dict[str, int] = {}
         self._registered_ids: set[int] = set()
+        self._registration_lock = asyncio.Lock()
         self._buffer: list[AnyEvent] = []
         self._debounce_task: asyncio.Task[None] | None = None
         self._flushing: bool = False
@@ -272,7 +283,7 @@ class MessageScanner:
         else:
             # MessageKind has exactly three members and IRRELEVANT returned
             # above, so PLAYER_SPEECH is the only remaining possibility.
-            applied = self._handle_player_speech(
+            applied = await self._handle_player_speech(
                 author_id=sender_id,
                 author_name=display_name or f"{_FALLBACK_NAME_PREFIX}{sender_id}",
                 text=text or "",
@@ -295,7 +306,7 @@ class MessageScanner:
         """
         if not text:
             return
-        parse = parse_bot_message(text, registry=self._registry)
+        parse = parse_bot_message(_strip_markdown(text), registry=self._registry)
         if parse is None:
             return
         events = resolve_bot_message(
@@ -310,7 +321,7 @@ class MessageScanner:
             return
         applied: list[AnyEvent] = []
         for event in events:
-            self._ensure_event_player(event)
+            await self._ensure_event_player(event)
             if self._apply_safely(event):
                 applied.append(event)
                 await self._emit(event)
@@ -318,7 +329,7 @@ class MessageScanner:
             self._buffer.extend(applied)
             await self._maybe_flush(triggered_by=applied)
 
-    def _handle_player_speech(
+    async def _handle_player_speech(
         self,
         *,
         author_id: int,
@@ -336,11 +347,11 @@ class MessageScanner:
 
         Returns:
             The applied event, or ``None`` when it was dropped. The caller
-            awaits :meth:`_maybe_flush` because this method stays synchronous.
+            awaits :meth:`_maybe_flush` because this method only applies state.
         """
         if not text.strip():
             return None
-        self._register_player(author_id, author_name)
+        await self._register_player(author_id, author_name)
         event = MessageEvent(
             ts=ts,
             game_id=self._game_state.game_id,
@@ -359,29 +370,43 @@ class MessageScanner:
     # GameState plumbing
     # ------------------------------------------------------------------
 
-    def _register_player(self, player_id: int, display_name: str) -> None:
+    async def _register_player(self, player_id: int, display_name: str) -> None:
         """Introduce a player to ``GameState`` once.
 
         ``GameState`` starts empty and rejects deaths/role reveals for unknown
-        players, so the scanner registers every player it learns about.
+        players, so the scanner registers every player it learns about. Each
+        new player is also announced through ``on_player_registered`` so the
+        orchestrator can persist it in SQLite; predictions reference
+        ``players(id)`` through a foreign key, so an in-memory-only player
+        makes every later prediction insert fail.
 
         Args:
             player_id: Telegram user id.
             display_name: nickname the bot writes in game.
         """
-        if player_id in self._registered_ids:
-            return
-        if not display_name.strip():
-            return
-        self._game_state.register_player(player_id, display_name)
-        self._registered_ids.add(player_id)
-        logger.bind(channel=_LOGGER_CHANNEL).debug(
-            "player registered: id={} name={!r}",
-            player_id,
-            display_name,
-        )
+        async with self._registration_lock:
+            if player_id in self._registered_ids:
+                return
+            if not display_name.strip():
+                return
+            self._game_state.register_player(player_id, display_name)
+            self._registered_ids.add(player_id)
+            logger.bind(channel=_LOGGER_CHANNEL).debug(
+                "player registered: id={} name={!r}",
+                player_id,
+                display_name,
+            )
+            if self._on_player_registered is not None:
+                try:
+                    await self._on_player_registered(player_id, display_name)
+                except Exception as e:  # noqa: BLE001 — callback защитный
+                    logger.bind(channel=_LOGGER_CHANNEL).error(
+                        "on_player_registered failed: {}: {}",
+                        type(e).__name__,
+                        str(e),
+                    )
 
-    def _ensure_event_player(self, event: AnyEvent) -> None:
+    async def _ensure_event_player(self, event: AnyEvent) -> None:
         """Register the player an event refers to, before applying it.
 
         Args:
@@ -391,7 +416,7 @@ class MessageScanner:
         if referenced is None:
             return
         player_id, display_name = referenced
-        self._register_player(player_id, display_name)
+        await self._register_player(player_id, display_name)
 
     def _apply_safely(self, event: AnyEvent) -> bool:
         """Apply an event, downgrading domain rejections to a log record.

@@ -91,7 +91,7 @@ class FakeAnalyzer:
         self.last_game_state: GameState | None = None
         self.next_success: bool = True
         self.raise_error: Exception | None = None
-        self.on_analyze: Callable[[], None] | None = None
+        self.on_analyze: Callable[[], Awaitable[None]] | None = None
         self.next_reasoning_text = ""
 
     async def analyze(
@@ -108,7 +108,7 @@ class FakeAnalyzer:
         # suspension point so re-entrancy guards are actually exercised.
         await asyncio.sleep(0)
         if self.on_analyze is not None:
-            self.on_analyze()
+            await self.on_analyze()
         if self.raise_error is not None:
             raise self.raise_error
         if self.next_success:
@@ -799,7 +799,7 @@ async def test_player_speech_with_blank_text_is_dropped(
     """24b. The synchronous player handler rejects blank text on its own."""
     scanner, _analyzer, _telegram = build_scanner(game_state=game_state, registry=registry)
 
-    applied = scanner._handle_player_speech(
+    applied = await scanner._handle_player_speech(
         author_id=VASYA,
         author_name="Вася",
         text="   ",
@@ -844,11 +844,11 @@ async def test_messages_arriving_during_flush_are_rescheduled(
     await scanner.start()
     injected: list[AnyEvent | None] = []
 
-    def inject_during_analysis() -> None:
+    async def inject_during_analysis() -> None:
         if injected:
             return
         injected.append(
-            scanner._handle_player_speech(
+            await scanner._handle_player_speech(
                 author_id=PETYA,
                 author_name="Петя",
                 text="Слово, пришедшее во время анализа",
@@ -965,11 +965,13 @@ async def test_role_reveal_marks_known_player(
     assert revealed_player.known_role.id == "mafia"
 
 
-def test_register_player_rejects_blank_name(game_state: GameState, registry: RoleRegistry) -> None:
+async def test_register_player_rejects_blank_name(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
     """32. A blank display name is never registered (``Player`` requires text)."""
     scanner, _analyzer, _telegram = build_scanner(game_state=game_state, registry=registry)
 
-    scanner._register_player(VASYA, "   ")
+    await scanner._register_player(VASYA, "   ")
 
     assert game_state.players() == ()
     assert scanner._registered_ids == set()
@@ -1029,3 +1031,56 @@ async def test_flush_ignores_failed_analysis_reasoning(registry: RoleRegistry) -
     await scanner._flush()
 
     assert received == []
+
+
+async def test_player_registration_calls_on_player_registered_callback(game_state, registry):
+    registered = []
+
+    async def callback(player_id, name):
+        registered.append((player_id, name))
+
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    scanner._on_player_registered = callback
+    await scanner._on_event(player_event(VASYA, "Вася", "Я мирный житель"))
+    assert registered == [(VASYA, "Вася")]
+
+
+async def test_player_registration_dedupes_repeated_players(game_state, registry):
+    registered = []
+
+    async def callback(player_id, name):
+        registered.append((player_id, name))
+        await asyncio.sleep(0)
+
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    scanner._on_player_registered = callback
+    await asyncio.gather(
+        *[scanner._on_event(player_event(VASYA, "Вася", "Я мирный житель")) for _ in range(2)]
+    )
+    assert registered == [(VASYA, "Вася")]
+    assert len(game_state.events()) == 2
+
+
+async def test_player_registration_callback_error_swallowed(game_state, registry, log_records):
+    async def callback(player_id, name):
+        raise RuntimeError("failure")
+
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    scanner._on_player_registered = callback
+    await scanner._on_event(player_event(VASYA, "Вася", "Я мирный житель"))
+    assert len(game_state.events()) == 1
+    assert any("on_player_registered failed" in text for text in _messages(log_records))
+
+
+async def test_bot_markdown_links_resolve_through_parser(game_state, registry):
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    await scanner._on_event(player_event(VASYA, "Вася", "Я мирный житель"))
+    await scanner._on_event(player_event(PETYA, "Петя", "Я тоже мирный житель"))
+    await scanner._on_event(
+        bot_event("[Вася](tg://user?id=100) голосовал за: [Петя](tg://user?id=101)")
+    )
+    await scanner._on_event(bot_event("Сегодня повешен [Вася](tg://user?id=100)"))
+    vote = game_state.events_by_kind("vote")[0]
+    assert isinstance(vote, VoteEvent)
+    assert vote.payload.target_id == PETYA
+    assert not game_state.player(VASYA).alive

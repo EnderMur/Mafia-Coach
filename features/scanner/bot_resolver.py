@@ -17,10 +17,17 @@ everything else    → ``[]``                   (informational only)
 Unresolvable data is never fatal: the event is skipped with a WARNING on
 the ``scanner`` log channel, because a single unknown nickname must not
 stop the whole pipeline.
+
+Player names are normalized with :func:`_strip_markdown` before lookup: real
+game bots mention players as Telegram markdown links
+(``[Yulios](tg://user?id=1)``) or with ``**bold**``/``*italic*`` markup, and
+those decorated strings never match the plain nicknames the scanner collected
+from Telegram messages.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Final, Literal, TypeAlias
@@ -66,6 +73,36 @@ _DEATH_CAUSES: Final[dict[str | None, _DeathCause]] = {
 
 #: Placeholder text for a last-words announcement without any words.
 _NO_LAST_WORDS: Final[str] = "(no words)"
+
+#: Telegram mention of a player: ``[Yulios](tg://user?id=1)`` → ``Yulios``.
+_MARKDOWN_LINK_RE: Final[re.Pattern[str]] = re.compile(r"\[?([^\[\]]+)\]\(tg://user\?id=\d+\)?")
+
+#: MarkdownV2 bold: ``**Вася**`` → ``Вася``.
+_MD_BOLD_RE: Final[re.Pattern[str]] = re.compile(r"\*\*([^*]+)\*\*")
+
+#: Legacy italic: ``*Петя*`` → ``Петя`` (without eating bold markers).
+_MD_ITALIC_RE: Final[re.Pattern[str]] = re.compile(r"(?<!\*)\*([^*]+)\*(?!\*)")
+
+
+def _strip_markdown(text: str) -> str:
+    """Extract the plain player name from Telegram markdown decoration.
+
+    Game bots write names as mention links and emphasize them with markup, so
+    the raw text almost never equals the nickname the scanner stored in
+    ``name_to_id``. Only decorations are removed — the name itself is kept
+    verbatim, including inner spaces and case.
+
+    Args:
+        text: player name exactly as the bot message spelled it.
+
+    Returns:
+        The bare name with surrounding whitespace removed. Text without any
+        decoration is returned unchanged.
+    """
+    text = _MARKDOWN_LINK_RE.sub(r"\1", text)
+    text = _MD_BOLD_RE.sub(r"\1", text)
+    text = _MD_ITALIC_RE.sub(r"\1", text)
+    return text.strip()
 
 
 def resolve_bot_message(
@@ -159,9 +196,10 @@ def _resolve_death(
     if not parse.player_name:
         _warn("death without player_name, skipped")
         return []
-    victim_id = name_to_id.get(parse.player_name)
+    victim_name = _strip_markdown(parse.player_name)
+    victim_id = name_to_id.get(victim_name)
     if victim_id is None:
-        _warn("death: unresolved victim name {!r}, skipped", parse.player_name)
+        _warn("death: unresolved victim name {!r}, skipped", victim_name)
         return []
     cause = _DEATH_CAUSES.get(parse.death_cause)
     if cause is None:
@@ -173,7 +211,7 @@ def _resolve_death(
             game_id=game_id,
             payload=DeathPayload(
                 victim_id=victim_id,
-                victim_name=parse.player_name,
+                victim_name=victim_name,
                 cause=cause,
             ),
         )
@@ -200,9 +238,10 @@ def _resolve_role_reveal(
     except UnknownRoleError:
         _warn("role_reveal: unknown role id {!r}, skipped", parse.role_id)
         return []
-    player_id = name_to_id.get(parse.player_name)
+    player_name = _strip_markdown(parse.player_name)
+    player_id = name_to_id.get(player_name)
     if player_id is None:
-        _warn("role_reveal: unresolved player name {!r}, skipped", parse.player_name)
+        _warn("role_reveal: unresolved player name {!r}, skipped", player_name)
         return []
     return [
         RoleRevealEvent(
@@ -210,7 +249,7 @@ def _resolve_role_reveal(
             game_id=game_id,
             payload=RoleRevealPayload(
                 player_id=player_id,
-                player_name=parse.player_name,
+                player_name=player_name,
                 role_name_ru=role.name_ru,
             ),
         )
@@ -228,15 +267,20 @@ def _resolve_votes(
     votes: list[tuple[str, str | None]] = list(parse.votes) if parse.votes is not None else []
     if not votes and parse.voter_name is not None:
         # Fallback for parsers/messages that carry a single vote pair only.
+        # ``parse.target_name`` is normalized by the loop below as well.
         votes = [(parse.voter_name, parse.target_name)]
 
     events: list[AnyEvent] = []
-    for voter, target in votes:
+    for raw_voter, raw_target in votes:
+        voter = _strip_markdown(raw_voter)
         voter_id = name_to_id.get(voter)
         if voter_id is None:
             _warn("vote: unresolved voter name {!r}, pair skipped", voter)
             continue
+        target = _strip_markdown(raw_target) if raw_target else None
         target_id = name_to_id.get(target) if target else None
+        if target and target_id is None:
+            _warn("vote: unresolved target name {!r}", target)
         events.append(
             VoteEvent(
                 ts=ts,
@@ -263,9 +307,10 @@ def _resolve_last_words(
     if not parse.player_name:
         _warn("last_words without player_name, skipped")
         return []
-    player_id = name_to_id.get(parse.player_name)
+    player_name = _strip_markdown(parse.player_name)
+    player_id = name_to_id.get(player_name)
     if player_id is None:
-        _warn("last_words: unresolved player name {!r}, skipped", parse.player_name)
+        _warn("last_words: unresolved player name {!r}, skipped", player_name)
         return []
     text = (parse.last_words or "").strip() or _NO_LAST_WORDS
     return [
@@ -274,7 +319,7 @@ def _resolve_last_words(
             game_id=game_id,
             payload=MessagePayload(
                 author_id=player_id,
-                author_name=parse.player_name,
+                author_name=player_name,
                 text=text,
             ),
         )
