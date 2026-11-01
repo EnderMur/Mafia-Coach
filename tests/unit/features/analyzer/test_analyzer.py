@@ -591,6 +591,40 @@ async def test_analyze_duration_positive(
     assert result.duration_sec >= 0
 
 
+async def test_analyze_duration_clamped_non_negative(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """duration_sec is clamped to >= 0 even if perf_counter rolls
+    back (QPC bug on Windows CI)."""
+    import time as _time
+
+    # Сделать так, что второй вызов perf_counter < первого.
+    calls = iter([100.0, 99.97])  # delta = -0.03
+    real_pc = _time.perf_counter
+
+    def fake_pc() -> float:
+        try:
+            return next(calls)
+        except StopIteration:
+            return real_pc()
+
+    # Dotted string form: ``analyzer_mod.time`` triggers mypy attr-defined
+    # (strict no_implicit_reexport), while pytest resolves this path itself.
+    monkeypatch.setattr("features.analyzer.analyzer.time.perf_counter", fake_pc)
+
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    result = await analyzer.analyze(make_game_state(registry), persist=False)
+
+    assert result.duration_sec == 0.0, f"expected clamp to 0.0, got {result.duration_sec}"
+
+
 async def test_analyze_known_player_ids_passed(
     registry: RoleRegistry,
     jinja_env: jinja2.Environment,
