@@ -12,7 +12,6 @@ from features.parser.speech import (
     truncate,
 )
 
-
 # --- remove_emoji ---------------------------------------------------------
 
 
@@ -114,8 +113,8 @@ def test_truncate_rejects_non_positive_limit(bad: int) -> None:
 
 @pytest.mark.parametrize("bad", [True, "5", 5.0, None])
 def test_truncate_rejects_non_int_limit(bad: object) -> None:
-    """max_chars не int (в том числе bool) — ValueError."""
-    with pytest.raises(ValueError, match="max_chars"):
+    """max_chars не int (в том числе bool) — TypeError."""
+    with pytest.raises(TypeError, match="max_chars"):
         truncate("abc", max_chars=bad)  # type: ignore[arg-type]
 
 

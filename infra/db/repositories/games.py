@@ -19,8 +19,7 @@ class GamesRepository:
     def create_game(self, *, chat_id: int, player_count: int) -> int:
         """Create a game and return its database identifier."""
         cursor = self._conn.execute(
-            "INSERT INTO games(chat_id, started_at, player_count) "
-            "VALUES (?, CURRENT_TIMESTAMP, ?)",
+            "INSERT INTO games(chat_id, started_at, player_count) VALUES (?, CURRENT_TIMESTAMP, ?)",
             (chat_id, player_count),
         )
         assert cursor.lastrowid is not None
@@ -34,7 +33,7 @@ class GamesRepository:
             raise ConfigError(f"invalid winner faction: {winner_faction}") from error
 
         cursor = self._conn.execute(
-            "UPDATE games SET ended_at = CURRENT_TIMESTAMP, winner_faction = ? " "WHERE id = ?",
+            "UPDATE games SET ended_at = CURRENT_TIMESTAMP, winner_faction = ? WHERE id = ?",
             (faction.value, game_id),
         )
         if cursor.rowcount == 0:

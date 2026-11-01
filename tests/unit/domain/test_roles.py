@@ -20,7 +20,6 @@ from domain.roles import (
     load_roles,
 )
 
-
 ROLES_PATH = Path(__file__).parents[3] / "configs" / "roles.yaml"
 
 

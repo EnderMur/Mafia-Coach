@@ -63,7 +63,7 @@ def test_failed_migration_rolls_back_all_its_statements(
     """A migration failure rolls back DDL and its version record."""
     migration = tmp_path / "002_broken.sql"
     migration.write_text(
-        "CREATE TABLE transient_table (id INTEGER PRIMARY KEY);\n" "NOT VALID SQL;\n",
+        "CREATE TABLE transient_table (id INTEGER PRIMARY KEY);\nNOT VALID SQL;\n",
         encoding="utf-8",
     )
     with pytest.raises(sqlite3.OperationalError):

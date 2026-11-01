@@ -9,16 +9,16 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from pydantic import ValidationError
 
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
 from features.parser.bot_messages import (
+    _EMOJI_TO_ROLE_ID,
     BotMessageKind,
     BotMessageParse,
-    _EMOJI_TO_ROLE_ID,
     parse_bot_message,
 )
-
 
 # ---------------------------------------------------------------------------
 # Shared fixtures
@@ -372,32 +372,26 @@ class TestFullDumpClassification:
         total = len(bot_msgs)
         parsed = 0
         unknown = 0
-        errors: list[str] = []
         by_kind: Counter[str] = Counter()
         results: list[BotMessageParse | None] = []
 
         for m in bot_msgs:
-            try:
-                r = parse_bot_message(m.get("text", ""), registry=registry)
-                results.append(r)
-                if r is not None:
-                    parsed += 1
-                    by_kind[r.kind.name] += 1
-                    if r.kind == BotMessageKind.UNKNOWN:
-                        unknown += 1
-            except Exception as exc:
-                errors.append(f"{exc}: {m.get('text', '')[:50]}")
+            r = parse_bot_message(m.get("text", ""), registry=registry)
+            results.append(r)
+            if r is not None:
+                parsed += 1
+                by_kind[r.kind.name] += 1
+                if r.kind == BotMessageKind.UNKNOWN:
+                    unknown += 1
 
         print(f"\n=== C3: real dump ({latest.name}) ===")
         print(f"bot_messages: {total}")
         print(f"parsed:       {parsed} ({100 * parsed / total:.1f}%)" if total else "parsed: 0")
         print(f"unknown:      {unknown} ({100 * unknown / total:.1f}%)" if total else "unknown: 0")
-        print(f"errors:       {len(errors)}")
         for kind, cnt in by_kind.most_common():
             print(f"  {kind:15s}: {cnt}")
 
-        # 0 exceptions
-        assert len(errors) == 0, f"Parser raised {len(errors)} exceptions"
+        # The direct parse loop above fails immediately if parsing raises.
 
         # >= 97% classified (non-UNKNOWN)
         if total > 0:
@@ -787,7 +781,7 @@ class TestRobustness:
     def test_bot_message_parse_is_frozen(self) -> None:
         """BotMessageParse should be immutable (frozen pydantic)."""
         p = BotMessageParse(kind=BotMessageKind.UNKNOWN, raw_text="test")
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError):
             p.kind = BotMessageKind.DEATH
 
     def test_emoji_map_has_21_roles(self) -> None:

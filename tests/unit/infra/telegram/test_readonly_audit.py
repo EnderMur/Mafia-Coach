@@ -96,9 +96,9 @@ def test_edited_message_only_for_warning() -> None:
     for match in matches:
         snippet = text[match.start() : match.start() + 400]
         lowered = snippet.lower()
-        assert (
-            "warn" in lowered or "warning" in lowered
-        ), "events.MessageEdited without warning context"
+        assert "warn" in lowered or "warning" in lowered, (
+            "events.MessageEdited without warning context"
+        )
         # The edited event must never be handed to a user handler directly.
         assert "self._handlers" not in snippet
 

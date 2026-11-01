@@ -25,7 +25,7 @@ DEFAULT_MIN_SPEECH_LENGTH: Final[int] = 3
 def _validate_int(name: str, value: object) -> None:
     """Ensure ``value`` is a real ``int`` and not a ``bool``."""
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValueError(f"{name} must be int, got {type(value).__name__}")
+        raise TypeError(f"{name} must be int, got {type(value).__name__}")
 
 
 def classify_message(

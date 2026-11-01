@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Callable
 from copy import deepcopy
-from typing import Any, Callable, TypeGuard
+from typing import Any, TypeGuard
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
@@ -69,7 +71,7 @@ def validate_response(
             AnalysisResponse.model_validate_json(raw)
         except ValidationError as validation_error:
             raise validation_error from error
-        raise error
+        raise
     warnings: list[str] = []
     normalized_data = deepcopy(parsed)
     _normalize_confidence_values(normalized_data, warnings)
@@ -167,8 +169,7 @@ def _normalize_confidence_values(data: Any, warnings: list[str]) -> None:
                 item["confidence"] = float(primary_value) / total
                 alternative["confidence"] = float(alternative_value) / total
                 warnings.append(
-                    f"confidence values normalized for player {player_id}: "
-                    "their sum exceeded 1.0"
+                    f"confidence values normalized for player {player_id}: their sum exceeded 1.0"
                 )
 
 
@@ -177,7 +178,7 @@ def _clamp_value(value: Any) -> tuple[float, bool] | None:
     if not _is_number(value):
         return None
     number = float(value)
-    if number != number:
+    if math.isnan(number):
         return None
     clamped = min(1.0, max(0.0, number))
     return clamped, clamped != number

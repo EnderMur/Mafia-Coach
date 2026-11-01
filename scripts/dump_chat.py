@@ -307,7 +307,7 @@ def run_cli(argv: Sequence[str] | None = None) -> int:
     ) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-    except Exception:
+    except (OSError, ValueError, TypeError, RuntimeError):
         traceback.print_exc(file=sys.stderr)
         return 1
     return 0

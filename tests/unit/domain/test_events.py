@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+
 import pytest
 from pydantic import ValidationError
 
@@ -25,7 +26,7 @@ from domain.phases import Phase
 
 def timestamp() -> datetime:
     """Return a timezone-aware event timestamp."""
-    return datetime(2025, 1, 1, tzinfo=timezone.utc)
+    return datetime(2025, 1, 1, tzinfo=UTC)
 
 
 def make_events() -> tuple[AnyEvent, ...]:

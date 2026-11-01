@@ -601,9 +601,7 @@ def _looks_like_player_token(token: str) -> bool:
         return False
     if token.casefold() in _NOISE_NAME_TOKENS:
         return False
-    if token[0].isupper() or any(char.isdigit() or char in "_@-" for char in token):
-        return True
-    return False
+    return bool(token[0].isupper() or any(char.isdigit() or char in "_@-" for char in token))
 
 
 def _try_role_by_name(candidate: str, registry: RoleRegistry) -> Role | None:
@@ -683,9 +681,7 @@ def _looks_like_role_word(candidate: str) -> bool:
         return False
     if first.casefold() in _NON_ROLE_WORDS:
         return False
-    if _RE_ACTION_VERB.match(first):
-        return False
-    return True
+    return not _RE_ACTION_VERB.match(first)
 
 
 def _try_detect_emoji_role(text: str) -> str | None:
@@ -987,9 +983,12 @@ def _parse_phase_change(text: str) -> BotMessageParse | None:
     DEATH (caught earlier) and must never flip the phase.
     """
     starts_with_phase_emoji = text.startswith(("🌙", "🌝"))
-    if len(text) >= _PHASE_MAX_LEN and not starts_with_phase_emoji:
-        if not _RE_GAME_END.search(text):
-            return None
+    if (
+        len(text) >= _PHASE_MAX_LEN
+        and not starts_with_phase_emoji
+        and not _RE_GAME_END.search(text)
+    ):
+        return None
 
     to_phase: Phase | None = None
     if _RE_NIGHT_START.search(text):
@@ -1055,7 +1054,7 @@ def parse_bot_message(
         stripped = text.strip()
         if not stripped:
             return None
-    except Exception:  # pragma: no cover — defensive
+    except (TypeError, ValueError, AttributeError, KeyError):  # defensive input guard
         return None
 
     # 2. Last words: arbitrary multi-line payload; classify before other patterns.

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -24,7 +24,6 @@ from domain.game_state import GameState
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
 
-
 ROLES_PATH = Path(__file__).parents[3] / "configs" / "roles.yaml"
 
 
@@ -42,7 +41,7 @@ def game(registry: RoleRegistry) -> GameState:
 
 def event_time() -> datetime:
     """Return a timezone-aware timestamp for event fixtures."""
-    return datetime(2025, 1, 1, tzinfo=timezone.utc)
+    return datetime(2025, 1, 1, tzinfo=UTC)
 
 
 def make_death(player_id: int = 1, game_id: int = 1) -> DeathEvent:
