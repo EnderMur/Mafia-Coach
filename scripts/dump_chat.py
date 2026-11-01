@@ -225,6 +225,12 @@ def _warn_about_output(output: Path, *, anonymize: bool) -> None:
                 "WARNING: output is outside data/ AND not anonymized — DO NOT COMMIT",
                 file=sys.stderr,
             )
+    if output.as_posix().startswith("data/dumps/"):
+        print(
+            "INFO: dumped to data/dumps/ (gitignored). "
+            "Do NOT move this file into tests/ without manual "
+            "PII review."
+        )
     if resolved.is_relative_to((Path("tests") / "fixtures").resolve()):
         print(
             "INFO: place for test fixtures. Verify manually there is no PII "

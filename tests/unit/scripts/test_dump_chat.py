@@ -286,11 +286,15 @@ def test_raw_dump_inside_data_still_warns(
     captured = capsys.readouterr()
     assert "WARNING" in captured.err
     assert "DO NOT COMMIT" in captured.err
+    assert "INFO: dumped to data/dumps/ (gitignored)." in captured.out
+    assert "without manual PII review." in captured.out
     assert read_json(output)["messages"][0]["sender_id"] == PLAYER_IDS[0]
     assert f"OK: wrote 1 messages to {output}" in captured.out
 
 
-def test_parse_defaults_and_quiet_logging(env: SimpleNamespace) -> None:
+def test_parse_defaults_and_quiet_logging(
+    env: SimpleNamespace, capsys: pytest.CaptureFixture[str]
+) -> None:
     """The advertised defaults are stable and the CLI config path is relative to cwd."""
     args = dump_chat.parse_args([])
     assert args.limit == 10_000
@@ -305,6 +309,10 @@ def test_parse_defaults_and_quiet_logging(env: SimpleNamespace) -> None:
     env.setup_logging.assert_called_once_with(level="WARNING", log_dir="logs")
     env.wrapper.list_recent_messages.assert_awaited_once_with(chat_id=CHAT_ID, limit=10_000)
     assert len(list(Path("data/dumps").glob("chat_*.json"))) == 1
+    captured = capsys.readouterr()
+    assert "INFO: dumped to data/dumps/ (gitignored)." in captured.out
+    assert "without manual PII review." in captured.out
+    assert "WARNING" not in captured.err
 
 
 @pytest.mark.parametrize(
@@ -714,3 +722,12 @@ def test_script_has_no_mutating_calls_or_application_imports() -> None:
             assert (node.module or "").split(".")[0] not in {"app", "features", "telethon"}
         if isinstance(node, ast.Import):
             assert all(alias.name.split(".")[0] != "telethon" for alias in node.names)
+
+
+def test_gitignore_covers_dumps(tmp_path: Path) -> None:
+    """data/dumps/* должен быть в .gitignore (defense-in-depth
+    против случайного коммита реального дампа)."""
+    gitignore = Path(".gitignore").read_text(encoding="utf-8")
+    assert "data/dumps/*" in gitignore
+    assert "!data/dumps/.gitkeep" in gitignore
+    assert Path("data/dumps/.gitkeep").is_file()
