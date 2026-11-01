@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from infra.db.connection import close, connect, transaction
+from infra.db.migrations.runner import apply_migrations
 
 
 def test_connect_memory_returns_row_connection() -> None:
@@ -68,3 +69,31 @@ def test_transaction_rolls_back_on_exception() -> None:
         assert connection.in_transaction is False
     finally:
         close(connection)
+
+
+def test_check_same_thread_false_allows_cross_thread_use() -> None:
+    """Connection can be used from a worker thread via
+    asyncio.to_thread (check_same_thread=False)."""
+    import asyncio
+
+    conn = connect(":memory:")
+    apply_migrations(conn)
+    try:
+
+        async def run() -> int:
+            def insert_and_count() -> int:
+                conn.execute(
+                    "INSERT INTO games(chat_id, player_count) VALUES (?, ?)",
+                    (-100, 2),
+                )
+                row = conn.execute(
+                    "SELECT COUNT(*) AS c FROM games",
+                ).fetchone()
+                return int(row["c"])
+
+            return await asyncio.to_thread(insert_and_count)
+
+        n = asyncio.run(run())
+        assert n == 1
+    finally:
+        close(conn)

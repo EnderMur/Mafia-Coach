@@ -680,3 +680,52 @@ async def test_analyze_role_alias_resolver_works(
 
     assert result.success is True
     assert fake_llm.calls[0]["alias_resolutions"] == [(alias, resolved_role.name_ru)]
+
+
+async def test_analyze_persist_runs_in_thread(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """insert_prediction is called via asyncio.to_thread,
+    not blocking the event loop."""
+    import asyncio as _asyncio
+
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+
+    # Подменить asyncio.to_thread на spy, чтобы убедиться,
+    # что repo.insert_prediction вызывается через него.
+    real_to_thread = _asyncio.to_thread
+    calls: list[str] = []
+
+    async def spy_to_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
+        calls.append(func.__name__)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "features.analyzer.analyzer.asyncio.to_thread",
+        spy_to_thread,
+    )
+
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(
+        make_response(
+            [
+                make_prediction(player_id=100, role_name="Мафия"),
+            ]
+        )
+    )
+    analyzer = make_analyzer(
+        fake_llm,
+        repository,
+        registry,
+        jinja_env,
+    )
+    result = await analyzer.analyze(
+        make_game_state(registry, game_id=game_id, player_ids=(100,)),
+        persist=True,
+    )
+    assert result.success
+    assert "insert_prediction" in calls, f"expected insert_prediction via to_thread, got {calls}"
