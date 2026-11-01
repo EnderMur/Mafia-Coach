@@ -13,6 +13,8 @@ from app.bootstrap import BootstrapResult, shutdown_result
 from domain.events import AnyEvent
 from domain.game_state import GameState
 from features.scanner.scanner import MessageScanner
+from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
+from features.ui.window_host import WindowHost
 
 _LOGGER_CHANNEL: str = "orchestrator"
 _ATTACH_PROMPT: str = "Введите номер чата для подключения (или пустую строку для отмены): "
@@ -21,8 +23,8 @@ _ATTACH_PROMPT: str = "Введите номер чата для подключ�
 class Orchestrator:
     """Main async loop that owns the scanner and application lifecycle.
 
-    Step 10a deliberately stays headless: the primary console accepts commands,
-    but the two display windows are outside this module and belong to step 10b.
+    The primary console accepts commands while two output-only child windows
+    display current stats and analyzer reasoning through lightweight IPC.
     """
 
     def __init__(
@@ -31,6 +33,8 @@ class Orchestrator:
         bootstrap_result: BootstrapResult,
         scanner_factory: Callable[[int], MessageScanner] | None = None,
         stdin: TextIO | None = None,
+        window_host: WindowHost | None = None,
+        enable_ui: bool | None = None,
     ) -> None:
         """Retain initialized resources and injectable console/scanner seams.
 
@@ -38,11 +42,23 @@ class Orchestrator:
             bootstrap_result: Dependencies created by :func:`app.bootstrap.bootstrap`.
             scanner_factory: Optional factory used to create a scanner per chat.
             stdin: Optional input stream, primarily for tests.
+            window_host: Optional injected owner for the two output windows.
+            enable_ui: Override UI config; ``None`` uses configured windows.
         """
         self._result = bootstrap_result
         self._scanner_factory = scanner_factory or self._default_scanner
         self._stdin = stdin if stdin is not None else sys.stdin
         self._scanner: MessageScanner | None = None
+        ui_cfg = bootstrap_result.config.ui
+        ui_enabled = (
+            ui_cfg.stats_window or ui_cfg.reasoning_window if enable_ui is None else enable_ui
+        )
+        self._ui: WindowHost | None = window_host
+        if ui_enabled and self._ui is None:
+            self._ui = WindowHost(
+                stats_enabled=ui_cfg.stats_window,
+                reasoning_enabled=ui_cfg.reasoning_window,
+            )
         self._chat_id = bootstrap_result.config.telegram.chat_id
         self._quit_event = asyncio.Event()
         self._command_task: asyncio.Task[None] | None = None
@@ -62,6 +78,7 @@ class Orchestrator:
             chat_id=chat_id,
             bot_id=bot_id or 0,
             on_event=self._persist_event,
+            on_reasoning=self._send_reasoning,
         )
 
     async def run(self) -> None:
@@ -72,6 +89,9 @@ class Orchestrator:
         """
         if self._quit_event.is_set():
             return
+
+        if self._ui is not None:
+            await self._ui.start()
 
         if self._chat_id is None:
             await self._handle_attach(None)
@@ -97,9 +117,24 @@ class Orchestrator:
                     await quit_task
                 except asyncio.CancelledError:
                     pass
+            command_task = self._command_task
+            if command_task is not None:
+                if not command_task.done():
+                    command_task.cancel()
+                try:
+                    await command_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as error:  # noqa: BLE001 — cleanup must still finish
+                    logger.bind(channel=_LOGGER_CHANNEL).error(
+                        "command reader failed while run was stopping: {}: {}",
+                        type(error).__name__,
+                        str(error),
+                    )
+                self._command_task = None
 
     async def shutdown(self) -> None:
-        """Cancel command input, stop the scanner, and close owned resources."""
+        """Cancel command input, stop scanner/UI children, and close resources."""
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
@@ -128,6 +163,15 @@ class Orchestrator:
                 str(error),
             )
         finally:
+            try:
+                if self._ui is not None:
+                    await self._ui.shutdown()
+            except Exception as error:  # noqa: BLE001 — continue resource cleanup
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "UI shutdown failed: {}: {}",
+                    type(error).__name__,
+                    str(error),
+                )
             await shutdown_result(self._result)
 
     async def _persist_event(self, event: AnyEvent) -> None:
@@ -138,6 +182,82 @@ class Orchestrator:
             logger.bind(channel=_LOGGER_CHANNEL).error(
                 "persist event failed: {}: {}",
                 type(error).__name__,
+                str(error),
+            )
+            return
+        await self._send_stats()
+
+    async def _send_stats(self) -> None:
+        """Build and send the strongest current predictions to the stats window."""
+        if self._ui is None:
+            return
+        game_state = self._result.game_state
+        try:
+            predictions = await asyncio.to_thread(
+                self._result.repos.predictions.list_predictions,
+                game_state.game_id,
+            )
+        except Exception as error:  # noqa: BLE001 — UI is best-effort
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "cannot load UI predictions: {}",
+                str(error),
+            )
+            predictions = []
+
+        min_confidence = self._result.config.analysis.min_confidence_to_display
+        sorted_predictions = sorted(
+            predictions,
+            key=lambda row: float(row["confidence"]),
+            reverse=True,
+        )[:20]
+        players = game_state.players()
+        rows: list[StatsRow] = []
+        for prediction in sorted_predictions:
+            confidence = float(prediction["confidence"])
+            if confidence < min_confidence:
+                continue
+            player = next(
+                (item for item in players if item.player_id == prediction["player_id"]),
+                None,
+            )
+            if player is None:
+                continue
+            rows.append(
+                StatsRow(
+                    player_name=player.display_name,
+                    role=str(prediction["predicted_role"]),
+                    confidence=confidence,
+                )
+            )
+        message = StatsMessage(
+            game_id=game_state.game_id,
+            phase=game_state.current_phase().value,
+            day=game_state.current_day(),
+            rows=rows,
+        )
+        try:
+            await self._ui.send_stats(message)
+        except Exception as error:  # noqa: BLE001 — UI is best-effort
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "send_stats failed: {}",
+                str(error),
+            )
+
+    async def _send_reasoning(self, text: str) -> None:
+        """Send one reasoning result, clipping the IPC frame defensively."""
+        if self._ui is None or not text:
+            return
+        truncated = len(text) > 4096
+        message = ReasoningMessage(
+            text=text[:4096],
+            truncated=truncated,
+            total_chars=len(text),
+        )
+        try:
+            await self._ui.send_reasoning(message)
+        except Exception as error:  # noqa: BLE001 — UI is best-effort
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "send_reasoning failed: {}",
                 str(error),
             )
 

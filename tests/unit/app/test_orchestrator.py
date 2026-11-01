@@ -15,6 +15,7 @@ from app.bootstrap import BootstrapResult, bootstrap
 from app.orchestrator import Orchestrator
 from domain.events import MessageEvent, MessagePayload
 from features.scanner.scanner import MessageScanner
+from features.ui.protocol import ReasoningMessage, StatsMessage
 from tests.unit.app.conftest import FakeLLMClient, FakeTelegram, create_settings_file
 
 GAME_CHAT_ID = -100123
@@ -94,14 +95,19 @@ async def test_run_with_chat_id_starts_scanner(tmp_path: Path) -> None:
         bootstrap_result=result,
         scanner_factory=lambda _chat_id: cast(MessageScanner, scanner),
         stdin=command_input,  # type: ignore[arg-type]
+        enable_ui=False,
     )
 
     run_task = asyncio.create_task(orchestrator.run())
-    await asyncio.sleep(0)
+    await asyncio.sleep(0.02)
     assert scanner.started is True
+    await orchestrator._handle_quit()
+    # The injected synchronous reader is blocked in a worker thread; release it
+    # as well as setting the quit event so the default executor can close cleanly.
     command_input.send("/quit\n")
-    await asyncio.wait_for(run_task, timeout=1.0)
-    await orchestrator.shutdown()
+    await asyncio.wait_for(run_task, timeout=2.0)
+    assert orchestrator._command_task is None
+    await asyncio.wait_for(orchestrator.shutdown(), timeout=2.0)
 
     assert scanner.shutdown_called is True
 
@@ -120,6 +126,7 @@ async def test_run_without_chat_id_calls_attach(tmp_path: Path) -> None:
         bootstrap_result=result,
         scanner_factory=scanner_factory,
         stdin=io.StringIO("1\n"),
+        enable_ui=False,
     )
     await asyncio.wait_for(orchestrator.run(), timeout=1.0)
 
@@ -332,3 +339,93 @@ async def test_run_returns_if_quit_already_signaled(tmp_path: Path) -> None:
 
     assert scanner.started is False
     await orchestrator.shutdown()
+
+
+class FakeWindowHost:
+    """Spy window host used to verify best-effort orchestrator callbacks."""
+
+    def __init__(self) -> None:
+        self.stats: list[StatsMessage] = []
+        self.reasoning: list[ReasoningMessage] = []
+        self.shutdown_calls = 0
+        self.start_calls = 0
+
+    async def start(self) -> None:
+        self.start_calls += 1
+
+    async def send_stats(self, message: StatsMessage) -> None:
+        self.stats.append(message)
+
+    async def send_reasoning(self, message: ReasoningMessage) -> None:
+        self.reasoning.append(message)
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+async def test_orchestrator_sends_stats_after_persist(tmp_path: Path) -> None:
+    """A successful event insert produces a stats frame."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        window_host=ui,  # type: ignore[arg-type]
+    )
+    event = MessageEvent(
+        ts=EVENT_TS,
+        game_id=result.game_state.game_id,
+        payload=MessagePayload(
+            author_id=PLAYER_ID,
+            author_name="Игрок",
+            text="Сообщение для UI",
+        ),
+    )
+
+    await orchestrator._persist_event(event)
+
+    assert len(ui.stats) == 1
+    assert ui.stats[0].game_id == result.game_state.game_id
+    await orchestrator.shutdown()
+
+
+async def test_orchestrator_sends_reasoning_after_scanner_flush(tmp_path: Path) -> None:
+    """Successful analyzer reasoning is forwarded through scanner callback."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        window_host=ui,  # type: ignore[arg-type]
+    )
+    scanner = orchestrator._default_scanner(GAME_CHAT_ID)
+
+    await scanner._flush()
+
+    assert len(ui.reasoning) == 1
+    assert "Проверяю" in ui.reasoning[0].text
+    await orchestrator.shutdown()
+
+
+async def test_orchestrator_ui_disabled_is_noop(tmp_path: Path) -> None:
+    """Explicit headless mode has no host and skips UI notifications."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+
+    assert orchestrator._ui is None
+    await orchestrator._send_stats()
+    await orchestrator._send_reasoning("reasoning")
+
+    await orchestrator.shutdown()
+
+
+async def test_orchestrator_shutdown_closes_ui(tmp_path: Path) -> None:
+    """The injected UI host is shut down along with application resources."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        window_host=ui,  # type: ignore[arg-type]
+    )
+
+    await orchestrator.shutdown()
+
+    assert ui.shutdown_calls == 1

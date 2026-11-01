@@ -154,8 +154,10 @@ async def test_e2e_headless_pipeline(tmp_path: Path) -> None:
     orchestrator = Orchestrator(
         bootstrap_result=bootstrap_result,
         stdin=command_input,  # type: ignore[arg-type]
+        enable_ui=False,
     )
 
+    run_task: asyncio.Task[None] | None = None
     try:
         run_task = asyncio.create_task(orchestrator.run())
         await asyncio.sleep(0)
@@ -192,4 +194,8 @@ async def test_e2e_headless_pipeline(tmp_path: Path) -> None:
         assert len(stored_predictions) == 5
         assert llm_client.calls == 5
     finally:
-        await orchestrator.shutdown()
+        if run_task is not None and not run_task.done():
+            await orchestrator._handle_quit()
+            command_input.send("/quit\n")
+            await asyncio.wait_for(run_task, timeout=2.0)
+        await asyncio.wait_for(orchestrator.shutdown(), timeout=2.0)

@@ -40,6 +40,7 @@ class AnalysisResult:
     # has no semantic meaning.
     reasoning_chars: int
     warnings: tuple[str, ...] = ()
+    reasoning_text: str = ""
 
     @property
     def success(self) -> bool:
@@ -174,6 +175,7 @@ class GameAnalyzer:
             duration_sec=max(0.0, time.perf_counter() - start),
             reasoning_chars=len(reasoning_full),
             warnings=tuple(warnings),
+            reasoning_text=reasoning_truncated,
         )
 
     def _render_hints(self, hints: list[HeuristicHint]) -> str:

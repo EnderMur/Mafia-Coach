@@ -133,6 +133,7 @@ class MessageScanner:
         chat_id: int,
         bot_id: int,
         on_event: Callable[[AnyEvent], Awaitable[None]] | None = None,
+        on_reasoning: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         """Retain dependencies and initialize the empty scan state.
 
@@ -145,6 +146,7 @@ class MessageScanner:
             chat_id: chat observed by this scanner.
             bot_id: Telegram id of the game bot.
             on_event: Optional async callback for each successfully applied event.
+            on_reasoning: Optional async callback for successful analysis reasoning.
         """
         self._telegram = telegram
         self._game_state = game_state
@@ -156,6 +158,7 @@ class MessageScanner:
         # ``_on_event`` is already the Telegram handler method; keep this
         # secondary callback under a distinct internal name to preserve it.
         self._event_callback = on_event
+        self._on_reasoning_callback = on_reasoning
 
         self._name_to_id: dict[str, int] = {}
         self._registered_ids: set[int] = set()
@@ -486,6 +489,15 @@ class MessageScanner:
             self._buffer.clear()
             result = await self._analyzer.analyze(self._game_state, persist=True)
             response = result.response
+            if result.success and result.reasoning_text and self._on_reasoning_callback is not None:
+                try:
+                    await self._on_reasoning_callback(result.reasoning_text)
+                except Exception as error:  # noqa: BLE001 — UI must not break scanning
+                    logger.bind(channel=_LOGGER_CHANNEL).error(
+                        "on_reasoning callback failed: {}: {}",
+                        type(error).__name__,
+                        str(error),
+                    )
             if not result.success or response is None:
                 logger.bind(channel=_LOGGER_CHANNEL).warning(
                     "flush failed: {}",
