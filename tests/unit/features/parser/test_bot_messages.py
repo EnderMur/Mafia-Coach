@@ -399,10 +399,10 @@ class TestFullDumpClassification:
         # 0 exceptions
         assert len(errors) == 0, f"Parser raised {len(errors)} exceptions"
 
-        # >= 95% classified (non-UNKNOWN)
+        # >= 97% classified (non-UNKNOWN)
         if total > 0:
             classified_pct = 100 * (parsed - unknown) / total
-            assert classified_pct >= 95, f"Only {classified_pct:.1f}% classified"
+            assert classified_pct >= 97, f"classified {classified_pct:.1f}%"
 
         # ROLE_REVEAL false-positive detector (step 7b-fix-1): a reveal is
         # only trusted at confidence 1.0 (grammatical form).  A high share
@@ -867,3 +867,96 @@ class TestRobustness:
         # "был Доном" could match role_reveal, but "Сегодня повешен" matches death first
         assert r.kind is BotMessageKind.DEATH
         assert r.death_cause == "lynch"
+
+
+# Step 7b-fix-2 regression coverage.
+@pytest.mark.parametrize(
+    ("text", "words"),
+    [
+        (
+            "Кто-то из жителей слышал, как Вася кричал перед смертью:\nМафия это Лена",
+            "Мафия это Лена",
+        ),
+        (
+            "Кто-то из жителей слышал, как Вася кричал перед смертью:\nПервая строка\nВторая строка",
+            "Первая строка\nВторая строка",
+        ),
+        ("Кто-то из жителей слышал, как Вася кричал перед смертью:\n", None),
+        ("Кто-то из жителей слышал, как 🕵️ X кричал перед смертью:\nПрощайте", "Прощайте"),
+    ],
+)
+def test_last_words(registry, text, words):
+    result = parse_bot_message(text, registry=registry)
+    assert result is not None and result.kind is BotMessageKind.LAST_WORDS
+    assert result.last_words == words
+    assert result.player_name
+
+
+@pytest.mark.parametrize(
+    ("text", "voter", "target"),
+    [
+        ("🇷🇺ℹ голосовал(а) за: Вася", "🇷🇺ℹ", "Вася"),
+        ("Вася голосовал(а) за: 🇷🇺ℹ", "Вася", "🇷🇺ℹ"),
+        ("Вася 🦱 голосовал(а) за: Петя", "Вася", "Петя"),
+        ("k голосовал(а) за: Вася", "k", "Вася"),
+        ("Вася голосовал(а) за: .", "Вася", None),
+        ("Вася голосовал(а) за: 🇧🇦", "Вася", "🇧🇦"),
+        ("Вася голосовал(а) за: v", "Вася", "v"),
+        ("Лена голосовал(а) за: .", "Лена", None),
+        ("🇧🇦 голосовал(а) за: Вася", "🇧🇦", "Вася"),
+        ("m голосовал(а) за: Петя", "m", "Петя"),
+    ],
+)
+def test_vote_emoji_short_names_and_abstain(registry, text, voter, target):
+    result = parse_bot_message(text, registry=registry)
+    assert result is not None and result.kind is BotMessageKind.VOTE
+    assert (result.voter_name, result.target_name) == (voter, target)
+    assert result.votes == [(voter, target)]
+
+
+def test_gift_simple(registry):
+    result = parse_bot_message("Вася подарил 💎5 к Пете!", registry=registry)
+    assert result is not None and result.kind is BotMessageKind.GIFT
+    assert (result.player_name, result.target_name) == ("Вася", "Пете")
+
+
+def test_gift_complex_names(registry):
+    result = parse_bot_message("🇷🇺ℹ | Вася | 💎 подарил 💎3 к 🕵️ | Петя | 💋!", registry=registry)
+    assert result is not None and result.kind is BotMessageKind.GIFT
+    assert (result.player_name, result.target_name) == ("Вася", "Петя")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Странно, этой ночью все остались в живых...",
+        "Недостаточно игроков для начала игры...",
+    ],
+)
+def test_new_system_messages(registry, text):
+    result = parse_bot_message(text, registry=registry)
+    assert result is not None and result.kind is BotMessageKind.SYSTEM
+
+
+def test_role_action_interaction(registry):
+    result = parse_bot_message(
+        "Сегодня 🤵🏻 Дон пытался убить Мага\nПосмотрим...", registry=registry
+    )
+    assert result is not None and result.kind is BotMessageKind.ROLE_ACTION
+    assert result.role_id == "don"
+
+
+def test_regressions_and_multiline_vote(registry):
+    cases = [
+        ("🤵🏻 Дон выбрал жертву", BotMessageKind.ROLE_ACTION),
+        ("Вася был Мафией", BotMessageKind.ROLE_REVEAL),
+        ("🌙 Кто-то был убит", BotMessageKind.DEATH),
+    ]
+    for text, kind in cases:
+        result = parse_bot_message(text, registry=registry)
+        assert result is not None and result.kind is kind
+    result = parse_bot_message(
+        "Вася голосовал(а) за: Петя\n\n\nЛена голосовал(а) за: Игорь", registry=registry
+    )
+    assert result is not None and result.kind is BotMessageKind.VOTE
+    assert result.votes == [("Вася", "Петя"), ("Лена", "Игорь")]

@@ -50,6 +50,8 @@ class BotMessageKind(str, Enum):
     #: Role action notification ("Роль сделала X") — NOT a player reveal.
     ROLE_ACTION = "role_action"
     VOTE = "vote"
+    LAST_WORDS = "last_words"
+    GIFT = "gift"
     ALIVE_LIST = "alive_list"
     #: "Кто-то потратил защиту", "Счастливчику повезло".
     PROTECTION_USED = "protection_used"
@@ -89,7 +91,10 @@ class BotMessageParse(BaseModel):
     target_name: str | None = None
     #: ``[(voter_name, target_name), ...]`` for multi-line vote messages
     #: (``kind=VOTE`` only, otherwise ``None``).
-    votes: list[tuple[str, str]] | None = None
+    votes: list[tuple[str, str | None]] | None = None
+
+    # last_words
+    last_words: str | None = None
 
     raw_text: str = ""
 
@@ -205,6 +210,9 @@ _ACTION_VERB_STEMS: Final[tuple[str, ...]] = (
     "пришел",
     "принес",
     "принёс",
+    "пытался убить",
+    "простить",
+    "покушение",
 )
 
 #: Words that look like a role but are actually death/permission verbs.
@@ -437,6 +445,17 @@ _RE_GAME_END: Final[re.Pattern[str]] = re.compile(
 # --- votes ----------------------------------------------------------------
 
 _VOTE_VERB: Final[str] = r"(?:про)?голос(?:овал[аи]?|ует)(?:\(а\))?"
+_VOTE_RE: Final[re.Pattern[str]] = re.compile(
+    r"([^\n]+?)\s+голосовал(?:\(а\)|а)?\s+за:\s*(.*?)(?=\n|$)",
+    re.UNICODE | re.IGNORECASE,
+)
+_RE_LAST_WORDS: Final[re.Pattern[str]] = re.compile(
+    r"(?is)^\s*Кто-то\s+из\s+жителей\s+слышал,\s*как\s+"
+    r"(?P<name>.+?)\s+кричал\s+перед\s+смертью:[ \t]*(?:\n(?P<words>.*))?$"
+)
+_RE_GIFT: Final[re.Pattern[str]] = re.compile(
+    r"(?is)^\s*(?P<giver>.+?)\s+подарил\s+💎(\d+)\s+к\s+(?P<target>.+?)!?\s*$"
+)
 _RE_VOTE_FOR: Final[re.Pattern[str]] = re.compile(
     rf"(?i)(?P<voter>.{{1,60}}?)\s+{_VOTE_VERB}\s+за\s*:?\s*(?P<target>.+)",
 )
@@ -483,7 +502,9 @@ _RE_ACTION_TARGET: Final[re.Pattern[str]] = re.compile(
 # --- system ---------------------------------------------------------------
 
 _RE_SYSTEM: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?:город\s+ветров|автоматическ\w*\s+старт(?:\s+игры)?)",
+    r"(?i)(?:город\s+ветров|автоматическ\w*\s+старт(?:\s+игры)?"
+    r"|странно.{0,30}этой\s+ночью\s+все\s+остались\s+в\s+живых"
+    r"|недостаточно\s+игроков\s+для\s+начала\s+игры)",
 )
 
 
@@ -744,6 +765,52 @@ def _parse_death(text: str) -> BotMessageParse | None:
     )
 
 
+def _clean_username(raw: str) -> str | None:
+    value = raw.strip()
+    if "|" in value:
+        parts = [part.strip() for part in value.split("|")]
+        if len(parts) >= 2:
+            value = parts[len(parts) // 2]
+    decorations = " 💎💋🦱🕵️🕵🏻🕵🏼🤵🏻🤵🏼"
+    value = value.strip()
+    while value and value[0] in decorations:
+        value = value[1:].lstrip()
+    while value and value[-1] in decorations:
+        value = value[:-1].rstrip()
+    if (
+        not value
+        or value == "."
+        or not any(ch.isalnum() or 0x1F1E6 <= ord(ch) <= 0x1F1FF for ch in value)
+    ):
+        return None
+    return value
+
+
+def _parse_last_words(text: str) -> BotMessageParse | None:
+    match = _RE_LAST_WORDS.match(text)
+    if match is None:
+        return None
+    words = (match.group("words") or "").strip()
+    return BotMessageParse(
+        kind=BotMessageKind.LAST_WORDS,
+        player_name=match.group("name").strip(),
+        last_words=words or None,
+        raw_text=text,
+    )
+
+
+def _parse_gift(text: str) -> BotMessageParse | None:
+    match = _RE_GIFT.match(text)
+    if match is None:
+        return None
+    return BotMessageParse(
+        kind=BotMessageKind.GIFT,
+        player_name=_clean_username(match.group("giver")),
+        target_name=_clean_username(match.group("target")),
+        raw_text=text,
+    )
+
+
 def _clean_vote_target(raw: str) -> str | None:
     target = _strip_marker_prefix(raw.strip())
     # Drop trailing parenthetical noise: "Петя (5 голосов)" → "Петя".
@@ -752,19 +819,22 @@ def _clean_vote_target(raw: str) -> str | None:
 
 
 def _parse_vote(text: str) -> BotMessageParse | None:
-    votes: list[tuple[str, str]] = []
-    for line in text.splitlines():
-        stripped_line = line.strip()
-        if not stripped_line:
-            continue
-        match = _RE_VOTE_FOR.search(stripped_line) or _RE_VOTE_AGAINST.search(stripped_line)
-        if match is None:
-            continue
-        voter = _clean_name(match.group("voter"))
-        target = _clean_vote_target(match.group("target"))
-        if voter is None or target is None:
-            continue
-        votes.append((voter, target))
+    votes: list[tuple[str, str | None]] = []
+    for match in _VOTE_RE.finditer(text):
+        voter = _clean_username(match.group(1))
+        target = _clean_username(match.group(2))
+        if voter is not None:
+            votes.append((voter, target))
+    # Preserve support for older vote phrasing ("против", "проголосовал").
+    if not votes:
+        for line in text.splitlines():
+            against_match = _RE_VOTE_AGAINST.search(line)
+            if against_match is None:
+                continue
+            voter = _clean_username(against_match.group("voter"))
+            target = _clean_username(against_match.group("target"))
+            if voter is not None:
+                votes.append((voter, target))
 
     if votes:
         return BotMessageParse(
@@ -988,7 +1058,12 @@ def parse_bot_message(
     except Exception:  # pragma: no cover — defensive
         return None
 
-    # 2. Alive list FIRST: "Живые игроки:" wraps a multi-line body that
+    # 2. Last words: arbitrary multi-line payload; classify before other patterns.
+    result = _parse_last_words(stripped)
+    if result is not None:
+        return result
+
+    # 3. Alive list FIRST: "Живые игроки:" wraps a multi-line body that
     #    contains role emoji (would otherwise look like role reveals).
     result = _parse_alive_list(stripped)
     if result is not None:
@@ -1024,7 +1099,12 @@ def parse_bot_message(
     if result is not None:
         return result
 
-    # 9. Grammatical role reveals
+    # 9. Gifts
+    result = _parse_gift(stripped)
+    if result is not None:
+        return result
+
+    # 10. Grammatical role reveals
     result = _parse_role_reveal(stripped, registry)
     if result is not None:
         return result
