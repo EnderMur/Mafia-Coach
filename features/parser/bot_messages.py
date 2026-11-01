@@ -2,6 +2,25 @@
 
 Pure module: no I/O, no ``async``, no imports from ``infra``/``app``/``telethon``.
 All functions are synchronous and side-effect free.
+
+Classification priorities (step 7b-fix-1)
+----------------------------------------
+Bot templates overlap heavily, so the order of the branches in
+:func:`parse_bot_message` is load-bearing:
+
+1. empty / ``None``     — returns ``None`` (not ``UNKNOWN``).
+2. ``ALIVE_LIST``       — first: the list body contains role emoji.
+3. ``REGISTRATION``
+4. ``DEATH``            — BEFORE phase change (``"🌙 Кто-то был убит"``).
+5. ``PHASE_CHANGE``     — vote start / vote end only.
+6. ``VOTE``             — multi-line, collects ``votes``.
+7. ``PROTECTION_USED``  — ``"использовал защиту от линчевания"`` is NOT death.
+8. ``VOTE_ABSTAIN``
+9. ``ROLE_REVEAL``      — *grammatical* player reveals only.
+10. ``ROLE_ACTION``     — role "action notifications" (``"Дон выбрал жертву"``).
+11. ``PHASE_CHANGE``    — night / day transitions (short messages only).
+12. ``SYSTEM``
+13. ``UNKNOWN``         — fallback, kept for C3 statistics.
 """
 
 from __future__ import annotations
@@ -15,7 +34,6 @@ from pydantic import BaseModel, ConfigDict
 from domain.phases import Phase
 from domain.roles import Role, RoleRegistry
 
-
 # ---------------------------------------------------------------------------
 # Enums and models
 # ---------------------------------------------------------------------------
@@ -27,9 +45,18 @@ class BotMessageKind(str, Enum):
     REGISTRATION = "registration"
     PHASE_CHANGE = "phase_change"
     DEATH = "death"
+    #: Only grammatical player reveals: ``"X был[а] Роль"`` / ``"X — Роль"``.
     ROLE_REVEAL = "role_reveal"
+    #: Role action notification ("Роль сделала X") — NOT a player reveal.
+    ROLE_ACTION = "role_action"
     VOTE = "vote"
     ALIVE_LIST = "alive_list"
+    #: "Кто-то потратил защиту", "Счастливчику повезло".
+    PROTECTION_USED = "protection_used"
+    #: "X решил никого не вешать".
+    VOTE_ABSTAIN = "vote_abstain"
+    #: "Город ветров начинает игру", "Автоматический старт игры".
+    SYSTEM = "system"
     UNKNOWN = "unknown"
 
 
@@ -46,7 +73,7 @@ class BotMessageParse(BaseModel):
     kind: BotMessageKind
     confidence: float = 1.0
 
-    # role_reveal
+    # role_reveal / role_action
     role_id: str | None = None
     player_name: str | None = None
 
@@ -60,6 +87,9 @@ class BotMessageParse(BaseModel):
     # vote
     voter_name: str | None = None
     target_name: str | None = None
+    #: ``[(voter_name, target_name), ...]`` for multi-line vote messages
+    #: (``kind=VOTE`` only, otherwise ``None``).
+    votes: list[tuple[str, str]] | None = None
 
     raw_text: str = ""
 
@@ -110,86 +140,350 @@ _ROLE_INSTRUMENTAL_SUFFIXES: Final[tuple[str, ...]] = (
     "ью",
 )
 
+#: Verbs used by the bot in *action notifications* ("Роль <verb> …").
+#: A message containing one of them is a ROLE_ACTION, never a reveal.
+_ACTION_VERB_STEMS: Final[tuple[str, ...]] = (
+    "выбрал",
+    "выберет",
+    "выбирает",
+    "выбрала",
+    "ушёл",
+    "ушел",
+    "ушла",
+    "ушли",
+    "вышел",
+    "вышла",
+    "вышли",
+    "отправил",
+    "начал",
+    "спрятал",
+    "зарядил",
+    "пошёл",
+    "пошел",
+    "пошла",
+    "пошли",
+    "сделал",
+    "превратил",
+    "решил",
+    "ищет",
+    "искать",
+    "проверил",
+    "проверяет",
+    "лечит",
+    "вылечил",
+    "заблокировал",
+    "блокирует",
+    "посетил",
+    "навестил",
+    "убил",
+    "поджёг",
+    "поджег",
+    "ждёт",
+    "ждет",
+    "ждём",
+    "ждем",
+    "смотрит",
+    "спит",
+    "проснулся",
+    "проснулась",
+    "защитил",
+    "защищает",
+    "спас",
+    "спасла",
+    "поменял",
+    "взломал",
+    "узнал",
+    "следил",
+    "проверял",
+    "лечил",
+    "блокировал",
+    "выстрелил",
+    "застрелил",
+    "ходил",
+    "сходил",
+    "пришёл",
+    "пришел",
+    "принес",
+    "принёс",
+)
+
+#: Words that look like a role but are actually death/permission verbs.
+_NON_ROLE_WORDS: Final[frozenset[str]] = frozenset(
+    {
+        "убит",
+        "убита",
+        "убиты",
+        "убить",
+        "повешен",
+        "повешена",
+        "повешены",
+        "повесить",
+        "задушен",
+        "задушена",
+        "отравлен",
+        "отравлена",
+        "застрелен",
+        "застрелена",
+        "ранен",
+        "ранена",
+        "вылечен",
+        "вылечена",
+        "заблокирован",
+        "заблокирована",
+        "спасён",
+        "спасен",
+        "спасена",
+        "раскрыт",
+        "раскрыта",
+        "изгнан",
+        "изгнана",
+        "сожжён",
+        "сожжен",
+        "съеден",
+    }
+)
+
+#: Tokens that can never be a player name.
+_NOISE_NAME_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "кто-то",
+        "кто",
+        "то",
+        "этой",
+        "этот",
+        "эта",
+        "ночью",
+        "сегодня",
+        "был",
+        "была",
+        "было",
+        "были",
+        "голосованием",
+        "голосование",
+        "игрок",
+        "игрока",
+        "игроки",
+        "жители",
+        "живых",
+        "защиту",
+        "жертву",
+        "жертва",
+        "никого",
+        "кого",
+        "цель",
+        "он",
+        "она",
+        "оно",
+        "уже",
+        "это",
+    }
+)
+
+#: Token that terminates name extraction ("Вася и Маша" → "Вася").
+_NAME_STOP_TOKENS: Final[frozenset[str]] = frozenset(
+    {
+        "и",
+        "а",
+        "но",
+        "или",
+        "он",
+        "она",
+        "оно",
+        "они",
+        "был",
+        "была",
+        "было",
+        "были",
+        "его",
+        "её",
+        "ее",
+        "их",
+        "это",
+        "который",
+        "которая",
+        "что",
+        "чтобы",
+        "с",
+        "со",
+        "в",
+        "во",
+        "на",
+        "за",
+        "под",
+        "по",
+        "от",
+        "до",
+        "у",
+        "к",
+        "не",
+        "ни",
+        "уже",
+        "также",
+        "тоже",
+    }
+)
+
+#: Phase-change detection is disabled for long messages (spec 7b-fix-1).
+_PHASE_MAX_LEN: Final[int] = 500
+
+# Max number of tokens kept when extracting a player name.
+_MAX_NAME_TOKENS: Final[int] = 3
+
 
 # ---------------------------------------------------------------------------
 # Regex patterns (compiled once)
 # ---------------------------------------------------------------------------
 
-_RE_REGISTRATION: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?:регистрация\s+(?:открыта|закрыта|заверш)"
-    r"|записал[ои]сь?\s+\d"
-    r"|записал(?:ся|ось)\b"
-    r"|регистраци[яи])",
-)
-
-_RE_NIGHT_START: Final[re.Pattern[str]] = re.compile(
-    r"(?:🌙|наступает\s+ночь|город\s+засыпает|ночь\s+наступает|^ночь\s*\d)",
-    re.IGNORECASE,
-)
-_RE_DAY_START: Final[re.Pattern[str]] = re.compile(
-    r"(?:🌝|наступает\s+день|город\s+прос|утро|день\s+наступает|^день\s*\d)",
-    re.IGNORECASE,
-)
-_RE_VOTE_PHASE: Final[re.Pattern[str]] = re.compile(
-    r"(?:пришло\s+время\s+голосован|время\s+голосован|начинается\s+голосован)",
-    re.IGNORECASE,
-)
-_RE_DAY_NUMBER: Final[re.Pattern[str]] = re.compile(
-    r"(?:день|ночь)\s*(?:#?\s*)(\d+)",
-    re.IGNORECASE,
-)
-
-_RE_ALIVE_LIST: Final[re.Pattern[str]] = re.compile(
-    r"^[\s\n]*живы[её]?\s*[:\-]?",
-    re.IGNORECASE,
-)
-
-_RE_DEATH_NIGHT: Final[re.Pattern[str]] = re.compile(
-    r"(?:кто[\-\s]?то\s+(?:был\s+)?убит"
-    r"|убит\s+этой\s+ночью"
-    r"|этой\s+ночью\s+убили"
-    r"|ночью\s+убили"
-    r"|был\s+убит\s+ночью)",
-    re.IGNORECASE,
-)
-_RE_DEATH_LYNCH: Final[re.Pattern[str]] = re.compile(
-    r"(?:сегодня\s+повешен" r"|повешен\s+голосован" r"|голосован.*повешен" r"|линчеван)",
-    re.IGNORECASE,
-)
-_RE_DEATH_NAME: Final[re.Pattern[str]] = re.compile(
-    r"(?:убит|повешен|убили|повешен)\s+(?:🌙\s*)?(\S+(?:\s+\S+)?)",
-    re.IGNORECASE,
-)
-
-_RE_VOTE_FOR: Final[re.Pattern[str]] = re.compile(
-    r"(\S+)\s+проголосовал(?:а)?\s+против\s+(\S+)",
-    re.IGNORECASE,
-)
-_RE_VOTE_RESULTS: Final[re.Pattern[str]] = re.compile(
-    r"(?:результат[ыи]\s+голосован|голосован\w*\s+заверш)",
-    re.IGNORECASE,
-)
-
-# Role-reveal: "X был ROLE" / "X была ROLE"
-_RE_BYL_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"(.+?)\s+был(?:а)?\s+(.+)",
-    re.IGNORECASE,
-)
-
-# Emoji-stripping helper pattern
 _RE_LEADING_EMOJI: Final[re.Pattern[str]] = re.compile(
-    r"^["
-    r"\U0001f300-\U0001f9ff"
-    r"\U0001f600-\U0001f64f"
-    r"\U0001f680-\U0001f6ff"
+    r"^(?:["
+    r"\U0001f300-\U0001faff"
     r"\U00002600-\U000027bf"
-    r"\U0001f900-\U0001f9ff"
-    r"\U0001fa70-\U0001faff"
+    r"\U00002b00-\U00002bff"
     r"\U0001f1e6-\U0001f1ff"
+    r"\U00002139\U00002122\U00002049\U0000203c"
     r"\U0000fe00-\U0000fe0f"
     r"\U0000200d"
     r"\U000020e3"
-    r"]+\s*",
+    r"]+\s*)+",
+)
+
+# --- registration ---------------------------------------------------------
+
+_RE_REGISTRATION: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:ведётся\s+набор"
+    r"|ведется\s+набор"
+    r"|набор\s+в\s+игру"
+    r"|набор\s+(?:открыт|закрыт)"
+    r"|регистрация\s+(?:открыта|закрыта|заверш\w*)"
+    r"|записал(?:ся|ось)"
+    r"|регистраци[яию])",
+)
+
+# --- alive list -----------------------------------------------------------
+
+_RE_ALIVE_LIST: Final[re.Pattern[str]] = re.compile(
+    r"^\s*Живые(?:\s+игроки)?\s*(?:\([^)]*\))?\s*:",
+    re.IGNORECASE,
+)
+
+# --- death ----------------------------------------------------------------
+
+_RE_DEATH_NIGHT: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:кто[\-\s]?то\s+(?:был[а]?\s+)?убит"
+    r"|кто[\-\s]?то\s+погиб"
+    r"|сегодня\s+был[а]?\s+жестоко\s+убит"
+    r"|жестоко\s+убит"
+    r"|этой\s+ночью\s+убили"
+    r"|ночью\s+убили"
+    r"|убит\s+этой\s+ночью"
+    r"|этой\s+ночью\s+(?:был[а]?\s+)?убит"
+    r"|\S+\s+был[а]?\s+убит"
+    r"|(?:^|[.!?\n])\s*убит[а]?\s+\S)",
+)
+
+_RE_DEATH_LYNCH: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:сегодня\s+повешен"
+    r"|голосованием\s+повешен"
+    r"|повешен\w*\s+голосовани"
+    r"|не\s+выдержал\w*.{0,50}?повесил"
+    r"|(?:^|[.!?\n])\s*повешен[а]?\s+\S"
+    r"|линч[её]ван(?!и))",
+)
+
+_RE_NAME_BEFORE_SUICIDE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)^\s*(?P<name>[^\n]+?)\s+не\s+выдержал",
+)
+_RE_NAME_BEFORE_KILLED: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?P<name>[^\s]+)\s+(?:был[а]?|были)\s+убит",
+)
+_RE_NAME_AFTER_HANG: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:сегодня\s+повешен[а]?|голосованием\s+повешен[а]?|повешен[а]?)"
+    r"[\s:\-—]*(?P<name>[^\n]+)",
+)
+_RE_NAME_AFTER_KILL: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:жестоко\s+убит[а]?|убили|убит[а]?)\s+(?P<name>[^\n]+)",
+)
+
+# --- phase change ---------------------------------------------------------
+
+_RE_NIGHT_START: Final[re.Pattern[str]] = re.compile(
+    r"(?:🌙|наступает\s+ночь|город\s+засыпает|ночь\s+наступает|^ночь\s*:?\s*\d)",
+    re.IGNORECASE,
+)
+_RE_DAY_START: Final[re.Pattern[str]] = re.compile(
+    r"(?:🌝|наступает\s+день|город\s+просыпается|город\s+прос|утро\s*:?\s*\d" r"|^день\s*:?\s*\d)",
+    re.IGNORECASE,
+)
+_RE_VOTE_PHASE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:пришло\s+время\s+определить"
+    r"|пришло\s+время\s+голосован"
+    r"|голосование\s+окончено"
+    r"|начинается\s+голосован"
+    r"|голосование\s+продлится"
+    r"|время\s+голосования)",
+)
+_RE_VOTE_PHASE_STANDALONE: Final[re.Pattern[str]] = re.compile(
+    r"(?i)^\s*голосование\s*:?\s*$",
+)
+_RE_DAY_NUMBER: Final[re.Pattern[str]] = re.compile(
+    r"(?:День|Утро|Ночь)\s*:?\s*(?:#\s*)?(\d+)",
+    re.IGNORECASE,
+)
+_RE_GAME_END: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:игра\s+окончена|конец\s+игры|игра\s+завершена"
+    r"|победа\s+(?:мафии|мирных|города|маньяка))",
+)
+
+# --- votes ----------------------------------------------------------------
+
+_VOTE_VERB: Final[str] = r"(?:про)?голос(?:овал[аи]?|ует)(?:\(а\))?"
+_RE_VOTE_FOR: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<voter>.{{1,60}}?)\s+{_VOTE_VERB}\s+за\s*:?\s*(?P<target>.+)",
+)
+_RE_VOTE_AGAINST: Final[re.Pattern[str]] = re.compile(
+    rf"(?i)(?P<voter>.{{1,60}}?)\s+{_VOTE_VERB}\s+против\s+(?P<target>.+)",
+)
+_RE_VOTE_RESULTS: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:результат[ыи]\s+голосован"
+    r"|голосован\w*\s+заверш"
+    r"|голосован\w*\s+окончен"
+    r"|никто\s+не\s+(?:был[а]?\s+)?повешен"
+    r"|голосов?\s+не\s+набрано)",
+)
+_RE_VOTE_ABSTAIN: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:(?P<name>.{1,60}?)\s+решил[аи]?(?:\(а\))?\s+никого\s+не\s+вешать"
+    r"|никого\s+не\s+вешать)",
+)
+
+# --- protection -----------------------------------------------------------
+
+_RE_PROTECTION: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:кто[\-\s]?то\s+потратил\s+защит"
+    r"|счастливчику.{0,50}?повезло"
+    r"|использовал[аи]?(?:\(а\))?\s+защиту"
+    r"|потратил[аи]?\s+защит)",
+)
+
+# --- role reveal / role action -------------------------------------------
+
+_RE_REVEAL_BYL: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?P<name>[^\n]{1,80}?)\s+(?:был|была|было)\s+(?P<role>[^\n]+)$",
+)
+_RE_REVEAL_DASH: Final[re.Pattern[str]] = re.compile(
+    r"^(?P<name>[^\n]{1,80}?)\s*(?:[—–]|\s-\s)\s*(?P<role>[^\n]+)$",
+)
+_RE_ACTION_VERB: Final[re.Pattern[str]] = re.compile(
+    r"(?i)\b(?:" + "|".join(re.escape(stem) for stem in _ACTION_VERB_STEMS) + r")\w*",
+)
+_RE_ACTION_TARGET: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:выбрал[аи]?(?:\(а\))?|выберет|выбирает|посетил[аи]?|навестил[аи]?"
+    r"|проверил[аи]?|убил[аи]?|вылечил[аи]?|заблокировал[аи]?)\s+(?P<target>[^\s,\.!?]+)",
+)
+
+# --- system ---------------------------------------------------------------
+
+_RE_SYSTEM: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:город\s+ветров|автоматическ\w*\s+старт(?:\s+игры)?)",
 )
 
 
@@ -200,7 +494,35 @@ _RE_LEADING_EMOJI: Final[re.Pattern[str]] = re.compile(
 
 def _strip_leading_emoji(text: str) -> str:
     """Remove a leading emoji run (with trailing whitespace)."""
-    return _RE_LEADING_EMOJI.sub("", text).strip()
+    previous = ""
+    result = text
+    while previous != result:
+        previous = result
+        result = _RE_LEADING_EMOJI.sub("", result).lstrip()
+    return result
+
+
+def _strip_marker_prefix(text: str) -> str:
+    """Drop chat-marker prefixes like ``"🇷🇺ℹ | name | 💋"``.
+
+    Returns the first ``|``-separated segment that contains a word
+    character; falls back to the original text when there is no ``|``.
+    """
+    if "|" not in text:
+        return text
+    for segment in (part.strip() for part in text.split("|")):
+        cleaned = _strip_leading_emoji(segment).strip()
+        if cleaned and re.search(r"\w", cleaned):
+            return cleaned
+    return text
+
+
+def _first_non_empty_line(text: str) -> str:
+    """Return the first non-blank line of ``text`` (or ``""``)."""
+    for line in text.splitlines():
+        if line.strip():
+            return line
+    return ""
 
 
 def _extract_day_number(text: str) -> int | None:
@@ -223,53 +545,126 @@ def _normalize_role_word(word: str) -> str:
     return lower
 
 
-def _try_resolve_role(candidate: str, registry: RoleRegistry) -> Role | None:
+def _clean_name(raw: str) -> str | None:
+    """Normalise a captured player name; return ``None`` if it is noise."""
+    candidate = _strip_marker_prefix(raw.strip())
+    candidate = _strip_leading_emoji(candidate).strip()
+    if not candidate:
+        return None
+
+    selected: list[str] = []
+    for token in candidate.split():
+        cleaned = token.strip(".,;:!?—–-«»\"'()[]{}")
+        if not cleaned:
+            continue
+        if cleaned.casefold() in _NAME_STOP_TOKENS:
+            break
+        selected.append(cleaned)
+        if len(selected) >= _MAX_NAME_TOKENS:
+            break
+
+    if not selected:
+        return None
+    if selected[0].casefold() in _NOISE_NAME_TOKENS:
+        return None
+
+    name = " ".join(selected)
+    if len(name) < 2 or not re.search(r"\w", name):
+        return None
+    return name
+
+
+def _looks_like_player_token(token: str) -> bool:
+    """Heuristic: can this token be a player name (capitalised or user-like)?"""
+    if not token:
+        return False
+    if token.casefold() in _NOISE_NAME_TOKENS:
+        return False
+    if token[0].isupper() or any(char.isdigit() or char in "_@-" for char in token):
+        return True
+    return False
+
+
+def _try_role_by_name(candidate: str, registry: RoleRegistry) -> Role | None:
     """Resolve a role from a possibly inflected Russian phrase.
 
     Order of attempts:
-    1. Exact match via ``registry.resolve_alias``.
-    2. Strip instrumental suffixes from each word, rejoin, and retry.
-    3. Prefix-match against all registered names/aliases.
+
+    1. Exact match (``registry.resolve_alias`` / Russian name).
+    2. Strip instrumental suffixes from every word, re-join, retry.
+    3. Prefix match against registered names/aliases.
+    4. First-word prefix match (``"Комиссаром Каттани"`` fallbacks).
     """
-    candidate_stripped = candidate.strip()
-    if not candidate_stripped:
+    cleaned = _strip_leading_emoji(candidate.strip())
+    cleaned = cleaned.strip(" .,;:!?—–-«»\"'()")
+    if not cleaned:
         return None
+    # Cut trailing clauses: "Доном, а user_2 был Мафией" → "Доном".
+    for separator in (",", ";", "!", "?", " ("):
+        if separator in cleaned:
+            cleaned = cleaned.split(separator)[0].strip()
+    if not cleaned:
+        return None
+    if len(cleaned) > 80:
+        cleaned = cleaned[:80].rsplit(" ", 1)[0].strip()
+        if not cleaned:
+            return None
 
     # 1. Exact
-    role = registry.resolve_alias(candidate_stripped)
+    role = registry.resolve_alias(cleaned)
     if role is not None:
         return role
+    role = registry.get_by_name_ru(cleaned)
+    if role is not None:
+        return role
+
+    words = cleaned.split()
+    if not words:
+        return None
 
     # 2. Per-word suffix strip then re-join
-    words = candidate_stripped.split()
-    normalized_words = [_normalize_role_word(w) for w in words]
-    rejoined = " ".join(normalized_words)
-    role = registry.resolve_alias(rejoined)
+    normalized = " ".join(_normalize_role_word(word) for word in words)
+    role = registry.resolve_alias(normalized)
     if role is not None:
         return role
 
-    # 3. Prefix-match: check if any role name/alias starts with
-    #    the normalised phrase.
-    for role_candidate in registry.all_roles():
-        for name_form in (role_candidate.name_ru, *role_candidate.bot_aliases):
-            name_lower = name_form.casefold()
-            if name_lower.startswith(rejoined) and len(rejoined) >= 3:
-                return role_candidate
-
-    # 4. Single first-word match (handles cases like "Мирным жителем"
-    #    where suffix strip on both words might overshoot).
-    if len(words) >= 1:
-        first_base = _normalize_role_word(words[0])
-        role = registry.resolve_alias(first_base)
-        if role is not None:
-            return role
+    # 3. Prefix-match on the normalised phrase
+    if len(normalized) >= 3:
         for role_candidate in registry.all_roles():
             for name_form in (role_candidate.name_ru, *role_candidate.bot_aliases):
-                name_lower = name_form.casefold()
-                if name_lower.startswith(first_base) and len(first_base) >= 3:
+                if name_form.casefold().startswith(normalized):
+                    return role_candidate
+
+    # 4. First-word prefix match
+    first_base = _normalize_role_word(words[0])
+    role = registry.resolve_alias(first_base)
+    if role is not None:
+        return role
+    if len(first_base) >= 3:
+        for role_candidate in registry.all_roles():
+            for name_form in (role_candidate.name_ru, *role_candidate.bot_aliases):
+                if name_form.casefold().startswith(first_base):
                     return role_candidate
 
     return None
+
+
+def _looks_like_role_word(candidate: str) -> bool:
+    """Grammar-only heuristic for an unresolved role word."""
+    cleaned = _strip_leading_emoji(candidate.strip()).strip(" .,;:!?—–-«»\"'()")
+    if len(cleaned) < 3:
+        return False
+    words = cleaned.split()
+    if not words or len(words) > 4:
+        return False
+    first = words[0].strip(".,;:!?—–-")
+    if not first or not first[0].isupper():
+        return False
+    if first.casefold() in _NON_ROLE_WORDS:
+        return False
+    if _RE_ACTION_VERB.match(first):
+        return False
+    return True
 
 
 def _try_detect_emoji_role(text: str) -> str | None:
@@ -283,12 +678,15 @@ def _try_detect_emoji_role(text: str) -> str | None:
 def _find_role_in_text(text: str, registry: RoleRegistry) -> Role | None:
     """Search for any known role name or alias inside text."""
     text_lower = text.casefold()
+    best: Role | None = None
+    best_len = 0
     for role in registry.all_roles():
         for name_form in (role.name_ru, *role.bot_aliases):
             needle = name_form.casefold()
-            if needle in text_lower and len(needle) >= 3:
-                return role
-    return None
+            if len(needle) >= 3 and needle in text_lower and len(needle) > best_len:
+                best = role
+                best_len = len(needle)
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -298,57 +696,37 @@ def _find_role_in_text(text: str, registry: RoleRegistry) -> Role | None:
 
 def _parse_registration(text: str) -> BotMessageParse | None:
     if _RE_REGISTRATION.search(text):
-        return BotMessageParse(
-            kind=BotMessageKind.REGISTRATION,
-            raw_text=text,
-        )
-    return None
-
-
-def _parse_phase_change(text: str) -> BotMessageParse | None:
-    day_number = _extract_day_number(text)
-    to_phase: Phase | None = None
-
-    # Guard: if the text also contains death indicators, it's a death message
-    # (not a phase change).  E.g. "🌙 Кто-то был убит этой ночью." → DEATH.
-    if _RE_DEATH_NIGHT.search(text) or _RE_DEATH_LYNCH.search(text):
-        return None
-
-    # Vote phase (check before day — "голосование" may appear in day context)
-    if _RE_VOTE_PHASE.search(text):
-        to_phase = Phase.VOTE
-    elif _RE_NIGHT_START.search(text):
-        to_phase = Phase.NIGHT
-    elif _RE_DAY_START.search(text):
-        to_phase = Phase.DAY
-
-    # Fallback: standalone "голосование" — but NOT "Голосование завершено"
-    # (that's a VOTE-kind message) or "Голосованием повешен" (that's DEATH).
-    if to_phase is None:
-        text_stripped = text.strip()
-        if re.match(r"(?i)^голосован(ие|ия|ию)?\s*$", text_stripped):
-            to_phase = Phase.VOTE
-
-    if to_phase is not None:
-        return BotMessageParse(
-            kind=BotMessageKind.PHASE_CHANGE,
-            to_phase=to_phase,
-            day_number=day_number,
-            raw_text=text,
-        )
+        return BotMessageParse(kind=BotMessageKind.REGISTRATION, raw_text=text)
     return None
 
 
 def _parse_alive_list(text: str) -> BotMessageParse | None:
-    if _RE_ALIVE_LIST.match(text):
-        return BotMessageParse(
-            kind=BotMessageKind.ALIVE_LIST,
-            raw_text=text,
-        )
+    first_line = _first_non_empty_line(text)
+    if first_line and _RE_ALIVE_LIST.match(first_line):
+        return BotMessageParse(kind=BotMessageKind.ALIVE_LIST, raw_text=text)
+    return None
+
+
+def _extract_death_name(text: str, cause: str) -> str | None:
+    if cause == "lynch":
+        patterns = (_RE_NAME_BEFORE_SUICIDE, _RE_NAME_AFTER_HANG)
+    else:
+        patterns = (_RE_NAME_BEFORE_KILLED, _RE_NAME_AFTER_KILL)
+
+    for pattern in patterns:
+        for match in pattern.finditer(text):
+            name = _clean_name(match.group("name"))
+            if name is not None:
+                return name
     return None
 
 
 def _parse_death(text: str) -> BotMessageParse | None:
+    # Guard: "X использовал(а) защиту от линчевания!" is a protection
+    # notification, NOT a death (checked before any death pattern).
+    if _RE_PROTECTION.search(text):
+        return None
+
     cause: str | None = None
     if _RE_DEATH_LYNCH.search(text):
         cause = "lynch"
@@ -358,140 +736,213 @@ def _parse_death(text: str) -> BotMessageParse | None:
     if cause is None:
         return None
 
-    # Try to extract victim name
-    player_name: str | None = None
-    name_match = _RE_DEATH_NAME.search(text)
-    if name_match:
-        candidate = name_match.group(1).strip()
-        # Filter out noise: if the captured word is a common stop word, skip
-        noise_words = {"этой", "ночью", "был", "кто-то", "голосованием"}
-        if candidate.casefold() not in noise_words and len(candidate) >= 2:
-            player_name = candidate
-
     return BotMessageParse(
         kind=BotMessageKind.DEATH,
         death_cause=cause,
-        player_name=player_name,
+        player_name=_extract_death_name(text, cause),
         raw_text=text,
     )
 
 
+def _clean_vote_target(raw: str) -> str | None:
+    target = _strip_marker_prefix(raw.strip())
+    # Drop trailing parenthetical noise: "Петя (5 голосов)" → "Петя".
+    target = re.sub(r"\s*\([^)]*\)\s*$", "", target).strip()
+    return _clean_name(target)
+
+
 def _parse_vote(text: str) -> BotMessageParse | None:
-    # "X проголосовал против Y"
-    vote_match = _RE_VOTE_FOR.search(text)
-    if vote_match:
+    votes: list[tuple[str, str]] = []
+    for line in text.splitlines():
+        stripped_line = line.strip()
+        if not stripped_line:
+            continue
+        match = _RE_VOTE_FOR.search(stripped_line) or _RE_VOTE_AGAINST.search(stripped_line)
+        if match is None:
+            continue
+        voter = _clean_name(match.group("voter"))
+        target = _clean_vote_target(match.group("target"))
+        if voter is None or target is None:
+            continue
+        votes.append((voter, target))
+
+    if votes:
         return BotMessageParse(
             kind=BotMessageKind.VOTE,
-            voter_name=vote_match.group(1),
-            target_name=vote_match.group(2),
+            confidence=1.0,
+            voter_name=votes[0][0],
+            target_name=votes[0][1],
+            votes=votes,
             raw_text=text,
         )
 
-    # "Результаты голосования" / "Голосование завершено"
     if _RE_VOTE_RESULTS.search(text):
-        return BotMessageParse(
-            kind=BotMessageKind.VOTE,
-            raw_text=text,
-        )
+        return BotMessageParse(kind=BotMessageKind.VOTE, confidence=0.9, raw_text=text)
 
     return None
 
 
+def _parse_protection_used(text: str) -> BotMessageParse | None:
+    if _RE_PROTECTION.search(text):
+        return BotMessageParse(kind=BotMessageKind.PROTECTION_USED, raw_text=text)
+    return None
+
+
+def _parse_vote_abstain(text: str) -> BotMessageParse | None:
+    match = _RE_VOTE_ABSTAIN.search(text)
+    if match is None:
+        return None
+    raw_name = match.group("name")
+    return BotMessageParse(
+        kind=BotMessageKind.VOTE_ABSTAIN,
+        player_name=_clean_name(raw_name) if raw_name else None,
+        raw_text=text,
+    )
+
+
 def _parse_role_reveal(text: str, registry: RoleRegistry) -> BotMessageParse | None:
-    # PRIMARY: "X был ROLE" / "X была ROLE"
-    byl_match = _RE_BYL_PATTERN.search(text)
-    if byl_match:
-        player_candidate = byl_match.group(1).strip()
-        role_candidate = byl_match.group(2).strip()
+    """Grammatical player reveals only (``"X был Роль"`` / ``"X — Роль"``).
 
-        # Clean up role candidate: remove trailing punctuation, limit length
-        role_candidate = role_candidate.rstrip(".,;:!?").strip()
-        # If there's a comma, only take the first part (before comma)
-        if "," in role_candidate:
-            role_candidate = role_candidate.split(",")[0].strip()
-        # Limit candidate length to avoid processing spam
-        if len(role_candidate) > 100:
-            role_candidate = role_candidate[:100].rsplit(" ", 1)[0]
+    Action notifications ("Дон выбрал жертву") are explicitly rejected —
+    they are handled by :func:`_parse_role_action` and must never poison
+    ``GameState`` with fake reveals.
+    """
+    if _RE_ACTION_VERB.search(text):
+        return None
 
-        role = _try_resolve_role(role_candidate, registry)
+    # (a) "Вася был Мафией" / "🔪 user_9 был Маньяком"
+    for byl_match in _RE_REVEAL_BYL.finditer(text):
+        role = _try_role_by_name(byl_match.group("role"), registry)
+        player = _clean_name(byl_match.group("name"))
         if role is not None:
-            # Clean up player name: strip leading emoji
-            clean_player = _strip_leading_emoji(player_candidate)
             return BotMessageParse(
                 kind=BotMessageKind.ROLE_REVEAL,
                 confidence=1.0,
                 role_id=role.id,
-                player_name=clean_player if clean_player else None,
+                player_name=player,
                 raw_text=text,
             )
-
-    # FALLBACK: starts with known emoji + text contains role name
-    emoji_role_id = _try_detect_emoji_role(text)
-    if emoji_role_id is not None:
-        role = registry.get(emoji_role_id)
-        # Check if any known name/alias appears in the text
-        role_in_text = _find_role_in_text(text, registry)
-        if role_in_text is not None and role_in_text.id == emoji_role_id:
-            clean_text = _strip_leading_emoji(text)
-            player_name = clean_text.split()[0] if clean_text.split() else None
+        if player is not None and _looks_like_role_word(byl_match.group("role")):
             return BotMessageParse(
                 kind=BotMessageKind.ROLE_REVEAL,
-                confidence=0.9,
-                role_id=role.id,
-                player_name=player_name,
+                confidence=0.5,
+                role_id=None,
+                player_name=player,
                 raw_text=text,
             )
-        # Even if we don't find the role name in text, emoji alone is
-        # a strong signal — but only if the text has enough content
-        text_no_emoji = _strip_leading_emoji(text)
-        if text_no_emoji and len(text_no_emoji) >= 2:
-            # Check if the text after emoji looks like a name
-            parts = text_no_emoji.split()
-            if parts:
-                first_word = parts[0]
-                # Heuristic: if the first word after emoji is not a common
-                # Russian stop word and not all digits, treat as role_reveal
-                stop_words = {
-                    "кто",
-                    "что",
-                    "это",
-                    "тут",
-                    "вот",
-                    "да",
-                    "нет",
-                    "не",
-                    "и",
-                    "а",
-                    "но",
-                }
-                if first_word.casefold() not in stop_words and not first_word.isdigit():
-                    return BotMessageParse(
-                        kind=BotMessageKind.ROLE_REVEAL,
-                        confidence=0.9,
-                        role_id=role.id,
-                        player_name=first_word,
-                        raw_text=text,
-                    )
 
-    # Second fallback: text contains "—" followed by a role name
-    # e.g. "🕵🏼 user_1 — Комиссар Каттани"
-    dash_match = re.search(r"—\s*(.+?)(?:\s*$)", text)
+    # (b) "Вася — 🕵🏼 Комиссар Каттани" / "🕵🏼 user_3 — Комиссар Каттани"
+    dash_match = _RE_REVEAL_DASH.match(text)
     if dash_match:
-        after_dash = dash_match.group(1).strip().rstrip(".,;:!?")
-        role = _try_resolve_role(after_dash, registry)
+        role = _try_role_by_name(dash_match.group("role"), registry)
         if role is not None:
-            # Extract player name from before the dash
-            before_dash = text[: dash_match.start()].strip()
-            clean_player = _strip_leading_emoji(before_dash)
-            player_name = clean_player.split()[0] if clean_player.split() else None
+            player = _clean_name(dash_match.group("name"))
             return BotMessageParse(
                 kind=BotMessageKind.ROLE_REVEAL,
-                confidence=0.95,
+                confidence=1.0 if player is not None else 0.9,
                 role_id=role.id,
-                player_name=player_name,
+                player_name=player,
                 raw_text=text,
             )
 
+    # (c) "🕵🏼 Комиссар Каттани Вася" (role first, name last)
+    tokens = _strip_leading_emoji(text).split()
+    if len(tokens) >= 2 and _looks_like_player_token(tokens[-1]):
+        role = _try_role_by_name(" ".join(tokens[:-1]), registry)
+        player = _clean_name(tokens[-1])
+        if role is not None and player is not None:
+            return BotMessageParse(
+                kind=BotMessageKind.ROLE_REVEAL,
+                confidence=0.8,
+                role_id=role.id,
+                player_name=player,
+                raw_text=text,
+            )
+
+    return None
+
+
+def _extract_action_target(text: str) -> str | None:
+    match = _RE_ACTION_TARGET.search(text)
+    if match is None:
+        return None
+    candidate = match.group("target")
+    if not _looks_like_player_token(candidate):
+        return None
+    return _clean_name(candidate)
+
+
+def _parse_role_action(text: str, registry: RoleRegistry) -> BotMessageParse | None:
+    """Role action notifications: "Роль сделала X" (NOT a player reveal)."""
+    emoji_role_id = _try_detect_emoji_role(text)
+    role_id: str | None = emoji_role_id
+    confidence = 0.9
+
+    if role_id is None:
+        found = _find_role_in_text(text, registry)
+        if found is None or _RE_ACTION_VERB.search(text) is None:
+            return None
+        role_id = found.id
+        confidence = 0.7
+
+    return BotMessageParse(
+        kind=BotMessageKind.ROLE_ACTION,
+        confidence=confidence,
+        role_id=role_id,
+        target_name=_extract_action_target(text),
+        raw_text=text,
+    )
+
+
+def _parse_vote_phase(text: str) -> BotMessageParse | None:
+    """Vote-start / vote-end announcements (``"Голосование окончено"``).
+
+    These are unambiguous, so there is no length guard here.
+    """
+    if not (_RE_VOTE_PHASE.search(text) or _RE_VOTE_PHASE_STANDALONE.match(text)):
+        return None
+    return BotMessageParse(
+        kind=BotMessageKind.PHASE_CHANGE,
+        to_phase=Phase.VOTE,
+        day_number=_extract_day_number(text),
+        raw_text=text,
+    )
+
+
+def _parse_phase_change(text: str) -> BotMessageParse | None:
+    """Night / day / end transitions.
+
+    Night and day markers only match short messages, or messages that
+    *start* with the phase emoji.  A long ``"🌙 Кто-то был убит …"`` is a
+    DEATH (caught earlier) and must never flip the phase.
+    """
+    starts_with_phase_emoji = text.startswith(("🌙", "🌝"))
+    if len(text) >= _PHASE_MAX_LEN and not starts_with_phase_emoji:
+        if not _RE_GAME_END.search(text):
+            return None
+
+    to_phase: Phase | None = None
+    if _RE_NIGHT_START.search(text):
+        to_phase = Phase.NIGHT
+    elif _RE_DAY_START.search(text):
+        to_phase = Phase.DAY
+    elif _RE_GAME_END.search(text):
+        to_phase = Phase.END
+
+    if to_phase is None:
+        return None
+
+    return BotMessageParse(
+        kind=BotMessageKind.PHASE_CHANGE,
+        to_phase=to_phase,
+        day_number=_extract_day_number(text),
+        raw_text=text,
+    )
+
+
+def _parse_system(text: str) -> BotMessageParse | None:
+    if _RE_SYSTEM.search(text):
+        return BotMessageParse(kind=BotMessageKind.SYSTEM, raw_text=text)
     return None
 
 
@@ -525,7 +976,7 @@ def parse_bot_message(
     - NEVER raises for emoji-only / 1000-char messages.
     - Empty / ``None`` input → ``None`` (not ``UNKNOWN``).
     """
-    # Guard: empty / None
+    # 1. Guard: empty / None
     if text is None:
         return None
     try:
@@ -537,38 +988,63 @@ def parse_bot_message(
     except Exception:  # pragma: no cover — defensive
         return None
 
-    # Order of checks matters — emoji/phase patterns can overlap.
-    # 1. Registration
-    result = _parse_registration(stripped)
-    if result is not None:
-        return result
-
-    # 2. Phase change (night / day / vote)
-    result = _parse_phase_change(stripped)
-    if result is not None:
-        return result
-
-    # 3. Alive list
+    # 2. Alive list FIRST: "Живые игроки:" wraps a multi-line body that
+    #    contains role emoji (would otherwise look like role reveals).
     result = _parse_alive_list(stripped)
     if result is not None:
         return result
 
-    # 4. Death
+    # 3. Registration
+    result = _parse_registration(stripped)
+    if result is not None:
+        return result
+
+    # 4. Death — BEFORE phase change ("🌙 Кто-то был убит" is a death)
     result = _parse_death(stripped)
     if result is not None:
         return result
 
-    # 5. Vote
+    # 5. Vote start / vote end announcements
+    result = _parse_vote_phase(stripped)
+    if result is not None:
+        return result
+
+    # 6. Votes (multi-line supported)
     result = _parse_vote(stripped)
     if result is not None:
         return result
 
-    # 6. Role reveal (most complex — last)
+    # 7. Protection notifications ("использовал защиту от линчевания!")
+    result = _parse_protection_used(stripped)
+    if result is not None:
+        return result
+
+    # 8. Abstentions ("решил никого не вешать")
+    result = _parse_vote_abstain(stripped)
+    if result is not None:
+        return result
+
+    # 9. Grammatical role reveals
     result = _parse_role_reveal(stripped, registry)
     if result is not None:
         return result
 
-    # 7. Unknown — bot message that we couldn't classify
+    # 10. Role action notifications (previously 1000 false ROLE_REVEALs)
+    result = _parse_role_action(stripped, registry)
+    if result is not None:
+        return result
+
+    # 11. Night / day transitions (short messages only)
+    result = _parse_phase_change(stripped)
+    if result is not None:
+        return result
+
+    # 12. System announcements
+    result = _parse_system(stripped)
+    if result is not None:
+        return result
+
+    # 13. Unknown — bot message that we couldn't classify
     return BotMessageParse(
         kind=BotMessageKind.UNKNOWN,
         confidence=0.0,

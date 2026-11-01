@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -373,10 +374,12 @@ class TestFullDumpClassification:
         unknown = 0
         errors: list[str] = []
         by_kind: Counter[str] = Counter()
+        results: list[BotMessageParse | None] = []
 
         for m in bot_msgs:
             try:
                 r = parse_bot_message(m.get("text", ""), registry=registry)
+                results.append(r)
                 if r is not None:
                     parsed += 1
                     by_kind[r.kind.name] += 1
@@ -401,6 +404,43 @@ class TestFullDumpClassification:
             classified_pct = 100 * (parsed - unknown) / total
             assert classified_pct >= 95, f"Only {classified_pct:.1f}% classified"
 
+        # ROLE_REVEAL false-positive detector (step 7b-fix-1): a reveal is
+        # only trusted at confidence 1.0 (grammatical form).  A high share
+        # of low-confidence reveals means action notifications are leaking
+        # into ROLE_REVEAL again — warn loudly (do not fail the build).
+        role_reveal_total = by_kind[BotMessageKind.ROLE_REVEAL.name]
+        role_reveal_conf_1 = sum(
+            1
+            for r in results
+            if r is not None and r.kind == BotMessageKind.ROLE_REVEAL and r.confidence >= 1.0
+        )
+        if role_reveal_total:
+            low_conf_pct = 100 * (role_reveal_total - role_reveal_conf_1) / role_reveal_total
+            print(f"role_reveal: {role_reveal_total}, conf==1.0: {role_reveal_conf_1}")
+            if low_conf_pct > 20:
+                print(
+                    f"WARNING: {low_conf_pct:.1f}% of ROLE_REVEAL have confidence < 1.0 "
+                    "— possible action notifications leaking into reveals"
+                )
+
+        # Optional offline analysis artifact (local runs only):
+        #   MAFIA_C3_REPORT=c3_report.json pytest -q -k full_dump_classification -s
+        report_path = os.environ.get("MAFIA_C3_REPORT")
+        if report_path:
+            report = {
+                "dump": latest.name,
+                "total_bot_messages": total,
+                "classified_pct": (100 * (parsed - unknown) / total) if total else 0.0,
+                "by_kind": dict(by_kind.most_common()),
+                "role_reveal_total": role_reveal_total,
+                "role_reveal_conf_1": role_reveal_conf_1,
+            }
+            Path(report_path).write_text(
+                json.dumps(report, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            print(f"report written to {report_path}")
+
         # Player messages should NOT be parsed as bot messages
         sample_player = player_msgs[:200] if len(player_msgs) > 200 else player_msgs
         false_positives = 0
@@ -410,6 +450,309 @@ class TestFullDumpClassification:
                 false_positives += 1
         # Allow some false positives since players may use similar language
         print(f"player_sample: {len(sample_player)}, false_positives: {false_positives}")
+
+
+# ===================================================================
+# Step 7b-fix-1: role ACTION notifications are NOT role reveals
+# ===================================================================
+
+
+class TestRoleAction:
+    """``ROLE_ACTION`` — "Роль сделала X" (action notification)."""
+
+    def test_don_action_is_not_reveal(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🤵🏻 Дон выбрал жертву", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_ACTION
+        assert r.role_id == "don"
+
+    def test_commissioner_action(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🕵🏼 Комиссар Каттани ушёл искать злодеев", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_ACTION
+        assert r.role_id == "commissioner"
+        assert r.player_name is None
+
+    def test_maniac_action(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🔪 Маньяк спрятался глубоко в кустах", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_ACTION
+        assert r.role_id == "maniac"
+
+    def test_werewolf_transform_is_action(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🐺 Оборотень превратился в 🤵🏻 Мафия!", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_ACTION
+        assert r.role_id == "werewolf"
+
+    def test_action_without_emoji(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Доктор вылечил user_9", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_ACTION
+        assert r.role_id == "doctor"
+        assert r.target_name == "user_9"
+
+    def test_action_no_player_reveal_false_positive(self, registry: RoleRegistry) -> None:
+        """Every action notification must stay out of ROLE_REVEAL."""
+        actions = [
+            "🤵🏻 Дон выбрал жертву",
+            "🔪 Маньяк спрятался глубоко в кустах",
+            "💃 Любовница посетила user_9",
+            "👨🏼\u200d⚕️ Доктор уже ждёт",
+            "Адвокат защитил user_9",
+        ]
+        for text in actions:
+            r = parse_bot_message(text, registry=registry)
+            assert r is not None
+            assert r.kind is BotMessageKind.ROLE_ACTION, f"{text!r} → {r.kind}"
+
+
+class TestProtectionUsed:
+    """``PROTECTION_USED`` — защита потрачена, игрок жив."""
+
+    def test_someone_spent_protection(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("💫 Кто-то потратил защиту!", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.PROTECTION_USED
+
+    def test_lucky_player_survived(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message(
+            "💫 Счастливчику ночью повезло, и он остался в живых",
+            registry=registry,
+        )
+        assert r is not None
+        assert r.kind is BotMessageKind.PROTECTION_USED
+
+    def test_used_protection_is_not_death(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_9 использовал(а) защиту от линчевания!", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.PROTECTION_USED
+        assert r.death_cause is None
+
+
+class TestVoteAbstain:
+    """``VOTE_ABSTAIN`` — "решил никого не вешать"."""
+
+    def test_abstain_with_name(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🚷 user_9 решил никого не вешать", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE_ABSTAIN
+        assert r.player_name == "user_9"
+
+    def test_abstain_without_name(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Никого не вешать", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE_ABSTAIN
+
+
+class TestSystem:
+    """``SYSTEM`` — служебные объявления бота."""
+
+    def test_city_of_winds_starts(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Город ветров начинает свою игру", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.SYSTEM
+
+    def test_automatic_start(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Автоматический старт игры", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.SYSTEM
+
+
+class TestNewKinds:
+    """All step 7b-fix-1 kinds must exist on the enum."""
+
+    def test_new_kinds_present(self) -> None:
+        for name in ("ROLE_ACTION", "PROTECTION_USED", "VOTE_ABSTAIN", "SYSTEM"):
+            assert hasattr(BotMessageKind, name)
+        assert BotMessageKind("role_action") is BotMessageKind.ROLE_ACTION
+        assert BotMessageKind("protection_used") is BotMessageKind.PROTECTION_USED
+        assert BotMessageKind("vote_abstain") is BotMessageKind.VOTE_ABSTAIN
+        assert BotMessageKind("system") is BotMessageKind.SYSTEM
+
+
+# ===================================================================
+# Step 7b-fix-1: priority checks (death before phase, vote patterns)
+# ===================================================================
+
+
+class TestDeathPriority:
+    """Death must win over phase change and never be a phase flip."""
+
+    def test_moon_killed_is_death(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🌙 Кто-то был убит", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.DEATH
+        assert r.to_phase is None
+        assert r.death_cause == "night_kill"
+
+    def test_long_night_message_with_kill_is_death(self, registry: RoleRegistry) -> None:
+        text = "🌙 " + "Кто-то был убит этой ночью. " * 30
+        r = parse_bot_message(text, registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.DEATH
+
+    def test_someone_died(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Кто-то погиб", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.DEATH
+        assert r.death_cause == "night_kill"
+
+    def test_brutally_killed(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Сегодня был жестоко убит user_9", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.DEATH
+        assert r.death_cause == "night_kill"
+        assert r.player_name == "user_9"
+
+    def test_hanged_with_role_line(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message(
+            "user_9 не выдержал гнетущей атмосферы... повесился.\nОн был 🤵🏻 Дон",
+            registry=registry,
+        )
+        assert r is not None
+        assert r.kind is BotMessageKind.DEATH
+        assert r.death_cause == "lynch"
+        assert r.player_name == "user_9"
+
+    def test_lynch_by_vote_named(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Голосованием повешен user_9", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.DEATH
+        assert r.death_cause == "lynch"
+        assert r.player_name == "user_9"
+
+
+class TestVotePatterns:
+    """Multi-line votes and vote-phase announcements."""
+
+    def test_vote_za_form(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_1 голосовал(а) за: user_5", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE
+        assert r.voter_name == "user_1"
+        assert r.target_name == "user_5"
+        assert r.votes == [("user_1", "user_5")]
+
+    def test_vote_za_male_form(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_1 голосовал за: user_5", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE
+        assert r.votes == [("user_1", "user_5")]
+
+    def test_vote_multi_line(self, registry: RoleRegistry) -> None:
+        text = "user_1 голосовал(а) за: user_2\n\n\nuser_3 голосовал(а) за: user_4"
+        r = parse_bot_message(text, registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE
+        assert r.votes is not None
+        assert len(r.votes) == 2
+        assert r.votes == [("user_1", "user_2"), ("user_3", "user_4")]
+        assert r.voter_name == "user_1"
+        assert r.target_name == "user_2"
+
+    def test_vote_with_chat_marker_prefix(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🇷🇺ℹ | user_1 | 💋 голосовал(а) за: user_5", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE
+        assert r.voter_name == "user_1"
+        assert r.target_name == "user_5"
+
+    def test_vote_against_keeps_target(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_1 проголосовал(а) против user_5", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE
+        assert r.voter_name == "user_1"
+        assert r.target_name == "user_5"
+
+    def test_vote_start_announcement(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message(
+            "Пришло время определить, кого повесить. Голосование продлится 60 секунд.",
+            registry=registry,
+        )
+        assert r is not None
+        assert r.kind is BotMessageKind.PHASE_CHANGE
+        assert r.to_phase is Phase.VOTE
+
+    def test_vote_ended_announcement(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Голосование окончено", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.PHASE_CHANGE
+        assert r.to_phase is Phase.VOTE
+
+    def test_no_lynch_result_is_vote(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Никто не повешен", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.VOTE
+
+    def test_votes_none_for_non_vote_kinds(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🤵🏻 Дон выбрал жертву", registry=registry)
+        assert r is not None
+        assert r.votes is None
+
+
+class TestGrammaticalReveal:
+    """ROLE_REVEAL stays available, but only in grammatical forms."""
+
+    def test_byl_instrumental(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_9 был Мафией", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_REVEAL
+        assert r.role_id == "mafia"
+        assert r.confidence == 1.0
+
+    def test_dash_with_role_emoji(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_9 — 🕵🏼 Комиссар Каттани", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_REVEAL
+        assert r.role_id == "commissioner"
+
+    def test_role_first_form(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("🕵🏼 Комиссар Каттани user_9", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_REVEAL
+        assert r.role_id == "commissioner"
+        assert r.player_name == "user_9"
+
+    def test_unknown_role_word_is_low_confidence_reveal(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_9 был НеведомойРолью", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ROLE_REVEAL
+        assert r.role_id is None
+        assert r.confidence == 0.5
+
+    def test_killed_is_not_reveal(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("user_9 был убит", registry=registry)
+        assert r is not None
+        assert r.kind is not BotMessageKind.ROLE_REVEAL
+
+
+class TestRegistrationPatterns:
+    """Registration templates from the real dump."""
+
+    def test_nabor_vedetsya(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Ведётся набор в игру", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.REGISTRATION
+
+    def test_nabor_otkryt(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Набор в игру открыт", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.REGISTRATION
+
+
+class TestAliveListPriority:
+    """Alive list must be recognised before role reveals inside its body."""
+
+    def test_multi_line_alive_list(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Живые игроки:\n🕵🏼 user_1\n🤵🏻 user_2", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ALIVE_LIST
+
+    def test_alive_list_with_counter(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Живые игроки (5): user_1, user_2", registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ALIVE_LIST
 
 
 # ===================================================================
