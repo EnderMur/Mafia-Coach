@@ -441,6 +441,8 @@ async def test_analyze_reasoning_truncated(
     assert len(logged_reasoning) <= 1050
     assert "[truncated, total 5000]" in logged_reasoning
     assert result.reasoning_chars == 5000
+    assert result.reasoning_text.startswith("x" * 1000)
+    assert "[truncated, total 5000]" in result.reasoning_text
 
 
 async def test_analyze_reasoning_not_truncated_when_short(

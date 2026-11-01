@@ -92,6 +92,7 @@ class FakeAnalyzer:
         self.next_success: bool = True
         self.raise_error: Exception | None = None
         self.on_analyze: Callable[[], None] | None = None
+        self.next_reasoning_text = ""
 
     async def analyze(
         self,
@@ -117,6 +118,7 @@ class FakeAnalyzer:
                 duration_sec=0.001,
                 reasoning_chars=0,
                 warnings=(),
+                reasoning_text=self.next_reasoning_text,
             )
         return AnalysisResult(
             response=None,
@@ -210,6 +212,7 @@ def build_scanner(
     analyzer: FakeAnalyzer | None = None,
     telegram: FakeTelegramWrapper | None = None,
     on_event: Callable[[AnyEvent], Awaitable[None]] | None = None,
+    on_reasoning: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[MessageScanner, FakeAnalyzer, FakeTelegramWrapper]:
     """Assemble a scanner with fakes and the requested trigger policy."""
     fake_analyzer = analyzer if analyzer is not None else FakeAnalyzer()
@@ -227,6 +230,7 @@ def build_scanner(
         chat_id=CHAT_ID,
         bot_id=BOT_ID,
         on_event=on_event,
+        on_reasoning=on_reasoning,
     )
     return scanner, fake_analyzer, fake_telegram
 
@@ -982,3 +986,46 @@ async def test_shutdown_without_start_is_noop(
 
     assert telegram.remove_calls == 0
     assert scanner.is_started is False
+
+
+async def test_flush_forwards_successful_reasoning(registry: RoleRegistry) -> None:
+    """Analyzer reasoning is forwarded to the optional callback after success."""
+    received: list[str] = []
+
+    async def on_reasoning(text: str) -> None:
+        received.append(text)
+
+    analyzer = FakeAnalyzer()
+    analyzer.next_reasoning_text = "Краткий разбор партии"
+    scanner, _fake_analyzer, _telegram = build_scanner(
+        game_state=GameState(game_id=GAME_ID, registry=registry),
+        registry=registry,
+        analyzer=analyzer,
+        on_reasoning=on_reasoning,
+    )
+
+    await scanner._flush()
+
+    assert received == ["Краткий разбор партии"]
+
+
+async def test_flush_ignores_failed_analysis_reasoning(registry: RoleRegistry) -> None:
+    """Failed analyzer results do not emit reasoning to the window."""
+    received: list[str] = []
+
+    async def on_reasoning(text: str) -> None:
+        received.append(text)
+
+    analyzer = FakeAnalyzer()
+    analyzer.next_success = False
+    analyzer.next_reasoning_text = "не должно появиться"
+    scanner, _fake_analyzer, _telegram = build_scanner(
+        game_state=GameState(game_id=GAME_ID, registry=registry),
+        registry=registry,
+        analyzer=analyzer,
+        on_reasoning=on_reasoning,
+    )
+
+    await scanner._flush()
+
+    assert received == []
