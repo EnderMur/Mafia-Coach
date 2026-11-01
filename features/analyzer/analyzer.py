@@ -81,7 +81,7 @@ class GameAnalyzer:
         persistence failures are recorded as warnings while retaining the LLM
         response.
         """
-        start = time.monotonic()
+        start = time.perf_counter()
         hints = compute_hints(game_state=game_state, registry=self._registry)
         context = build_context(
             game_state=game_state,
@@ -119,7 +119,7 @@ class GameAnalyzer:
             return AnalysisResult(
                 response=None,
                 error=f"connection: {error}",
-                duration_sec=time.monotonic() - start,
+                duration_sec=time.perf_counter() - start,
                 reasoning_chars=sum(len(chunk) for chunk in reasoning_buffer),
             )
         except ValidationError as error:

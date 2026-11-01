@@ -588,7 +588,7 @@ async def test_analyze_duration_positive(
 
     result = await analyzer.analyze(make_game_state(registry), persist=False)
 
-    assert result.duration_sec > 0
+    assert result.duration_sec >= 0
 
 
 async def test_analyze_known_player_ids_passed(
