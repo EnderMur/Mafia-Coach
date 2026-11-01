@@ -28,6 +28,7 @@ forced flush.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any, Final
 
 from loguru import logger
@@ -131,6 +132,7 @@ class MessageScanner:
         trigger_policy: TriggerPolicy,
         chat_id: int,
         bot_id: int,
+        on_event: Callable[[AnyEvent], Awaitable[None]] | None = None,
     ) -> None:
         """Retain dependencies and initialize the empty scan state.
 
@@ -142,6 +144,7 @@ class MessageScanner:
             trigger_policy: when-to-flush decisions.
             chat_id: chat observed by this scanner.
             bot_id: Telegram id of the game bot.
+            on_event: Optional async callback for each successfully applied event.
         """
         self._telegram = telegram
         self._game_state = game_state
@@ -150,6 +153,9 @@ class MessageScanner:
         self._policy = trigger_policy
         self._chat_id = chat_id
         self._bot_id = bot_id
+        # ``_on_event`` is already the Telegram handler method; keep this
+        # secondary callback under a distinct internal name to preserve it.
+        self._event_callback = on_event
 
         self._name_to_id: dict[str, int] = {}
         self._registered_ids: set[int] = set()
@@ -270,6 +276,7 @@ class MessageScanner:
                 ts=ts,
             )
             if applied is not None:
+                await self._emit(applied)
                 await self._maybe_flush(triggered_by=[applied])
 
     # ------------------------------------------------------------------
@@ -303,6 +310,7 @@ class MessageScanner:
             self._ensure_event_player(event)
             if self._apply_safely(event):
                 applied.append(event)
+                await self._emit(event)
         if applied:
             self._buffer.extend(applied)
             await self._maybe_flush(triggered_by=applied)
@@ -402,6 +410,19 @@ class MessageScanner:
             )
             return False
         return True
+
+    async def _emit(self, event: AnyEvent) -> None:
+        """Forward an applied event to the optional callback."""
+        if self._event_callback is None:
+            return
+        try:
+            await self._event_callback(event)
+        except Exception as e:  # noqa: BLE001 — callback защитный
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "on_event callback failed: {}: {}",
+                type(e).__name__,
+                str(e),
+            )
 
     # ------------------------------------------------------------------
     # Flush triggering

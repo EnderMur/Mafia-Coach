@@ -12,7 +12,7 @@ fast, long enough to be stable on a loaded machine.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -209,6 +209,7 @@ def build_scanner(
     max_messages: int = 10,
     analyzer: FakeAnalyzer | None = None,
     telegram: FakeTelegramWrapper | None = None,
+    on_event: Callable[[AnyEvent], Awaitable[None]] | None = None,
 ) -> tuple[MessageScanner, FakeAnalyzer, FakeTelegramWrapper]:
     """Assemble a scanner with fakes and the requested trigger policy."""
     fake_analyzer = analyzer if analyzer is not None else FakeAnalyzer()
@@ -225,6 +226,7 @@ def build_scanner(
         ),
         chat_id=CHAT_ID,
         bot_id=BOT_ID,
+        on_event=on_event,
     )
     return scanner, fake_analyzer, fake_telegram
 
@@ -306,6 +308,52 @@ async def test_player_speech_added_to_buffer(
     assert scanner.buffer_size == 1
     assert len(game_state.events_by_kind("message")) == 1
     assert analyzer.calls == 0
+
+
+async def test_on_event_callback_invoked_for_player_speech(
+    game_state: GameState,
+    registry: RoleRegistry,
+) -> None:
+    """An applied player-speech event is forwarded to the callback once."""
+    emitted: list[AnyEvent] = []
+
+    async def on_event(event: AnyEvent) -> None:
+        emitted.append(event)
+
+    scanner, _analyzer, _telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        on_event=on_event,
+    )
+
+    await scanner._on_event(player_event(VASYA, "Вася", "Привет, я мирный житель"))
+
+    assert len(emitted) == 1
+    assert emitted[0] is game_state.events()[0]
+
+
+async def test_on_event_callback_errors_swallowed(
+    game_state: GameState,
+    registry: RoleRegistry,
+    log_records: list[Record],
+) -> None:
+    """Callback failures are logged without undoing the applied event."""
+
+    async def on_event(_event: AnyEvent) -> None:
+        raise RuntimeError("database unavailable")
+
+    scanner, _analyzer, _telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        on_event=on_event,
+    )
+
+    await scanner._on_event(player_event(VASYA, "Вася", "Привет, я мирный житель"))
+
+    assert len(game_state.events_by_kind("message")) == 1
+    assert any(
+        "on_event callback failed: RuntimeError" in message for message in _messages(log_records)
+    )
 
 
 async def test_name_to_id_populated(
