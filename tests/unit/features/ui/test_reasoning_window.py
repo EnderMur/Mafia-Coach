@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import builtins
 import io
+import os
+import sys
+from typing import Any
 
 import pytest
 
@@ -52,3 +56,56 @@ def test_main_skips_invalid_line() -> None:
     content = "not json\n" + encode(IPCEnvelope(type="shutdown")) + "\n"
 
     assert main(io.StringIO(content)) == 0
+
+
+class _FlushSpy(io.StringIO):
+    """StringIO that counts flush() calls made by the child loop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        super().flush()
+
+
+def test_main_reports_startup_pid_and_flushes(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The child announces its pid and flushes after every rendered frame."""
+    spy = _FlushSpy()
+    monkeypatch.setattr(sys, "stdout", spy)
+
+    assert main(io.StringIO(_line("Старт") + "\n")) == 0
+    assert "starting pid=" in capsys.readouterr().err
+    assert "Старт" in spy.getvalue()
+    assert spy.flush_count >= 2
+
+
+def test_win32_reopens_conout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows the child reopens CONOUT$ so rich draws into its own window."""
+    console_stream = io.StringIO()
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def fake_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(str(file))
+        if str(file) == "CONOUT$":
+            return console_stream
+        return real_open(file, *args, **kwargs)
+
+    # Register originals first: main() rebinds sys.stdout / sys.stderr.
+    monkeypatch.setattr(sys, "stdout", sys.stdout)
+    monkeypatch.setattr(sys, "stderr", sys.stderr)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(os, "system", lambda command: 0)  # chcp on POSIX
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    assert (
+        main(io.StringIO(_line("Окно") + "\n" + encode(IPCEnvelope(type="shutdown")) + "\n")) == 0
+    )
+    assert opened.count("CONOUT$") == 2
+    assert "starting pid=" in console_stream.getvalue()
+    assert "Окно" in console_stream.getvalue()

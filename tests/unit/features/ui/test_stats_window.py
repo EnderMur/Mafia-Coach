@@ -2,12 +2,44 @@
 
 from __future__ import annotations
 
+import builtins
 import io
+import os
+import sys
+from typing import Any
 
+import pytest
 from rich.console import Console
 
 from features.ui.protocol import IPCEnvelope, StatsMessage, StatsRow, encode
 from features.ui.stats_window import main, render_table
+
+
+class _FlushSpy(io.StringIO):
+    """StringIO that counts flush() calls made by the child loop."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.flush_count = 0
+
+    def flush(self) -> None:
+        self.flush_count += 1
+        super().flush()
+
+
+def _stats_line() -> str:
+    """Encode one stats frame with a single visible row."""
+    return encode(
+        IPCEnvelope(
+            type="stats",
+            payload=StatsMessage(
+                game_id=3,
+                phase="day",
+                day=2,
+                rows=[StatsRow(player_name="Анна", role="Мафия", confidence=0.75)],
+            ).model_dump(),
+        )
+    )
 
 
 def test_render_table_shows_players_phase_day_and_confidence() -> None:
@@ -78,3 +110,58 @@ def test_main_skips_invalid_line() -> None:
     lines = "invalid\n" + encode(IPCEnvelope(type="shutdown")) + "\n"
 
     assert main(io.StringIO(lines)) == 0
+
+
+def test_win32_reopens_conout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """On Windows the child reopens CONOUT$ so rich draws into its own window."""
+    console_stream = io.StringIO()
+    opened: list[str] = []
+    real_open = builtins.open
+
+    def fake_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        opened.append(str(file))
+        if str(file) == "CONOUT$":
+            return console_stream
+        return real_open(file, *args, **kwargs)
+
+    # Register originals first: main() rebinds sys.stdout / sys.stderr.
+    monkeypatch.setattr(sys, "stdout", sys.stdout)
+    monkeypatch.setattr(sys, "stderr", sys.stderr)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(os, "system", lambda command: 0)  # chcp on POSIX
+    monkeypatch.setattr(builtins, "open", fake_open)
+
+    lines = encode(IPCEnvelope(type="shutdown")) + "\n"
+
+    assert main(io.StringIO(lines)) == 0
+    assert opened.count("CONOUT$") == 2
+    assert "starting pid=" in console_stream.getvalue()
+
+
+def test_win32_missing_console_falls_back_to_devnull(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missing console (no CONOUT$) does not abort the child loop."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(os, "system", lambda command: 0)
+
+    def failing_open(file: Any, *args: Any, **kwargs: Any) -> Any:
+        raise OSError("no console")
+
+    monkeypatch.setattr(builtins, "open", failing_open)
+
+    lines = _stats_line() + "\n" + encode(IPCEnvelope(type="shutdown")) + "\n"
+
+    assert main(io.StringIO(lines)) == 0
+
+
+def test_render_goes_to_stdout_and_flushes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Frames are written to sys.stdout and flushed after every render."""
+    spy = _FlushSpy()
+    monkeypatch.setattr(sys, "stdout", spy)
+
+    lines = "\n".join((_stats_line(), encode(IPCEnvelope(type="shutdown")), ""))
+
+    assert main(io.StringIO(lines)) == 0
+    assert "Анна" in spy.getvalue()
+    assert spy.flush_count >= 2

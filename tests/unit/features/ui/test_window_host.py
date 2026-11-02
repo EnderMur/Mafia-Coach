@@ -105,12 +105,12 @@ async def test_send_to_dead_process_is_noop() -> None:
     await host.send_stats(StatsMessage(game_id=1, phase="day", day=1, rows=[]))
 
 
-async def test_drain_stderr_logs_child_errors() -> None:
-    """Crash traceback of a child is logged instead of being lost in the pipe."""
-    records: list[str] = []
+async def test_drain_stderr_logs_child_startup_as_info() -> None:
+    """Child startup chatter lands at INFO, not WARNING."""
+    records: list[tuple[str, str]] = []
     sink_id = logger.add(
-        lambda message: records.append(message.record["message"]),
-        level="WARNING",
+        lambda message: records.append((message.record["level"].name, message.record["message"])),
+        level="INFO",
     )
     try:
         host = WindowHost(
@@ -132,7 +132,37 @@ async def test_drain_stderr_logs_child_errors() -> None:
     finally:
         logger.remove(sink_id)
 
-    assert "stats_window stderr: boom" in records
+    assert ("INFO", "stats_window stderr: boom") in records
+
+
+async def test_drain_stderr_logs_child_traceback_as_error() -> None:
+    """Real failures (tracebacks, Error lines) are logged at ERROR."""
+    records: list[tuple[str, str]] = []
+    sink_id = logger.add(
+        lambda message: records.append((message.record["level"].name, message.record["message"])),
+        level="INFO",
+    )
+    try:
+        host = WindowHost(
+            stats_enabled=True,
+            reasoning_enabled=False,
+            create_new_console=False,
+            stats_command=(
+                sys.executable,
+                "-c",
+                "import sys; sys.stderr.write('Traceback: boom\\n')",
+            ),
+        )
+        await host.start()
+        proc = host._processes["stats"]
+        assert proc is not None
+        await proc.wait()
+        await host._stderr_tasks["stats"]
+        await host.shutdown()
+    finally:
+        logger.remove(sink_id)
+
+    assert ("ERROR", "stats_window stderr: Traceback: boom") in records
 
 
 async def test_send_stats_skips_dead_process() -> None:
