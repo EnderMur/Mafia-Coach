@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes
 import os
 import sys
 from typing import TextIO
@@ -52,9 +53,16 @@ def main(stream: TextIO | None = None) -> int:
         stdout_reconfigure(encoding="utf-8", errors="replace")
         stderr_reconfigure(encoding="utf-8", errors="replace")
 
-    # Windows cmd.exe (CREATE_NEW_CONSOLE): chcp 65001
+    # Windows: set console output/input code page to UTF-8 for THIS
+    # process (not a subshell). A chcp command in a child cmd.exe
+    # changes cp only there and is lost when that subshell exits.
     if sys.platform == "win32":
-        os.system("chcp 65001 > nul")
+        try:
+            kernel32 = ctypes.windll.kernel32
+            kernel32.SetConsoleOutputCP(65001)
+            kernel32.SetConsoleCP(65001)
+        except (AttributeError, OSError):
+            pass  # нет kernel32/консоли — остаёмся на текущей cp
         _reopen_windows_console()
 
     # Startup debug: подтверждение, что child жив и открыл консоль

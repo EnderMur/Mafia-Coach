@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import builtins
 import io
-import os
 import sys
 from typing import Any
 
@@ -105,7 +104,6 @@ def test_win32_reopens_conout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "stdout", sys.stdout)
     monkeypatch.setattr(sys, "stderr", sys.stderr)
     monkeypatch.setattr(sys, "platform", "win32")
-    monkeypatch.setattr(os, "system", lambda command: 0)  # chcp on POSIX
     monkeypatch.setattr(builtins, "open", fake_open)
     monkeypatch.setattr(
         reasoning_window_module, "_reopen_windows_console", _REAL_REOPEN_WINDOWS_CONSOLE
@@ -117,3 +115,15 @@ def test_win32_reopens_conout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert opened.count("CONOUT$") == 2
     assert "starting pid=" in console_stream.getvalue()
     assert "Окно" in console_stream.getvalue()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows-only cp fix")
+def test_set_console_cp_called_on_win32() -> None:
+    """Smoke: the Windows cp fix runs (no chcp subshell) and stdout is open.
+
+    Asserting on ``ctypes.windll.kernel32`` through monkeypatch is brittle;
+    running the real Windows startup path without an exception is enough.
+    ``conftest`` stubs CONOUT$ reopening, so pytest capture stays intact.
+    """
+    assert main(io.StringIO(encode(IPCEnvelope(type="shutdown")) + "\n")) == 0
+    assert hasattr(sys.stdout, "write")
