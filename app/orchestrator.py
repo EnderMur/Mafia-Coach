@@ -11,6 +11,7 @@ from loguru import logger
 
 from app.bootstrap import BootstrapResult, shutdown_result
 from domain.events import AnyEvent, EndGameEvent
+from domain.exceptions import ConfigError
 from domain.game_state import GameState
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
@@ -179,7 +180,18 @@ class Orchestrator:
             await shutdown_result(self._result)
 
     async def _persist_player(self, player_id: int, name: str) -> None:
-        """Insert a player once, before persisting predictions that reference it."""
+        """Insert a player once, before persisting predictions that reference it.
+
+        Two tables are involved and both are needed: ``players`` is the global
+        identity table the ``predictions`` foreign key points at, and
+        ``game_players`` records participation in the current game — without
+        that row :meth:`_run_retro` cannot store the final role and every
+        prediction of the player stays "unknown".
+
+        Order is load-bearing: ``players`` must exist before the
+        ``game_players`` foreign key can be satisfied. Both writes are
+        idempotent, so a repeated attach or a backfill only refreshes data.
+        """
         async with self._player_persistence_lock:
             if player_id in self._registered_player_ids:
                 return
@@ -190,6 +202,16 @@ class Orchestrator:
                     username=name,
                     display_name=name,
                 )
+                game_id = self._result.game_state.game_id
+                if game_id > 0:
+                    await asyncio.to_thread(
+                        self._result.repos.game_players.add_player,
+                        game_id=game_id,
+                        player_id=player_id,
+                        final_role=None,
+                        survived=None,
+                        is_winner=None,
+                    )
                 self._registered_player_ids.add(player_id)
             except Exception as error:  # noqa: BLE001 — best-effort persistence
                 logger.bind(channel=_LOGGER_CHANNEL).error(
@@ -250,6 +272,15 @@ class Orchestrator:
                     final_role=player.final_role.name_ru,
                     survived=player.alive,
                     is_winner=player.is_winner,
+                )
+            except ConfigError as error:
+                # The player is missing from game_players: either it was
+                # registered before 10c-fix-12 (empty table) or the backfill
+                # has not reached it yet. Expected, not a failure of the run.
+                logger.bind(channel=_LOGGER_CHANNEL).warning(
+                    "final_role skipped for {} (not in game_players): {}",
+                    player.player_id,
+                    str(error),
                 )
             except Exception as error:  # noqa: BLE001 — keep processing players
                 logger.bind(channel=_LOGGER_CHANNEL).error(

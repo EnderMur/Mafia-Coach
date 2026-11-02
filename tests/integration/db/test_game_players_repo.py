@@ -87,13 +87,19 @@ def test_add_player_stores_unknown_survival_as_null(conn: sqlite3.Connection) ->
     assert stored["survived"] is None
 
 
-def test_add_player_twice_raises_config_error(conn: sqlite3.Connection) -> None:
-    """The same player cannot be registered in one game twice."""
+def test_add_player_insert_or_ignore(conn: sqlite3.Connection) -> None:
+    """13. Re-registering a player is a silent no-op that keeps one row and its id."""
     game_id, repository = create_participation_repository(conn)
-    repository.add_player(game_id=game_id, player_id=100)
 
-    with pytest.raises(ConfigError, match="player 100 already registered in game"):
-        repository.add_player(game_id=game_id, player_id=100)
+    first_id = repository.add_player(game_id=game_id, player_id=100, final_role="Мафия")
+    second_id = repository.add_player(game_id=game_id, player_id=100)
+
+    assert second_id == first_id
+    rows = repository.list_game_players(game_id)
+    assert len(rows) == 1
+    assert rows[0]["id"] == first_id
+    # The second call must not erase ground truth stored by the first one.
+    assert rows[0]["final_role"] == "Мафия"
 
 
 def test_set_final_role_updates_existing_row(conn: sqlite3.Connection) -> None:
@@ -228,3 +234,16 @@ def test_set_final_role_coalesce_preserves(conn: sqlite3.Connection) -> None:
     assert row["final_role"] == "Дон"
     assert row["survived"] == 0
     assert row["is_winner"] == 0
+
+
+def test_add_player_reports_legacy_duplicate_rows(conn: sqlite3.Connection) -> None:
+    """A legacy table holding duplicate pairs fails loudly instead of adding more."""
+    game_id, repository = create_participation_repository(conn)
+    for _ in range(2):
+        conn.execute(
+            "INSERT INTO game_players(game_id, player_id) VALUES (?, ?)",
+            (game_id, 100),
+        )
+
+    with pytest.raises(sqlite3.IntegrityError, match="duplicate"):
+        repository.add_player(game_id=game_id, player_id=100)
