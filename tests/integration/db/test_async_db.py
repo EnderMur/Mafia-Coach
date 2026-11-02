@@ -74,6 +74,8 @@ async def test_event_loop_not_blocked_during_insert() -> None:
             predictions.list_predictions,
             gid,
         )
-        assert len(rows) == 20
+        assert len(rows) == 1
+        assert rows[0]["id"] == results[0]
+        assert rows[0]["reasoning"] == "iter 19"
     finally:
         close(conn)

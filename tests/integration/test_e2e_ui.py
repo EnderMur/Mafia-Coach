@@ -8,7 +8,8 @@ from typing import cast
 
 from app.bootstrap import BootstrapResult, bootstrap
 from app.orchestrator import Orchestrator
-from domain.events import MessageEvent, MessagePayload
+from domain.events import MessageEvent, MessagePayload, PhaseChangeEvent, PhaseChangePayload
+from domain.phases import Phase
 from features.ui.protocol import ReasoningMessage, StatsMessage
 from features.ui.window_host import WindowHost
 from tests.unit.app.conftest import FakeLLMClient, FakeTelegram, create_settings_file
@@ -76,6 +77,15 @@ async def test_e2e_ui_mode_with_fake_window(tmp_path: Path) -> None:
 
     try:
         await orchestrator._persist_event(message_event)
+        bootstrap_result.game_state.apply(
+            PhaseChangeEvent(
+                ts=message_event.ts,
+                game_id=bootstrap_result.game_state.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
         scanner = orchestrator._default_scanner(-100555)
         await scanner._flush()
     finally:

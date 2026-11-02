@@ -29,7 +29,7 @@ async def test_bootstrap_creates_all_resources(tmp_path: Path) -> None:
         llm_client=llm_client,
     )
     try:
-        assert result.conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 1
+        assert result.conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()[0] == 2
         assert isinstance(result.repos, Repositories)
         assert result.registry.all_ids()
         assert result.llm_client is llm_client

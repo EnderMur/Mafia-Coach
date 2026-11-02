@@ -165,3 +165,44 @@ def test_migration_002_dedupes_via_runner(tmp_path: Path) -> None:
         assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         conn.close()
+
+
+def test_migration_002_filters_invalid_legacy_rows(tmp_path: Path) -> None:
+    """Keep latest valid duplicate, synthesize missing times, and discard invalid rows."""
+    source = Path("infra/db/migrations")
+    first = source / "001_init.sql"
+    (tmp_path / first.name).write_text(first.read_text(encoding="utf-8"), encoding="utf-8")
+    conn = connect(":memory:")
+    try:
+        assert apply_migrations(conn, tmp_path) == 1
+        conn.execute("INSERT INTO games(id) VALUES (1)")
+        conn.execute("INSERT INTO players(id) VALUES (2)")
+        rows = [
+            (1, 1, 2, "2020-01-01 12:00:00", "first", 0.4),
+            (2, 1, 2, None, "latest valid", 0.8),
+            (3, 1, 2, "2020-01-01 12:00:00", None, 0.6),
+            (4, 1, 2, "2020-01-01 12:00:00", "invalid", None),
+            (5, None, 2, "2020-01-01 12:00:00", "invalid", 0.5),
+            (6, 1, None, "2020-01-01 12:00:00", "invalid", 0.5),
+        ]
+        conn.executemany(
+            "INSERT INTO predictions(id, game_id, player_id, ts, predicted_role, confidence) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            rows,
+        )
+        second = source / "002_predictions_split.sql"
+        (tmp_path / second.name).write_text(second.read_text(encoding="utf-8"), encoding="utf-8")
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert apply_migrations(conn, tmp_path) == 1
+        assert apply_migrations(conn, tmp_path) == 0
+        current = conn.execute("SELECT id, predicted_role, ts FROM predictions").fetchall()
+        assert len(current) == 1
+        assert current[0][0:2] == (2, "latest valid")
+        assert current[0][2] is not None
+        history = conn.execute("SELECT id, ts FROM predictions_history ORDER BY id").fetchall()
+        assert [row[0] for row in history] == [1, 2]
+        assert history[1][1] is not None
+        assert conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert conn.execute("PRAGMA foreign_key_check").fetchall() == []
+    finally:
+        conn.close()
