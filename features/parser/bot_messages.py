@@ -96,6 +96,16 @@ class BotMessageParse(BaseModel):
     # last_words
     last_words: str | None = None
 
+    # alive_list
+    #: ``display_name`` strings from the "Живые игроки:" section, as written
+    #: by the bot. Resolution to ids happens in ``GameState.apply`` (A2-1).
+    alive_player_names: list[str] | None = None
+    #: Bot-reported role composition: ``name_ru → count`` (registry matching
+    #: is the analyzer's job, not the parser's).
+    role_count: dict[str, int] | None = None
+    #: Bot-reported "Всего: N" headcount of alive players.
+    total_players: int | None = None
+
     raw_text: str = ""
 
 
@@ -372,6 +382,14 @@ _RE_REGISTRATION: Final[re.Pattern[str]] = re.compile(
 _RE_ALIVE_LIST: Final[re.Pattern[str]] = re.compile(
     r"^\s*Живые(?:\s+игроки)?\s*(?:\([^)]*\))?\s*:",
     re.IGNORECASE,
+)
+
+#: One ``"N. display_name"`` line of the "Живые игроки:" block. Names may
+#: contain Cyrillic letters, emoji and spaces — everything after ``N. `` is
+#: kept verbatim.
+_ALIVE_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\s*\d+\.\s+(.+?)\s*$",
+    re.MULTILINE,
 )
 
 # --- death ----------------------------------------------------------------
@@ -718,10 +736,71 @@ def _parse_registration(text: str) -> BotMessageParse | None:
 
 
 def _parse_alive_list(text: str) -> BotMessageParse | None:
+    """Parse the bot's ``Живые игроки … Из них … Всего: N`` snapshot.
+
+    Names stay as ``display_name`` strings (no id resolution here — A2-1 is
+    applied later by :meth:`domain.game_state.GameState.apply`). ``role_count``
+    is keyed by the Russian role names exactly as the bot wrote them; mapping
+    them onto ``RoleRegistry`` entries belongs to the analyzer (step 10c-fix-9).
+    """
     first_line = _first_non_empty_line(text)
-    if first_line and _RE_ALIVE_LIST.match(first_line):
-        return BotMessageParse(kind=BotMessageKind.ALIVE_LIST, raw_text=text)
-    return None
+    if not first_line or not _RE_ALIVE_LIST.match(first_line):
+        return None
+
+    # Section "Живые игроки:" — "N. name" lines up to "Из них:"/"Всего:".
+    alive_names: list[str] = []
+    head_match = re.search(
+        r"Живые\s+игроки:?\s*\n(.*?)(?=\n\s*(?:Из\s+них:|Всего:)|$)",
+        text,
+        re.DOTALL,
+    )
+    if head_match:
+        for match in _ALIVE_LINE_RE.finditer(head_match.group(1)):
+            name = match.group(1).strip()
+            if name and name not in alive_names:
+                alive_names.append(name)
+
+    # Section "Из них:" — role composition. A trailing " - N" is the count;
+    # without it the role occurs once. Duplicate names are accumulated.
+    role_count: dict[str, int] = {}
+    roles_match = re.search(
+        r"Из\s+них:\s*(.+?)(?=\n\s*Всего:|\Z)",
+        text,
+        re.DOTALL,
+    )
+    if roles_match:
+        for chunk in roles_match.group(1).split(","):
+            # Collapse line breaks introduced by the bot's soft wrapping.
+            chunk = " ".join(chunk.split())
+            if not chunk:
+                continue
+            # Strip the leading emoji (incl. ZWJ sequences and skin tones).
+            chunk_clean = _strip_leading_emoji(chunk)
+            parts = re.split(r"\s*-\s*", chunk_clean, maxsplit=1)
+            name = parts[0].strip()
+            count = 1
+            if len(parts) == 2:
+                try:
+                    count = int(parts[1].strip())
+                except ValueError:
+                    count = 1
+            if name:
+                role_count[name] = role_count.get(name, 0) + count
+
+    # Section "Всего: N" — bot-reported headcount of alive players.
+    total: int | None = None
+    total_match = re.search(r"Всего:\s*(\d+)", text)
+    if total_match:
+        total = int(total_match.group(1))
+
+    return BotMessageParse(
+        kind=BotMessageKind.ALIVE_LIST,
+        confidence=1.0,
+        alive_player_names=alive_names,
+        role_count=role_count or None,
+        total_players=total,
+        raw_text=text,
+    )
 
 
 def _extract_death_name(text: str, cause: str) -> str | None:

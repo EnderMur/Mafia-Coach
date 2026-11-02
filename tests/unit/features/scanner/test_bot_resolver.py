@@ -16,6 +16,8 @@ import pytest
 from loguru import logger
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     AnyEvent,
     DeathEvent,
     MessageEvent,
@@ -478,6 +480,62 @@ def test_last_words_text_is_stripped() -> None:
     event = events[0]
     assert isinstance(event, MessageEvent)
     assert event.payload.text == "я мирный"
+
+
+# ===================================================================
+# Step 10c-fix-8: ALIVE_LIST (21-23)
+# ===================================================================
+
+
+def test_alive_list_creates_event() -> None:
+    """21. A snapshot with names becomes one AliveListEvent (names unresolved)."""
+    parse = _parse(
+        BotMessageKind.ALIVE_LIST,
+        alive_player_names=["A"],
+        role_count={"Мафия": 5},
+        total_players=10,
+    )
+
+    events = _resolve(parse, name_to_id={})
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, AliveListEvent)
+    assert isinstance(event.payload, AliveListPayload)
+    assert event.kind == "alive_list"
+    assert event.game_id == GAME_ID
+    assert event.ts == TS
+    assert event.payload.alive_player_names == ["A"]
+    assert event.payload.role_count == {"Мафия": 5}
+    assert event.payload.total_players == 10
+
+
+def test_alive_list_empty_names_skipped(log_records: list[Record]) -> None:
+    """22. An empty name list is meaningless: no event, only a warning."""
+    parse = _parse(BotMessageKind.ALIVE_LIST, alive_player_names=[])
+
+    assert _resolve(parse) == []
+    assert any("alive_list without player names" in text for text in _messages(log_records))
+
+
+def test_alive_list_preserves_role_count() -> None:
+    """23. role_count is forwarded as-is (no registry mapping in the resolver)."""
+    role_count = {"Адвокат": 1, "Мафия": 5, "Мирный Житель": 3}
+    parse = _parse(
+        BotMessageKind.ALIVE_LIST,
+        alive_player_names=["user_1", "user_2"],
+        role_count=role_count,
+        total_players=9,
+    )
+
+    events = _resolve(parse)
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, AliveListEvent)
+    assert event.payload.role_count == role_count
+    assert event.payload.alive_player_names == ["user_1", "user_2"]
+    assert event.payload.total_players == 9
 
 
 # ===================================================================
