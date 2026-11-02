@@ -718,13 +718,13 @@ async def test_analyze_stream_log_reasoning_chunks_true(
     assert "Player A" not in logged_reasoning
 
 
-async def test_analyze_stream_validation_error_does_not_retry(
+async def test_analyze_stream_schema_validation_error_does_not_retry(
     client: LMStudioClient, respx_mock: respx.MockRouter
 ) -> None:
     """Final validation after DONE never starts another HTTP request."""
     route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
         return_value=sse_response(
-            {"choices": [{"delta": {"content": "not JSON"}}]},
+            {"choices": [{"delta": {"content": '{"analysis": []}'}}]},
             "[DONE]",
         ),
     )
@@ -860,3 +860,19 @@ async def test_analyze_stream_budget_with_fallback(
     # Schema rejection (1) + first text attempt (2) + successful retry (3).
     assert route.call_count == 3
     assert route.call_count <= client.max_retries
+
+
+async def test_eof_retry(client: LMStudioClient, respx_mock: respx.MockRouter) -> None:
+    client.max_tokens = 4096
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        side_effect=[
+            sse_response({"choices": [{"delta": {"content": '{"analysis": ['}}]}, "[DONE]"),
+            sse_response({"choices": [{"delta": {"content": VALID_CONTENT}}]}, "[DONE]"),
+        ]
+    )
+    result = await run_stream(client)
+    assert result.analysis[0].player_id == 100
+    assert route.call_count == 2
+    assert json.loads(route.calls[0].request.content)["max_tokens"] == 4096
+    assert json.loads(route.calls[1].request.content)["max_tokens"] == 8192
+    assert client.max_tokens == 4096

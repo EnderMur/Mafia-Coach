@@ -27,7 +27,7 @@ from domain.events import (
     VotePayload,
 )
 from domain.exceptions import ConfigError, UnknownRoleError
-from domain.game_state import GameState
+from domain.game_state import GameState, _placeholder_player_id
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
 
@@ -365,17 +365,17 @@ def test_apply_alive_list_sets_total_players(game: GameState) -> None:
     assert game.role_count is None
 
 
-def test_apply_alive_list_no_unknown_players_added(game: GameState, registry: RoleRegistry) -> None:
-    """A name absent from GameState is ignored, never registered (A2-1)."""
+def test_alive_list_registers_placeholder_players(game: GameState, registry: RoleRegistry) -> None:
+    """New snapshot names get stable negative ids."""
     game.register_player(1, "A")
     game.register_player(2, "B")
     game.register_player(3, "C")
 
     game.apply(make_alive_list(["A", "D"]))
 
-    assert len(game.players()) == 3
-    assert {player.display_name for player in game.players()} == {"A", "B", "C"}
-    assert {player.player_id for player in game.players()} == {1, 2, 3}
+    assert len(game.players()) == 4
+    assert {player.display_name for player in game.players()} == {"A", "B", "C", "D"}
+    assert {player.player_id for player in game.players()} == {1, 2, 3, _placeholder_player_id("D")}
     assert game.player(1).alive is True
     assert game.player(2).alive is False
     assert game.player(3).alive is False
@@ -512,3 +512,38 @@ def test_apply_end_game_unknown_role_keeps_final_role_empty(
     assert any("unknown final role name" in record["message"] for record in log_records)
     assert game.player(1).final_role is None
     assert game.player(1).is_winner is True
+
+
+def test_phase_end_guard(game: GameState) -> None:
+    game.apply(
+        PhaseChangeEvent(
+            ts=event_time(),
+            game_id=1,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION,
+                to_phase=Phase.END,
+                day_number=0,
+            ),
+        )
+    )
+    game.apply(
+        PhaseChangeEvent(
+            ts=event_time(),
+            game_id=1,
+            payload=PhaseChangePayload(
+                from_phase=Phase.END,
+                to_phase=Phase.DAY,
+                day_number=1,
+            ),
+        )
+    )
+    assert game.current_phase() == Phase.END
+    assert game.current_day() == 0
+    assert len(game.events()) == 1
+
+
+def test_placeholder_id_is_stable_negative_int64() -> None:
+    pid = _placeholder_player_id("Never Wrote")
+    assert -(2**63) < pid < 0
+    assert pid == _placeholder_player_id("Never Wrote")
+    assert pid != _placeholder_player_id("Another Player")

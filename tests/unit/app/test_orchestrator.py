@@ -753,7 +753,7 @@ async def test_handle_status_uses_total_players(
     await orchestrator._handle_status()
     output = capsys.readouterr().out
 
-    assert "alive=5/10" in output
+    assert "alive=10/10" in output
     assert "alive=5/5" not in output
     await orchestrator.shutdown()
 
@@ -885,3 +885,41 @@ def test_backfill_timeout_300_in_source() -> None:
     source = inspect.getsource(Orchestrator._backfill_safe)
     assert "300.0" in source
     assert "60.0" not in source
+
+
+async def test_handle_reset(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    result, _, _ = await make_result(tmp_path)
+    old_game_id = result.game_state.game_id
+    scanners: list[FakeScanner] = []
+
+    def factory(chat_id: int) -> MessageScanner:
+        scanner = FakeScanner(chat_id)
+        scanners.append(scanner)
+        return cast(MessageScanner, scanner)
+
+    orchestrator = Orchestrator(bootstrap_result=result, scanner_factory=factory, enable_ui=False)
+    await orchestrator._start_scanner(GAME_CHAT_ID)
+    orchestrator._registered_player_ids.add(PLAYER_ID)
+    result.game_state.register_player(PLAYER_ID, "Old")
+    await orchestrator._handle_command("/reset")
+    assert scanners[0].shutdown_called
+    assert scanners[1].started
+    assert result.game_state.game_id != old_game_id
+    assert result.game_state.players() == ()
+    assert not orchestrator._registered_player_ids
+    assert "Reset: new game" in capsys.readouterr().out
+    await orchestrator.shutdown()
+
+
+async def test_handle_retro(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    retro = AsyncMock()
+    orchestrator._run_retro = retro  # type: ignore[method-assign]
+    await orchestrator._handle_command("/retro")
+    retro.assert_awaited_once()
+    assert "Retro: done" in capsys.readouterr().out
+    retro.side_effect = RuntimeError("broken")
+    await orchestrator._handle_command("/retro")
+    assert "Retro failed: broken" in capsys.readouterr().out
+    await orchestrator.shutdown()

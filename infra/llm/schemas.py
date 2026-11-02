@@ -8,6 +8,7 @@ from collections.abc import Callable
 from copy import deepcopy
 from typing import Any, TypeGuard
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 
@@ -87,6 +88,12 @@ def validate_response(
             prediction.suspected_role, role_names_ru, role_alias_resolver
         )
         if canonical_role is None:
+            if "неизвест" in prediction.suspected_role.lower():
+                logger.bind(channel="llm").debug(
+                    "unknown role placeholder for player {}; prediction dropped",
+                    prediction.player_id,
+                )
+                continue
             warnings.append(
                 f"unknown suspected role {prediction.suspected_role!r} for player "
                 f"{prediction.player_id}; prediction dropped"

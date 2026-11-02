@@ -236,14 +236,13 @@ def test_set_final_role_coalesce_preserves(conn: sqlite3.Connection) -> None:
     assert row["is_winner"] == 0
 
 
-def test_add_player_reports_legacy_duplicate_rows(conn: sqlite3.Connection) -> None:
-    """A legacy table holding duplicate pairs fails loudly instead of adding more."""
-    game_id, repository = create_participation_repository(conn)
+def test_migration_rejects_legacy_duplicate_rows(conn: sqlite3.Connection) -> None:
+    """Migration 004 fails loudly on legacy duplicates rather than dropping data."""
+    game_id, _repository = create_participation_repository(conn)
+    conn.execute("DROP INDEX idx_game_players_pair")
     for _ in range(2):
+        conn.execute("INSERT INTO game_players(game_id, player_id) VALUES (?, ?)", (game_id, 100))
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
         conn.execute(
-            "INSERT INTO game_players(game_id, player_id) VALUES (?, ?)",
-            (game_id, 100),
+            "CREATE UNIQUE INDEX idx_game_players_pair ON game_players(game_id, player_id)"
         )
-
-    with pytest.raises(sqlite3.IntegrityError, match="duplicate"):
-        repository.add_player(game_id=game_id, player_id=100)

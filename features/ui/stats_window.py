@@ -14,7 +14,7 @@ from rich.table import Table
 from features.ui.protocol import IPCEnvelope, StatsMessage, decode
 
 _HEADER = "Stats"
-_MAX_ROWS = 20
+_MAX_ROWS = 30
 _WINDOW_NAME = "stats_window"
 
 

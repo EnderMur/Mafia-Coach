@@ -64,6 +64,10 @@ class LLMClient(ABC):
         """Close any transport resources owned by the implementation."""
 
 
+class _TransientEOF(Exception):
+    """Internal retryable truncated or invalid model JSON."""
+
+
 class _TransientHTTP(Exception):
     """Internal retryable HTTP status failure."""
 
@@ -289,6 +293,8 @@ class LMStudioClient(LLMClient):
         """
         self._ensure_open()
         budget = self._max_retries
+        token_limit = self.max_tokens
+        eof_retried = False
         use_schema = True
         last_exc: Exception | None = None
 
@@ -299,6 +305,7 @@ class LMStudioClient(LLMClient):
                 response_format="json_schema" if use_schema else "text",
             )
             payload["stream"] = True
+            payload["max_tokens"] = token_limit
             try:
                 return await self._stream_once(
                     payload=payload,
@@ -311,6 +318,14 @@ class LMStudioClient(LLMClient):
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as error:
                 raise LLMConnectionError(f"LM Studio недоступен: {error}") from error
+            except _TransientEOF as error:
+                last_exc = error
+                if eof_retried or budget == 0:
+                    break
+                eof_retried = True
+                if token_limit < 8192:
+                    token_limit = min(8192, token_limit * 2)
+                await self._sleep_before_retry(budget)
             except _SchemaRejectedHTTP as error:
                 if budget == 0:
                     raise LLMError(f"HTTP {error.status}: {error.body}") from error
@@ -444,6 +459,9 @@ class LMStudioClient(LLMClient):
                 role_alias_resolver=role_alias_resolver,
             )
         except ValidationError as error:
+            msg = str(error).lower()
+            if "eof" in msg or "invalid json" in msg:
+                raise _TransientEOF(f"JSON EOF: {error}") from error
             raise LLMError(f"invalid streaming response: {error}") from error
         self._log_warnings(warnings)
         return result

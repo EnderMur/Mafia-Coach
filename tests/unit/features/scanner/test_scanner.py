@@ -919,7 +919,7 @@ async def test_messages_arriving_during_flush_are_rescheduled(
     assert scanner.buffer_size == 0
 
 
-async def test_duplicate_death_is_rejected(
+async def test_apply_safely_already_dead_debug(
     game_state: GameState,
     registry: RoleRegistry,
     log_records: list[Record],
@@ -934,11 +934,17 @@ async def test_duplicate_death_is_rejected(
     await scanner._on_event(bot_event("Сегодня повешен Вася"))
     calls_after_first_death = analyzer.calls
 
-    await scanner._on_event(bot_event("Сегодня повешен Вася"))
+    sink = logger.add(lambda message: log_records.append(message.record), level="DEBUG")
+    try:
+        await scanner._on_event(bot_event("Сегодня повешен Вася"))
+    finally:
+        logger.remove(sink)
 
     assert len(game_state.events_by_kind("death")) == 1
     assert analyzer.calls == calls_after_first_death
-    assert any("is already dead" in text for text in _messages(log_records))
+    assert any(
+        "is already dead" in r["message"] and r["level"].name == "DEBUG" for r in log_records
+    )
 
 
 async def test_bot_last_words_creates_player_and_message(
@@ -1528,3 +1534,14 @@ async def test_backfill_restores_flushing_after_failure(
     with pytest.raises(RuntimeError, match="replay failed"):
         await scanner.backfill()
     assert scanner._flushing is True
+
+
+async def test_alive_list_calls_on_player_registered(game_state, registry):
+    from domain.game_state import _placeholder_player_id
+
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    callback = AsyncMock()
+    scanner._on_player_registered = callback
+    await scanner._on_event(bot_event("Живые игроки:\n1. Never Wrote\nВсего: 1"))
+    callback.assert_awaited_once_with(_placeholder_player_id("Never Wrote"), "Never Wrote")
+    assert scanner._name_to_id["Never Wrote"] == _placeholder_player_id("Never Wrote")
