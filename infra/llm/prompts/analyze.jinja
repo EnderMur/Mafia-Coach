@@ -9,6 +9,13 @@ ID партии: {{ game_id }}
 {% for player in players %}- ID {{ player.player_id }}; имя: {{ player.display_name }}; жив: {{ player.alive }}; известная роль: {{ player.known_role if player.known_role else "неизвестна" }}
 {% else %}- Список игроков пуст.
 {% endfor %}
+{% if role_count %}
+## Состав партии (по данным бота)
+
+{{ role_count }}
+
+Всего живых: {{ total_players }}
+{% endif %}
 Последние сообщения
 {% for message in recent_messages %}- {{ message.ts }} — {{ message.author_name }}: {{ message.text }}
 {% else %}- Сообщений нет.

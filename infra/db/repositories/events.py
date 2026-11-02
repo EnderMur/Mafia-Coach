@@ -7,6 +7,8 @@ import sqlite3
 from typing import Any
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     AnyEvent,
     DeathEvent,
     MessageEvent,
@@ -43,6 +45,10 @@ class EventsRepository:
         elif isinstance(event, PhaseChangeEvent):
             phase = event.payload.to_phase.value
             day_number = event.payload.day_number
+        elif isinstance(event, AliveListEvent):
+            # alive_list carries no actor/target/phase/day metadata —
+            # actor_id, target_id, phase, day_number stay NULL.
+            pass
 
         cursor = self._conn.execute(
             "INSERT INTO events(game_id, ts, kind, actor_id, target_id, phase, "
@@ -85,6 +91,15 @@ class EventsRepository:
                 event = RoleRevealEvent.model_validate(event_data)
             elif kind == "phase_change":
                 event = PhaseChangeEvent.model_validate(event_data)
+            elif kind == "alive_list":
+                payload = AliveListPayload.model_validate_json(row["payload_json"])
+                event = AliveListEvent.model_validate(
+                    {
+                        "ts": row["ts"],
+                        "game_id": row["game_id"],
+                        "payload": payload,
+                    }
+                )
             else:
                 raise ConfigError(f"unknown event kind: {kind}")
             events.append(event)

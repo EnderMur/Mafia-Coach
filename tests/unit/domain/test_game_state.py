@@ -187,6 +187,36 @@ def test_phase_change_updates_phase_and_day(game: GameState) -> None:
     assert game.current_day() == 1
 
 
+def test_phase_change_to_day_increments_day(game: GameState) -> None:
+    """Переход в день без явного номера инкрементит счётчик дней (0 → 1)."""
+    game.apply(make_phase_change(to_phase=Phase.DAY, day_number=0))
+    assert game.current_phase() == Phase.DAY
+    assert game.current_day() == 1
+
+
+def test_phase_change_to_night_increments_day(game: GameState) -> None:
+    """Любой переход в DAY/NIGHT/VOTE инкрементит день, а не только в DAY."""
+    game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=0))  # день 1
+    game.apply(
+        make_phase_change(from_phase=Phase.NIGHT, to_phase=Phase.VOTE, day_number=0)  # день 2
+    )
+    assert game.current_phase() == Phase.VOTE
+    assert game.current_day() == 2
+
+
+def test_phase_change_with_explicit_day_number(game: GameState) -> None:
+    """Явный номер дня из бота применяется как есть."""
+    game.apply(make_phase_change(to_phase=Phase.DAY, day_number=5))
+    assert game.current_day() == 5
+
+
+def test_phase_change_to_end_does_not_increment(game: GameState) -> None:
+    """Переход в END без номера дня не считается новым днём."""
+    game.apply(make_phase_change(to_phase=Phase.END, day_number=0))
+    assert game.current_phase() == Phase.END
+    assert game.current_day() == 0
+
+
 def test_phase_change_with_wrong_source_phase_is_atomic(game: GameState) -> None:
     """A transition must begin at the aggregate's current phase."""
     with pytest.raises(ConfigError, match="current phase"):
