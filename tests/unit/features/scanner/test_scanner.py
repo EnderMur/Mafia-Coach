@@ -57,6 +57,16 @@ LENA = 102
 DEBOUNCE = 0.05
 DEBOUNCE_WAIT = 0.1
 
+END_GAME_TEXT = """Игра окончена!
+
+Победители:
+    1. Вася - 🤵🏼 Мафия
+
+Другие пользователи:
+    2. Петя - 👨🏼 Мирный Житель
+
+Игра длилась: 20 минут"""
+
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -1498,6 +1508,65 @@ async def test_backfill_applies_without_intermediate_flush(
     assert analyzer.calls == 1
     assert event_counts == [72]
     assert scanner.buffer_size == 0
+
+
+async def test_backfill_forces_flush_even_at_end(
+    game_state: GameState,
+    registry: RoleRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """11b-fix-3. Replaying a finished game still analyses it once at the end.
+
+    After 98 messages the bot's final report moves ``GameState`` to
+    ``Phase.END``. A normal ``_flush`` would clear the buffer and skip the
+    analyzer, leaving retro with no predictions; backfill must call
+    ``_flush_force`` so the single final analysis still happens.
+    """
+    start_game(game_state)
+    scanner, analyzer, telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        mode=TriggerMode.BATCH_DEBOUNCE,
+        debounce=10.0,
+        max_messages=200,
+        on_flush_complete=AsyncMock(),
+    )
+    chronological = [
+        history_message(
+            sender_id=BOT_ID,
+            text="Город ветров начинает свою игру над жителями!",
+            second=0,
+        ),
+        *[
+            history_message(
+                sender_id=VASYA,
+                sender=FakeSender(first_name="Вася"),
+                text=f"Сообщение {i}",
+                second=i + 1,
+            )
+            for i in range(98)
+        ],
+        history_message(sender_id=BOT_ID, text=END_GAME_TEXT, second=99),
+    ]
+    telegram.recent_messages = list(reversed(chronological))
+
+    force_calls: list[bool] = []
+    real_force_flush = scanner._flush_force
+
+    async def force_spy() -> None:
+        force_calls.append(True)
+        await real_force_flush()
+
+    monkeypatch.setattr(scanner, "_flush_force", force_spy)
+
+    applied = await scanner.backfill()
+
+    assert applied == 99
+    assert game_state.current_phase() is Phase.END
+    assert force_calls == [True]
+    assert analyzer.calls == 1
+    assert scanner.buffer_size == 0
+    assert scanner._debounce_task is None
 
 
 def test_backfill_timeout_300s() -> None:

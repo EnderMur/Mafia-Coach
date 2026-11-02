@@ -104,7 +104,9 @@ class GameState:
             updated_player = player.model_copy(update={"known_role": role, "revealed": True})
         elif isinstance(event, PhaseChangeEvent):
             if self._phase == Phase.END:
-                logger.bind(channel="game_state").warning(
+                # Post-END phase chatter is expected in backfills/replays:
+                # keep it out of WARNING logs (noise on every finished game).
+                logger.bind(channel="game_state").debug(
                     "phase_change to {} after END — ignored", event.payload.to_phase
                 )
                 return

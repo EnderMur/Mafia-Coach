@@ -245,8 +245,10 @@ class MessageScanner:
         жителями!"``) in the loaded window. Messages before the marker belong to
         finished games and are ignored; messages after the marker are applied
         chronologically via :meth:`_process_event`. Intermediate
-        flushes are suppressed, with one flush after the replay when a flush
-        completion callback is configured.
+        flushes are suppressed, with one *forced* flush after the replay when a
+        flush completion callback is configured. That final flush bypasses the
+        phase guard so even a game already in ``Phase.END`` gets predictions
+        for the retrospective.
 
         If ``GAME_START`` is not found in the loaded window, logs a warning,
         applies nothing, and returns ``0``. On :class:`TelegramFloodWaitError`,
@@ -344,8 +346,11 @@ class MessageScanner:
             applied,
             len(self._buffer),
         )
+        # Backfill is explicitly a catch-up flow: even if phase is END,
+        # we want a final analysis (predictions for retro). Use
+        # _flush_force() bypassing the phase guard.
         if self._buffer and self._on_flush_complete_callback is not None:
-            await self._flush()
+            await self._flush_force()
             logger.bind(channel=_LOGGER_CHANNEL).info("backfill: final flush done")
 
         return applied
@@ -723,6 +728,58 @@ class MessageScanner:
             self._flushing = False
             if self._started and self._policy.is_batch() and self._buffer:
                 self._schedule_debounce()
+
+    async def _flush_force(self) -> None:
+        """Flush the buffer bypassing the phase guard (backfill post-END).
+
+        Mirrors :meth:`_flush` — re-entrancy guard, debounce cancellation,
+        buffer drain, analysis, reasoning and flush-completion callbacks —
+        but never skips the analysis because of ``REGISTRATION``/``END``.
+        Backfill is a catch-up flow: its last analysis must still run after
+        the replay reached ``Phase.END`` so retro has predictions to label.
+
+        Force-specific log messages make it obvious in the logs which path
+        produced the final analysis.
+        """
+        if self._flushing:
+            return
+        self._flushing = True
+        try:
+            self._cancel_debounce()
+            self._buffer.clear()
+            result = await self._analyzer.analyze(self._game_state, persist=True)
+            response = result.response
+            if result.success and self._on_reasoning_callback is not None:
+                try:
+                    await self._on_reasoning_callback(result.reasoning_text)
+                except Exception as error:  # noqa: BLE001 — UI must not break scanning
+                    logger.bind(channel=_LOGGER_CHANNEL).error(
+                        "on_reasoning callback failed (force): {}: {}",
+                        type(error).__name__,
+                        str(error),
+                    )
+            if result.success and self._on_flush_complete_callback is not None:
+                try:
+                    await self._on_flush_complete_callback()
+                except Exception as error:  # noqa: BLE001 — UI must not break scanning
+                    logger.bind(channel=_LOGGER_CHANNEL).error(
+                        "on_flush_complete callback failed (force): {}: {}",
+                        type(error).__name__,
+                        str(error),
+                    )
+            if not result.success or response is None:
+                logger.bind(channel=_LOGGER_CHANNEL).warning(
+                    "flush failed (force): {}",
+                    result.error,
+                )
+            else:
+                logger.bind(channel=_LOGGER_CHANNEL).info(
+                    "flush ok (force): {} predictions, {:.2f}s",
+                    len(response.analysis),
+                    result.duration_sec,
+                )
+        finally:
+            self._flushing = False
 
     # ------------------------------------------------------------------
     # Read-only introspection (tests, orchestrator step 10)
