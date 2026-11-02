@@ -44,10 +44,20 @@ class FakeScanner:
         self.started = False
         self.shutdown_called = False
         self.buffer_size = 0
+        self.backfill_calls = 0
+        self.backfill_result = 0
+        self.backfill_error: Exception | None = None
 
     async def start(self) -> None:
         """Record scanner startup."""
         self.started = True
+
+    async def backfill(self) -> int:
+        """Record history backfill or raise the configured failure."""
+        self.backfill_calls += 1
+        if self.backfill_error is not None:
+            raise self.backfill_error
+        return self.backfill_result
 
     async def shutdown(self) -> None:
         """Record scanner shutdown."""
@@ -307,6 +317,57 @@ async def test_handle_attach_direct_chat_id(tmp_path: Path) -> None:
     assert telegram.get_chat_calls == [-100999]
     assert created_scanners[0].chat_id == -100999
     assert created_scanners[0].started is True
+    assert created_scanners[0].backfill_calls == 1
+    await orchestrator.shutdown()
+
+
+async def test_handle_attach_backfill_only_on_first_game_creation(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Backfill runs on first /attach (game_id 0 -> N), never on re-attach."""
+    result, _telegram, _llm = await make_result(tmp_path, chat_id=None)
+    created_scanners: list[FakeScanner] = []
+
+    def scanner_factory(chat_id: int) -> MessageScanner:
+        scanner = FakeScanner(chat_id)
+        scanner.backfill_result = 7
+        created_scanners.append(scanner)
+        return cast(MessageScanner, scanner)
+
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        scanner_factory=scanner_factory,
+    )
+    await orchestrator._handle_command("/attach -100999")
+    await orchestrator._handle_command("/attach -100888")
+
+    output = capsys.readouterr().out
+    assert "Backfilled 7 messages from game start." in output
+    assert len(created_scanners) == 2
+    assert created_scanners[0].backfill_calls == 1
+    assert created_scanners[1].backfill_calls == 0
+    await orchestrator.shutdown()
+
+
+async def test_handle_attach_backfill_error_does_not_abort_attach(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A backfill error is logged and printed without detaching the scanner."""
+    result, _telegram, _llm = await make_result(tmp_path, chat_id=None)
+    scanner = FakeScanner(-100999)
+    scanner.backfill_error = RuntimeError("history unavailable")
+
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        scanner_factory=lambda _chat_id: cast(MessageScanner, scanner),
+    )
+    await orchestrator._handle_command("/attach -100999")
+
+    output = capsys.readouterr().out
+    assert "Подключён чат -100999." in output
+    assert "Backfill failed: history unavailable" in output
+    assert scanner.started is True
+    assert orchestrator._scanner is not None
     await orchestrator.shutdown()
 
 

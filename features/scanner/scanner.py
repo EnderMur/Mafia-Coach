@@ -32,7 +32,9 @@ forced flush.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
+from types import SimpleNamespace
 from typing import Any, Final
 
 from loguru import logger
@@ -44,6 +46,7 @@ from domain.events import (
     MessagePayload,
     RoleRevealEvent,
 )
+from domain.exceptions import TelegramFloodWaitError
 from domain.game_state import GameState
 from domain.phases import Phase
 from domain.roles import RoleRegistry
@@ -59,6 +62,12 @@ _LOGGER_CHANNEL: Final[str] = "scanner"
 #: Prefix for synthetic display names when Telethon hides the sender entity
 #: (e.g. the sender left the chat and the entity is no longer resolvable).
 _FALLBACK_NAME_PREFIX: Final[str] = "user_"
+
+#: Bot marker announcing a new game ("Город ветров начинает свою игру над жителями!").
+_GAME_START_RE: Final[re.Pattern[str]] = re.compile(
+    r"Город\s+ветров\s+начинает\s+свою\s+игру",
+    re.IGNORECASE,
+)
 
 
 def _sender_display_name(sender: Any) -> str | None:
@@ -222,6 +231,85 @@ class MessageScanner:
             await self._telegram.remove_all_handlers()
             self._started = False
         logger.bind(channel=_LOGGER_CHANNEL).info("scanner stopped")
+
+    async def backfill(
+        self,
+        *,
+        limit: int | None = None,
+        max_messages: int = 5000,
+    ) -> int:
+        """Load recent chat history and apply it to ``GameState``.
+
+        Finds the ``GAME_START`` marker (``"Город ветров начинает свою игру над
+        жителями!"``) in the loaded window. Messages before the marker belong to
+        finished games and are ignored; messages from the marker onward are
+        applied chronologically via :meth:`_process_event`. Phase events may
+        trigger immediate flushes according to :class:`TriggerPolicy`, and any
+        remaining buffered events at the end of history are flushed once.
+
+        If ``GAME_START`` is not found in the loaded window, logs a warning,
+        applies nothing, and returns ``0``. On :class:`TelegramFloodWaitError`,
+        sleeps ``wait_seconds`` and retries once.
+
+        Args:
+            limit: Explicit maximum number of messages to fetch; defaults to
+                ``max_messages`` when ``None``.
+            max_messages: Default window size when ``limit`` is not given.
+
+        Returns:
+            Number of messages replayed starting from ``GAME_START``, or ``0``
+            when the marker was not found.
+        """
+        fetch_limit = limit if limit is not None else max_messages
+        try:
+            raw_messages = await self._telegram.list_recent_messages(
+                chat_id=self._chat_id,
+                limit=fetch_limit,
+            )
+        except TelegramFloodWaitError as e:
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "flood wait {}s",
+                e.wait_seconds,
+            )
+            await asyncio.sleep(e.wait_seconds)
+            raw_messages = await self._telegram.list_recent_messages(
+                chat_id=self._chat_id,
+                limit=fetch_limit,
+            )
+
+        messages = list(reversed(raw_messages))
+
+        start_idx: int | None = None
+        for i, msg in enumerate(messages):
+            msg_text = getattr(msg, "text", None)
+            if (
+                getattr(msg, "sender_id", None) == self._bot_id
+                and isinstance(msg_text, str)
+                and _GAME_START_RE.search(_strip_markdown(msg_text))
+            ):
+                start_idx = i
+
+        if start_idx is None:
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "GAME_START not found in history, no backfill",
+            )
+            return 0
+
+        messages_after = messages[start_idx:]
+        for msg in messages_after:
+            msg_text = getattr(msg, "text", None)
+            fake_event = SimpleNamespace(
+                sender_id=getattr(msg, "sender_id", None),
+                sender=getattr(msg, "sender", None),
+                message=SimpleNamespace(text=msg_text if isinstance(msg_text, str) else None),
+                date=getattr(msg, "date", None),
+            )
+            await self._process_event(fake_event)
+
+        if self._buffer:
+            await self._flush()
+
+        return len(messages_after)
 
     # ------------------------------------------------------------------
     # Telegram handler

@@ -517,6 +517,7 @@ class Orchestrator:
         # Bootstrap uses game_id=0 as a placeholder while no chat is selected.
         # The first attach replaces that placeholder; later attaches intentionally
         # keep the current game/state in v1 rather than splitting it per chat.
+        created_new_game = False
         if self._result.game_state.game_id == 0:
             try:
                 game_id = await asyncio.to_thread(
@@ -536,12 +537,29 @@ class Orchestrator:
                 game_id=game_id,
                 registry=self._result.registry,
             )
+            created_new_game = True
             logger.bind(channel=_LOGGER_CHANNEL).info(
                 "created game {} for chat_id={}", game_id, chat_id
             )
 
         await self._start_scanner(chat_id)
         print(f"Подключён чат {chat_id}.")
+        if created_new_game and self._scanner is not None:
+            try:
+                applied = await self._scanner.backfill()
+                if applied > 0:
+                    print(f"Backfilled {applied} messages from game start.")
+                    logger.bind(channel=_LOGGER_CHANNEL).info(
+                        "backfilled {} messages",
+                        applied,
+                    )
+            except Exception as e:  # noqa: BLE001 — backfill must not abort attach
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "backfill failed: {}: {}",
+                    type(e).__name__,
+                    str(e),
+                )
+                print(f"Backfill failed: {e}")
 
     async def _start_scanner(self, chat_id: int) -> None:
         """Construct and start a scanner for the selected chat."""

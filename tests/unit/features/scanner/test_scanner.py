@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
@@ -30,7 +30,7 @@ from domain.events import (
     PhaseChangePayload,
     VoteEvent,
 )
-from domain.exceptions import ConfigError
+from domain.exceptions import ConfigError, TelegramFloodWaitError
 from domain.game_state import GameState
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
@@ -69,6 +69,9 @@ class FakeTelegramWrapper:
         self.add_calls: int = 0
         self.removed: bool = False
         self.remove_calls: int = 0
+        self.recent_messages: list[Any] = []
+        self.list_calls: list[tuple[int, int]] = []
+        self.flood_wait_once: int | None = None
 
     def add_message_handler(
         self,
@@ -88,6 +91,20 @@ class FakeTelegramWrapper:
         self.removed = True
         self.remove_calls += 1
         self.handler = None
+
+    async def list_recent_messages(
+        self,
+        *,
+        chat_id: int,
+        limit: int = 50,
+    ) -> list[Any]:
+        """Return canned messages (newest-first) or raise FloodWait once."""
+        self.list_calls.append((chat_id, limit))
+        if self.flood_wait_once is not None:
+            wait = self.flood_wait_once
+            self.flood_wait_once = None
+            raise TelegramFloodWaitError(wait)
+        return list(self.recent_messages[:limit])
 
 
 class FakeAnalyzer:
@@ -1234,3 +1251,203 @@ async def test_flush_works_after_registration(
     await scanner._flush()
     assert analyzer.calls == 1
     assert scanner.buffer_size == 0
+
+
+# ---------------------------------------------------------------------------
+# Backfill (step 11a)
+# ---------------------------------------------------------------------------
+
+
+def history_message(
+    *,
+    sender_id: int,
+    text: str,
+    sender: Any = None,
+    second: int = 0,
+) -> SimpleNamespace:
+    """Build one Telethon-shaped history item as yielded by ``iter_messages``."""
+    return SimpleNamespace(
+        sender_id=sender_id,
+        sender=sender,
+        text=text,
+        date=TS + timedelta(seconds=second),
+    )
+
+
+async def test_backfill_applies_after_game_start(
+    game_state: GameState,
+    registry: RoleRegistry,
+) -> None:
+    """Messages before ``GAME_START`` are ignored; later ones enter ``GameState``."""
+    scanner, _analyzer, telegram = build_scanner(game_state=game_state, registry=registry)
+    chronological = [
+        history_message(
+            sender_id=999,
+            sender=FakeSender(first_name="Старожил"),
+            text="Реплика из прошлой партии",
+            second=0,
+        ),
+        history_message(
+            sender_id=BOT_ID,
+            text="Город ветров начинает свою игру над жителями!",
+            second=1,
+        ),
+        history_message(
+            sender_id=VASYA,
+            sender=FakeSender(first_name="Вася"),
+            text="Всем привет в новой игре",
+            second=2,
+        ),
+        history_message(
+            sender_id=PETYA,
+            sender=None,
+            text="Я тоже в игре",
+            second=3,
+        ),
+    ]
+    # Telethon's iter_messages returns newest messages first.
+    telegram.recent_messages = list(reversed(chronological))
+
+    applied = await scanner.backfill()
+
+    assert applied == 3
+    assert telegram.list_calls == [(CHAT_ID, 5000)]
+    assert 999 not in {player.player_id for player in game_state.players()}
+    assert "Старожил" not in scanner.name_to_id
+    messages = game_state.events_by_kind("message")
+    assert len(messages) == 2
+    assert [event.payload.text for event in messages if isinstance(event, MessageEvent)] == [
+        "Всем привет в новой игре",
+        "Я тоже в игре",
+    ]
+    assert game_state.player(PETYA).display_name == f"user_{PETYA}"
+
+
+async def test_backfill_no_game_start_returns_zero(
+    game_state: GameState,
+    registry: RoleRegistry,
+    log_records: list[Record],
+) -> None:
+    """Missing ``GAME_START`` logs a warning, touches nothing, and returns 0."""
+    scanner, analyzer, telegram = build_scanner(game_state=game_state, registry=registry)
+    chronological = [
+        history_message(
+            sender_id=VASYA,
+            sender=FakeSender(first_name="Вася"),
+            text="Первое сообщение без старта",
+            second=0,
+        ),
+        history_message(
+            sender_id=PETYA,
+            sender=FakeSender(first_name="Петя"),
+            text="Второе сообщение без старта",
+            second=1,
+        ),
+    ]
+    telegram.recent_messages = list(reversed(chronological))
+
+    applied = await scanner.backfill(limit=100)
+
+    assert applied == 0
+    assert telegram.list_calls == [(CHAT_ID, 100)]
+    assert game_state.events() == ()
+    assert game_state.players() == ()
+    assert analyzer.calls == 0
+    assert any("GAME_START not found" in message for message in _messages(log_records))
+
+
+async def test_backfill_flood_wait_retries(
+    game_state: GameState,
+    registry: RoleRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+    log_records: list[Record],
+) -> None:
+    """``TelegramFloodWaitError`` sleeps ``wait_seconds`` and retries once."""
+    scanner, analyzer, telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        mode=TriggerMode.BATCH_DEBOUNCE,
+    )
+    telegram.flood_wait_once = 3
+    chronological = [
+        history_message(
+            sender_id=BOT_ID,
+            text="Город ветров начинает свою игру над жителями!",
+            second=0,
+        ),
+        history_message(
+            sender_id=BOT_ID,
+            text="🌙 Наступает ночь",
+            second=1,
+        ),
+    ]
+    telegram.recent_messages = list(reversed(chronological))
+
+    real_sleep = asyncio.sleep
+    slept: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        if delay > 0:
+            slept.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr("features.scanner.scanner.asyncio.sleep", fake_sleep)
+
+    applied = await scanner.backfill()
+
+    assert applied == 2
+    assert telegram.list_calls == [(CHAT_ID, 5000), (CHAT_ID, 5000)]
+    assert slept == [3]
+    assert game_state.current_phase() is Phase.NIGHT
+    assert analyzer.calls == 1
+    assert scanner.buffer_size == 0
+    assert any("flood wait 3s" in message for message in _messages(log_records))
+
+
+async def test_backfill_flushes_at_end(
+    game_state: GameState,
+    registry: RoleRegistry,
+) -> None:
+    """Player messages trailing after ``GAME_START`` trigger a single end flush."""
+    start_game(game_state)
+    scanner, analyzer, telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        mode=TriggerMode.BATCH_DEBOUNCE,
+        debounce=10.0,
+        max_messages=50,
+    )
+    chronological = [
+        history_message(
+            sender_id=BOT_ID,
+            text="Город ветров начинает свою игру над жителями!",
+            second=0,
+        ),
+        history_message(
+            sender_id=VASYA,
+            sender=FakeSender(first_name="Вася"),
+            text="Первое обсуждение после ночи",
+            second=1,
+        ),
+        history_message(
+            sender_id=PETYA,
+            sender=FakeSender(first_name="Петя"),
+            text="Второе обсуждение после ночи",
+            second=2,
+        ),
+        history_message(
+            sender_id=LENA,
+            sender=FakeSender(first_name="Лена"),
+            text="Третье обсуждение после ночи",
+            second=3,
+        ),
+    ]
+    telegram.recent_messages = list(reversed(chronological))
+
+    applied = await scanner.backfill()
+
+    assert applied == 4
+    assert len(game_state.events_by_kind("message")) == 3
+    assert analyzer.calls == 1
+    assert scanner.buffer_size == 0
+    assert scanner._debounce_task is None
