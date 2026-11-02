@@ -19,11 +19,11 @@ Unresolvable data is never fatal: the event is skipped with a WARNING on
 the ``scanner`` log channel, because a single unknown nickname must not
 stop the whole pipeline.
 
-Player names are normalized with :func:`_strip_markdown` before lookup: real
-game bots mention players as Telegram markdown links
-(``[Yulios](tg://user?id=1)``) or with ``**bold**``/``*italic*`` markup, and
-those decorated strings never match the plain nicknames the scanner collected
-from Telegram messages.
+Player names are normalized with :func:`_strip_markdown` and, when direct
+lookup misses, :func:`_strip_role_prefix`: real game bots mention players as
+Telegram markdown links (``[Yulios](tg://user?id=1)``), emphasize them with
+``**bold**``/``*italic*`` markup, or prepend ``"[emoji] RoleName "`` before the
+display name.
 """
 
 from __future__ import annotations
@@ -53,7 +53,11 @@ from domain.events import (
 from domain.exceptions import UnknownRoleError
 from domain.phases import Phase
 from domain.roles import Role, RoleRegistry
-from features.parser.bot_messages import BotMessageKind, BotMessageParse
+from features.parser.bot_messages import (
+    BotMessageKind,
+    BotMessageParse,
+    _strip_leading_emoji,
+)
 
 _LOGGER_CHANNEL: Final[str] = "scanner"
 
@@ -108,6 +112,54 @@ def _strip_markdown(text: str) -> str:
     return text.strip()
 
 
+def _strip_role_prefix(
+    name: str,
+    registry: RoleRegistry,
+) -> str:
+    """Remove optional ``"[emoji] RoleName "`` prefix from a bot-reported display name.
+
+    Bot often writes ``"👨🏼 Мирный Житель ℳ𝒶𝓇𝒾𝓃𝒶 ♕"`` — role before name, while
+    ``name_to_id`` stores ``"ℳ𝒶𝓇𝒾𝓃𝒶 ♕"``. Each registered role's ``name_ru`` is
+    checked case-insensitively after leading emoji are stripped.
+
+    Args:
+        name: player name string extracted from a bot announcement.
+        registry: role registry providing canonical ``name_ru`` titles.
+
+    Returns:
+        Player name without the leading emoji/role prefix, or the original
+        ``name`` when no role prefix matches.
+    """
+    stripped = _strip_leading_emoji(name)
+    stripped_folded = stripped.casefold()
+    for role in registry.all_roles():
+        prefix_with_space = role.name_ru + " "
+        if stripped_folded.startswith(prefix_with_space.casefold()):
+            rest = stripped[len(prefix_with_space) :].strip()
+            if rest:
+                return rest
+        if stripped_folded == role.name_ru.casefold():
+            return stripped
+    return name
+
+
+def _resolve_player(
+    raw_name: str,
+    name_to_id: Mapping[str, int],
+    registry: RoleRegistry,
+) -> tuple[int | None, str]:
+    """Normalize markdown and optional role prefix, returning ``(player_id, name)``."""
+    name = _strip_markdown(raw_name)
+    player_id = name_to_id.get(name)
+    if player_id is None:
+        stripped = _strip_role_prefix(name, registry)
+        if stripped != name:
+            player_id = name_to_id.get(stripped)
+            if player_id is not None:
+                return player_id, stripped
+    return player_id, name
+
+
 def resolve_bot_message(
     *,
     parse: BotMessageParse,
@@ -148,15 +200,21 @@ def resolve_bot_message(
             parse=parse, game_id=game_id, ts=ts, current_phase=current_phase
         )
     if kind is BotMessageKind.DEATH:
-        return _resolve_death(parse=parse, name_to_id=name_to_id, game_id=game_id, ts=ts)
+        return _resolve_death(
+            parse=parse, name_to_id=name_to_id, registry=registry, game_id=game_id, ts=ts
+        )
     if kind is BotMessageKind.ROLE_REVEAL:
         return _resolve_role_reveal(
             parse=parse, name_to_id=name_to_id, registry=registry, game_id=game_id, ts=ts
         )
     if kind is BotMessageKind.VOTE:
-        return _resolve_votes(parse=parse, name_to_id=name_to_id, game_id=game_id, ts=ts)
+        return _resolve_votes(
+            parse=parse, name_to_id=name_to_id, registry=registry, game_id=game_id, ts=ts
+        )
     if kind is BotMessageKind.LAST_WORDS:
-        return _resolve_last_words(parse=parse, name_to_id=name_to_id, game_id=game_id, ts=ts)
+        return _resolve_last_words(
+            parse=parse, name_to_id=name_to_id, registry=registry, game_id=game_id, ts=ts
+        )
     if kind is BotMessageKind.ALIVE_LIST:
         if not parse.alive_player_names:
             _warn("alive_list without player names, skipped")
@@ -203,6 +261,7 @@ def _resolve_death(
     *,
     parse: BotMessageParse,
     name_to_id: Mapping[str, int],
+    registry: RoleRegistry,
     game_id: int,
     ts: datetime,
 ) -> list[AnyEvent]:
@@ -210,8 +269,7 @@ def _resolve_death(
     if not parse.player_name:
         _warn("death without player_name, skipped")
         return []
-    victim_name = _strip_markdown(parse.player_name)
-    victim_id = name_to_id.get(victim_name)
+    victim_id, victim_name = _resolve_player(parse.player_name, name_to_id, registry)
     if victim_id is None:
         _warn("death: unresolved victim name {!r}, skipped", victim_name)
         return []
@@ -252,8 +310,7 @@ def _resolve_role_reveal(
     except UnknownRoleError:
         _warn("role_reveal: unknown role id {!r}, skipped", parse.role_id)
         return []
-    player_name = _strip_markdown(parse.player_name)
-    player_id = name_to_id.get(player_name)
+    player_id, player_name = _resolve_player(parse.player_name, name_to_id, registry)
     if player_id is None:
         _warn("role_reveal: unresolved player name {!r}, skipped", player_name)
         return []
@@ -274,6 +331,7 @@ def _resolve_votes(
     *,
     parse: BotMessageParse,
     name_to_id: Mapping[str, int],
+    registry: RoleRegistry,
     game_id: int,
     ts: datetime,
 ) -> list[AnyEvent]:
@@ -286,13 +344,15 @@ def _resolve_votes(
 
     events: list[AnyEvent] = []
     for raw_voter, raw_target in votes:
-        voter = _strip_markdown(raw_voter)
-        voter_id = name_to_id.get(voter)
+        voter_id, voter = _resolve_player(raw_voter, name_to_id, registry)
         if voter_id is None:
             _warn("vote: unresolved voter name {!r}, pair skipped", voter)
             continue
         target = _strip_markdown(raw_target) if raw_target else None
         target_id = name_to_id.get(target) if target else None
+        if target and target_id is None:
+            target = _strip_role_prefix(target, registry)
+            target_id = name_to_id.get(target)
         if target and target_id is None:
             _warn("vote: unresolved target name {!r}", target)
         events.append(
@@ -314,6 +374,7 @@ def _resolve_last_words(
     *,
     parse: BotMessageParse,
     name_to_id: Mapping[str, int],
+    registry: RoleRegistry,
     game_id: int,
     ts: datetime,
 ) -> list[AnyEvent]:
@@ -321,8 +382,7 @@ def _resolve_last_words(
     if not parse.player_name:
         _warn("last_words without player_name, skipped")
         return []
-    player_name = _strip_markdown(parse.player_name)
-    player_id = name_to_id.get(player_name)
+    player_id, player_name = _resolve_player(parse.player_name, name_to_id, registry)
     if player_id is None:
         _warn("last_words: unresolved player name {!r}, skipped", player_name)
         return []

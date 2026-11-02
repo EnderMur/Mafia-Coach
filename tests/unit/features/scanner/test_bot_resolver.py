@@ -28,7 +28,7 @@ from domain.events import (
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
 from features.parser.bot_messages import BotMessageKind, BotMessageParse
-from features.scanner.bot_resolver import resolve_bot_message
+from features.scanner.bot_resolver import _strip_role_prefix, resolve_bot_message
 
 if TYPE_CHECKING:
     from loguru import Record
@@ -659,3 +659,115 @@ def test_strip_returns_plain_when_no_markdown():
     assert _strip_markdown("Вася") == "Вася"
     assert _strip_markdown("[**Вася**](tg://user?id=1)") == "Вася"
     assert _strip_markdown("*Петя*") == "Петя"
+
+
+# ===================================================================
+# Step 10c-fix-10: _strip_role_prefix & fallback resolution
+# ===================================================================
+
+
+def test_death_with_role_prefix_resolved() -> None:
+    """Night-kill name carrying '[emoji] RoleName ' resolves to the bare display_name."""
+    parse = BotMessageParse(
+        kind=BotMessageKind.DEATH,
+        confidence=1.0,
+        player_name="👨🏼 Мирный Житель ℳ𝒶𝓇𝒾𝓃𝒶 ♕",
+        death_cause="night_kill",
+        raw_text="",
+    )
+
+    events = _resolve(parse, name_to_id={"ℳ𝒶𝓇𝒾𝓃𝒶 ♕": 123})
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, DeathEvent)
+    assert event.payload.victim_id == 123
+    assert event.payload.victim_name == "ℳ𝒶𝓇𝒾𝓃𝒶 ♕"
+    assert event.payload.cause == "night_kill"
+
+
+def test_death_without_role_prefix_resolved() -> None:
+    """Plain victim display_name resolves directly without prefix stripping."""
+    parse = _parse(BotMessageKind.DEATH, player_name="Вася", death_cause="night_kill")
+
+    events = _resolve(parse, name_to_id={"Вася": 100})
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, DeathEvent)
+    assert event.payload.victim_id == 100
+    assert event.payload.victim_name == "Вася"
+
+
+def test_death_unresolved_falls_back_to_warning(log_records: list[Record]) -> None:
+    """Unresolved plain or role-prefixed victim logs a warning and emits no event."""
+    parse_plain = _parse(BotMessageKind.DEATH, player_name="Неизвестный", death_cause="night_kill")
+    parse_prefixed = _parse(
+        BotMessageKind.DEATH,
+        player_name="👨🏼 Мирный Житель Неизвестный",
+        death_cause="night_kill",
+    )
+
+    assert _resolve(parse_plain, name_to_id={}) == []
+    assert _resolve(parse_prefixed, name_to_id={}) == []
+    messages = _messages(log_records)
+    assert any("Неизвестный" in text for text in messages)
+
+
+def test_strip_role_prefix_does_not_break_plain_names() -> None:
+    """Names without a role prefix (or role-only strings) stay intact."""
+    assert _strip_role_prefix("Вася", REGISTRY) == "Вася"
+    assert _strip_role_prefix("Магистр", REGISTRY) == "Магистр"
+    assert _strip_role_prefix("Мафия", REGISTRY) == "Мафия"
+    assert _strip_role_prefix("Мафия   ", REGISTRY) == "Мафия   "
+
+
+def test_strip_role_prefix_all_roles() -> None:
+    """Every registered role's name_ru prefix is stripped cleanly."""
+    for role in REGISTRY.all_roles():
+        assert _strip_role_prefix(f"{role.name_ru} Имя", REGISTRY) == "Имя"
+
+
+def test_role_prefix_resolved_in_reveal_last_words_and_votes() -> None:
+    """Role prefix stripping also applies to role_reveal, last_words, and vote pairs."""
+    reveal = _parse(
+        BotMessageKind.ROLE_REVEAL,
+        player_name="🤵🏼 Мафия Вася",
+        role_id="mafia",
+    )
+    reveal_events = _resolve(reveal, name_to_id=dict(NAME_TO_ID))
+    assert len(reveal_events) == 1
+    assert isinstance(reveal_events[0], RoleRevealEvent)
+    assert reveal_events[0].payload.player_id == 100
+    assert reveal_events[0].payload.player_name == "Вася"
+
+    last_words = _parse(
+        BotMessageKind.LAST_WORDS,
+        player_name="👨🏼 Мирный Житель Ӡɞёӡɠϰƅɩύ Λγɥ 💬",
+        last_words="прощайте",
+    )
+    lw_events = _resolve(last_words, name_to_id={"Ӡɞёӡɠϰƅɩύ Λγɥ 💬": 555})
+    assert len(lw_events) == 1
+    assert isinstance(lw_events[0], MessageEvent)
+    assert lw_events[0].payload.author_id == 555
+    assert lw_events[0].payload.author_name == "Ӡɞёӡɠϰƅɩύ Λγɥ 💬"
+
+    vote = _parse(
+        BotMessageKind.VOTE,
+        votes=[
+            ("👨🏼 Мирный Житель Вася", "🤵🏼 Мафия Петя"),
+            ("Лена", "🤵🏼 Мафия Призрак"),
+        ],
+    )
+    vote_events = _resolve(vote, name_to_id=dict(NAME_TO_ID), current_phase=Phase.VOTE)
+    assert len(vote_events) == 2
+    first_vote, second_vote = vote_events
+    assert isinstance(first_vote, VoteEvent)
+    assert first_vote.payload.voter_id == 100
+    assert first_vote.payload.voter_name == "Вася"
+    assert first_vote.payload.target_id == 101
+    assert first_vote.payload.target_name == "Петя"
+    assert isinstance(second_vote, VoteEvent)
+    assert second_vote.payload.voter_id == 102
+    assert second_vote.payload.target_id is None
+    assert second_vote.payload.target_name == "Призрак"
