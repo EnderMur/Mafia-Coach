@@ -126,6 +126,11 @@ def retro_analyze(
         report.wrong,
         report.unknown,
     )
+    if report.unknown > 0:
+        logger.bind(channel=LOG_CHANNEL).info(
+            "retro: {} predictions lack final_role (unknown) — run backfill or check game_players",
+            report.unknown,
+        )
     return report
 
 

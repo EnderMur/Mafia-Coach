@@ -599,6 +599,44 @@ async def test_orchestrator_persist_player_dedup(tmp_path: Path, monkeypatch) ->
     await orchestrator.shutdown()
 
 
+async def test_persist_player_adds_to_game_players(tmp_path: Path) -> None:
+    """10c-fix-12. Registration writes both ``players`` and ``game_players``."""
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+
+    await orchestrator._persist_player(PLAYER_ID, "Вася")
+
+    game_id = result.game_state.game_id
+    assert game_id > 0
+    assert result.repos.players.get_player(PLAYER_ID) is not None
+    rows = result.repos.game_players.list_game_players(game_id)
+    assert len(rows) == 1
+    assert rows[0]["game_id"] == game_id
+    assert rows[0]["player_id"] == PLAYER_ID
+    assert rows[0]["final_role"] is None
+    await orchestrator.shutdown()
+
+
+async def test_persist_player_add_game_players_idempotent(tmp_path: Path) -> None:
+    """10c-fix-12. A repeated registration keeps exactly one participation row."""
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    game_id = result.game_state.game_id
+
+    await orchestrator._persist_player(PLAYER_ID, "Вася")
+    first_rows = result.repos.game_players.list_game_players(game_id)
+    # A fresh orchestrator has an empty in-memory dedup set, so this really
+    # exercises the repository's INSERT OR IGNORE path instead of the guard.
+    second = Orchestrator(bootstrap_result=result, enable_ui=False)
+    await second._persist_player(PLAYER_ID, "Вася")
+
+    rows = result.repos.game_players.list_game_players(game_id)
+    assert len(rows) == 1
+    assert first_rows[0]["id"] == rows[0]["id"]
+    await second.shutdown()
+    await orchestrator.shutdown()
+
+
 async def test_handle_status_uses_total_players(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

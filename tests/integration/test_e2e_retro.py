@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -200,8 +201,19 @@ def telegram_event(sender_id: int, name: str, text: str, index: int) -> Any:
     )
 
 
-async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
-    """13. The bot's final report labels predictions and stores the ground truth."""
+@dataclass(frozen=True)
+class EndGameEnvironment:
+    """Fully wired orchestrator over an empty, migrated in-memory database."""
+
+    conn: sqlite3.Connection
+    repos: Repositories
+    game_state: GameState
+    orchestrator: Orchestrator
+    game_id: int
+
+
+def build_end_game_environment(tmp_path: Path) -> EndGameEnvironment:
+    """Create the migrated database, analyzer, and orchestrator used by the e2e runs."""
     config = load_config(
         create_settings_file(
             tmp_path,
@@ -270,11 +282,22 @@ async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
         owns_telegram=False,
         owns_llm=False,
     )
-    orchestrator = Orchestrator(
-        bootstrap_result=bootstrap_result,
-        enable_ui=False,
+    return EndGameEnvironment(
+        conn=conn,
+        repos=repos,
+        game_state=game_state,
+        orchestrator=Orchestrator(bootstrap_result=bootstrap_result, enable_ui=False),
+        game_id=game_id,
     )
-    scanner = orchestrator._default_scanner(CHAT_ID_E2E)
+
+
+async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
+    """13. The bot's final report labels predictions and stores the ground truth."""
+    environment = build_end_game_environment(tmp_path)
+    repos = environment.repos
+    game_state = environment.game_state
+    game_id = environment.game_id
+    scanner = environment.orchestrator._default_scanner(CHAT_ID_E2E)
     await scanner.start()
     try:
         game_state.apply(
@@ -330,3 +353,69 @@ async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
     assert end_game_events[0].payload.winners == [("Вася", "Мафия")]
     assert end_game_events[0].payload.losers == [("Петя", "Мирный Житель")]
     assert end_game_events[0].payload.duration_minutes == 20
+
+
+# ---------------------------------------------------------------------------
+# Step 10c-fix-12: registration alone fills game_players
+# ---------------------------------------------------------------------------
+
+
+async def test_e2e_end_game_auto_retro_with_persist_player(tmp_path: Path) -> None:
+    """14. ``_persist_player`` alone fills game_players, so auto-retro labels predictions.
+
+    No manual ``game_players.add_player`` call: the orchestrator's registration
+    callback must create the participation rows, otherwise every final role
+    write is rejected and ``predictions.correct`` stays NULL.
+    """
+    environment = build_end_game_environment(tmp_path)
+    repos = environment.repos
+    game_state = environment.game_state
+    game_id = environment.game_id
+    orchestrator = environment.orchestrator
+    scanner = orchestrator._default_scanner(CHAT_ID_E2E)
+    await scanner.start()
+    try:
+        game_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
+        for index, (player_id, name) in enumerate(((PLAYER_A, "Вася"), (PLAYER_B, "Петя"))):
+            await scanner._on_event(
+                telegram_event(
+                    player_id,
+                    name,
+                    "Я думаю, что кто-то из нас двоих ведёт себя подозрительно",
+                    index,
+                )
+            )
+
+        # --- Registration created the participation rows -------------------
+        rows_before = repos.game_players.list_game_players(game_id)
+        assert [row["player_id"] for row in rows_before] == [PLAYER_A, PLAYER_B]
+        assert {row["final_role"] for row in rows_before} == {None}
+        assert len(repos.predictions.list_predictions(game_id)) == 2
+
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", END_GAME_TEXT, 10))
+    finally:
+        await scanner.shutdown()
+
+    # --- Ground truth is stored on the pre-existing participation rows -----
+    winner = repos.game_players.get_player_in_game(game_id=game_id, player_id=PLAYER_A)
+    loser = repos.game_players.get_player_in_game(game_id=game_id, player_id=PLAYER_B)
+    assert winner is not None and loser is not None
+    assert winner["final_role"] == "Мафия"
+    assert loser["final_role"] == "Мирный житель"
+    assert len(repos.game_players.list_game_players(game_id)) == 2
+
+    # --- Auto-retro filled predictions.correct instead of leaving it NULL --
+    labels = {
+        row["player_id"]: row["correct"] for row in repos.predictions.list_predictions(game_id)
+    }
+    assert labels == {PLAYER_A: 1, PLAYER_B: 1}
+
+    await orchestrator.shutdown()

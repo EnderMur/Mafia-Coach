@@ -26,10 +26,18 @@ class GamePlayersRepository:
     ) -> int:
         """Insert a game_players row and return its row identifier.
 
+        The insert is ``INSERT OR IGNORE`` into a unique ``(game_id,
+        player_id)`` pair, so registering the same player in the same game
+        twice is a silent no-op that returns the identifier of the existing
+        row. An existing row keeps whatever ground truth it already holds: a
+        repeated attach or a later backfill never erases a final role and never
+        fails the caller.
+
         ``game_id`` and ``player_id`` must already exist in ``games`` and
         ``players`` respectively: the schema declares foreign keys and the
         connection enables ``PRAGMA foreign_keys``, so a missing parent row
-        raises :class:`sqlite3.IntegrityError`.
+        still raises :class:`sqlite3.IntegrityError` (``OR IGNORE`` never
+        suppresses foreign-key violations).
 
         Args:
             game_id: Identifier of an existing game.
@@ -42,17 +50,18 @@ class GamePlayersRepository:
                 None otherwise; stored as INTEGER 1/0/NULL.
 
         Returns:
-            The ``game_players.id`` of the inserted row.
+            The ``game_players.id`` of the inserted row, or of the existing row
+            when the player was already registered in this game.
 
         Raises:
-            ConfigError: If the player is already registered in this game.
-            sqlite3.IntegrityError: If the game or the player does not exist.
+            sqlite3.IntegrityError: If the game or the player does not exist,
+                or if the table holds a legacy duplicate pair that cannot be
+                backfilled with the ``game_players_unique_player`` index.
         """
-        if self.get_player_in_game(game_id=game_id, player_id=player_id) is not None:
-            raise ConfigError(f"player {player_id} already registered in game {game_id}")
-
-        cursor = self._conn.execute(
-            "INSERT INTO game_players(game_id, player_id, final_role, survived, is_winner) "
+        self._ensure_unique_player_index()
+        self._conn.execute(
+            "INSERT OR IGNORE INTO game_players"
+            "(game_id, player_id, final_role, survived, is_winner) "
             "VALUES (?, ?, ?, ?, ?)",
             (
                 game_id,
@@ -62,8 +71,36 @@ class GamePlayersRepository:
                 _to_db_optional_flag(is_winner),
             ),
         )
-        assert cursor.lastrowid is not None
-        return cursor.lastrowid
+        row = self._conn.execute(
+            "SELECT id FROM game_players WHERE game_id = ? AND player_id = ?",
+            (game_id, player_id),
+        ).fetchone()
+        if row is None:  # pragma: no cover — INSERT OR IGNORE always leaves one row
+            raise sqlite3.IntegrityError(
+                f"game_players row for player {player_id} in game {game_id} is missing"
+            )
+        return int(row["id"])
+
+    def _ensure_unique_player_index(self) -> None:
+        """Create the unique participation index the first time it is needed.
+
+        The v1 schema allows several rows for one ``(game_id, player_id)``
+        pair, and ``INSERT OR IGNORE`` can only deduplicate against a unique
+        constraint. Creating the index here keeps already-migrated databases
+        working without an extra migration, is a no-op once it exists, and
+        fails loudly on a legacy table that really holds duplicates — such a
+        database needs an explicit backfill instead of silent double rows.
+        """
+        try:
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS game_players_unique_player "
+                "ON game_players(game_id, player_id)"
+            )
+        except sqlite3.IntegrityError as error:
+            raise sqlite3.IntegrityError(
+                "game_players holds duplicate (game_id, player_id) rows; "
+                f"cannot enforce one participation row per player: {error}"
+            ) from error
 
     def set_final_role(
         self,
