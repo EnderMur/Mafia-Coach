@@ -54,11 +54,8 @@ class GamePlayersRepository:
             when the player was already registered in this game.
 
         Raises:
-            sqlite3.IntegrityError: If the game or the player does not exist,
-                or if the table holds a legacy duplicate pair that cannot be
-                backfilled with the ``game_players_unique_player`` index.
+            sqlite3.IntegrityError: If the game or the player does not exist.
         """
-        self._ensure_unique_player_index()
         self._conn.execute(
             "INSERT OR IGNORE INTO game_players"
             "(game_id, player_id, final_role, survived, is_winner) "
@@ -80,27 +77,6 @@ class GamePlayersRepository:
                 f"game_players row for player {player_id} in game {game_id} is missing"
             )
         return int(row["id"])
-
-    def _ensure_unique_player_index(self) -> None:
-        """Create the unique participation index the first time it is needed.
-
-        The v1 schema allows several rows for one ``(game_id, player_id)``
-        pair, and ``INSERT OR IGNORE`` can only deduplicate against a unique
-        constraint. Creating the index here keeps already-migrated databases
-        working without an extra migration, is a no-op once it exists, and
-        fails loudly on a legacy table that really holds duplicates — such a
-        database needs an explicit backfill instead of silent double rows.
-        """
-        try:
-            self._conn.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS game_players_unique_player "
-                "ON game_players(game_id, player_id)"
-            )
-        except sqlite3.IntegrityError as error:
-            raise sqlite3.IntegrityError(
-                "game_players holds duplicate (game_id, player_id) rows; "
-                f"cannot enforce one participation row per player: {error}"
-            ) from error
 
     def set_final_role(
         self,

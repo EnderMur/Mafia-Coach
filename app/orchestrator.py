@@ -526,13 +526,48 @@ class Orchestrator:
             await self._handle_status()
         elif command == "/quit" and argument is None:
             await self._handle_quit()
+        elif command == "/reset" and argument is None:
+            await self._handle_reset()
+        elif command == "/retro" and argument is None:
+            await self._handle_retro()
         elif command == "/attach":
             await self._handle_attach(argument)
         else:
             print(
-                f"Unknown command: {line}. Available: /status, /quit, /attach [id]",
+                f"Unknown command: {line}. Available: /status, /quit, /attach [id], /reset, /retro",
                 flush=True,
             )
+
+    async def _handle_reset(self) -> None:
+        """Handle /reset by starting a fresh game and scanner in the attached chat."""
+        chat_id = self._chat_id
+        if chat_id is None:
+            print("No chat attached. Use /attach first.", flush=True)
+            return
+        await self._cancel_backfill()
+        if self._scanner is not None:
+            await self._scanner.shutdown()
+            self._scanner = None
+        try:
+            async with self._db_lock:
+                gid = await asyncio.to_thread(
+                    self._result.repos.games.create_game, chat_id=chat_id, player_count=0
+                )
+            self._result.game_state = GameState(game_id=gid, registry=self._result.registry)
+            self._registered_player_ids.clear()
+            await self._start_scanner(chat_id)
+        except Exception as error:  # noqa: BLE001 — command boundary
+            print(f"Reset failed: {error}", flush=True)
+            return
+        print(f"Reset: new game {gid}.", flush=True)
+
+    async def _handle_retro(self) -> None:
+        """Handle /retro by manually running retrospective analysis."""
+        try:
+            await self._run_retro()
+            print("Retro: done (see logs).", flush=True)
+        except Exception as error:  # noqa: BLE001 — command boundary
+            print(f"Retro failed: {error}", flush=True)
 
     async def _handle_attach(self, arg: str | None) -> None:
         """Select a chat interactively or attach directly to a numeric id.

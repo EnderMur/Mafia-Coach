@@ -99,6 +99,11 @@ class GameState:
                 raise UnknownRoleError(f"unknown role name: {event.payload.role_name_ru}")
             updated_player = player.model_copy(update={"known_role": role, "revealed": True})
         elif isinstance(event, PhaseChangeEvent):
+            if self._phase == Phase.END:
+                logger.bind(channel="game_state").warning(
+                    "phase_change to {} after END — ignored", event.payload.to_phase
+                )
+                return
             payload = event.payload
             if payload.from_phase == payload.to_phase:
                 raise ConfigError("phase change must transition to a different phase")
@@ -108,9 +113,11 @@ class GameState:
                     f"but current phase is {self._phase.value}"
                 )
         elif isinstance(event, AliveListEvent):
-            # A2-1: every registered player absent from the bot's snapshot is
-            # dead. Names are display_name strings; unknown names are ignored
-            # (the bot's list never introduces players on its own).
+            existing_names = {p.display_name for p in self._players.values()}
+            for name in event.payload.alive_player_names:
+                if name not in existing_names:
+                    self.register_player(_placeholder_player_id(name), name, username=None)
+                    existing_names.add(name)
             alive_names = set(event.payload.alive_player_names)
             updated: dict[int, Player] = {}
             for pid, player in self._players.items():
@@ -158,8 +165,8 @@ class GameState:
         the parser is wrong, so it is reported as a WARNING instead of being
         silently overwritten.
 
-        Names are ``display_name`` strings; players the bot mentions but that
-        were never registered are ignored, and roles that do not resolve to a
+        Names match display names first, then usernames; unknown players get
+        deterministic placeholder ids. Roles that do not resolve to a
         configured ``Role`` leave ``final_role`` untouched (the winner flag is
         still recorded — it does not depend on the role).
 
@@ -168,16 +175,15 @@ class GameState:
         winners_map = dict(event.payload.winners)
         losers_map = dict(event.payload.losers)
 
-        for player_id, player in self._players.items():
-            winner_role = winners_map.get(player.display_name)
-            loser_role = losers_map.get(player.display_name)
-            if winner_role is None and loser_role is None:
-                continue
-
-            final_role_ru = winner_role if winner_role is not None else loser_role
-            if final_role_ru is None:  # pragma: no cover - narrowed above
-                continue
-            is_winner = winner_role is not None
+        for name in winners_map.keys() | losers_map.keys():
+            player = next((p for p in self._players.values() if p.display_name == name), None)
+            if player is None:
+                player = next((p for p in self._players.values() if p.username == name), None)
+            if player is None:
+                player = self.register_player(_placeholder_player_id(name), name)
+            player_id = player.player_id
+            is_winner = name in winners_map
+            final_role_ru = winners_map[name] if is_winner else losers_map[name]
 
             final_role = self._resolve_final_role(final_role_ru)
             if player.known_role is not None:
@@ -266,3 +272,12 @@ class GameState:
             return self._players[player_id]
         except KeyError as error:
             raise ConfigError(f"player {player_id} not registered") from error
+
+
+def _placeholder_player_id(name: str) -> int:
+    """Stable negative int64 for name-only players; Telegram user ids are positive."""
+    import hashlib
+
+    digest = hashlib.sha256(name.encode("utf-8")).digest()
+    n = int.from_bytes(digest[:8], "big", signed=False)
+    return -(n % (2**62)) - 1

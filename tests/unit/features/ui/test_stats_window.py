@@ -67,7 +67,7 @@ def test_render_table_shows_players_phase_day_and_confidence() -> None:
         assert expected in rendered
 
 
-def test_render_table_limits_to_twenty_rows() -> None:
+def test_max_rows_30() -> None:
     """Large frames are truncated at the visible-row cap."""
     output = io.StringIO()
     message = StatsMessage(
@@ -76,14 +76,14 @@ def test_render_table_limits_to_twenty_rows() -> None:
         day=1,
         rows=[
             StatsRow(player_name=f"Игрок {index}", role="Мафия", confidence=0.5)
-            for index in range(25)
+            for index in range(35)
         ],
     )
 
     render_table(Console(file=output, force_terminal=False), message)
 
-    assert "Игрок 19" in output.getvalue()
-    assert "Игрок 20" not in output.getvalue()
+    assert "Игрок 29" in output.getvalue()
+    assert "Игрок 30" not in output.getvalue()
 
 
 def test_main_processes_stats_and_shutdown_lines() -> None:

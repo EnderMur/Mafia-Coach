@@ -15,7 +15,7 @@ llm:
   model: "qwen/qwen3.5-9b"                    # ОБЯЗАТЕЛЬНО: идентификатор из LM Studio
   temperature: 0.3
   top_p: 0.9
-  max_tokens: 4096
+  max_tokens: 8192
   request_timeout_sec: 120                    # первая генерация на CPU бывает долгой
   connect_timeout_sec: 5
   max_retries: 3                              # не больше 3 (см. §8.4)
@@ -51,7 +51,7 @@ ui:
 
 # ── Логи ───────────────────────────────────────────────────────────────────
 logging:
-  level: "INFO"                                # DEBUG для отладки парсера
+  level: INFO                                # DEBUG для отладки парсера
   dir: "logs"
   rotation: "10 MB"
   retention_days: 30

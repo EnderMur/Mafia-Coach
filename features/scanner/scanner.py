@@ -40,6 +40,7 @@ from typing import Any, Final
 from loguru import logger
 
 from domain.events import (
+    AliveListEvent,
     AnyEvent,
     DeathEvent,
     MessageEvent,
@@ -47,7 +48,7 @@ from domain.events import (
     RoleRevealEvent,
 )
 from domain.exceptions import TelegramFloodWaitError
-from domain.game_state import GameState
+from domain.game_state import GameState, _placeholder_player_id
 from domain.phases import Phase
 from domain.roles import RoleRegistry
 from features.analyzer.analyzer import GameAnalyzer
@@ -456,6 +457,8 @@ class MessageScanner:
             await self._ensure_event_player(event)
             if self._apply_safely(event):
                 applied.append(event)
+                if isinstance(event, AliveListEvent):
+                    await self._persist_alive_placeholders(event.payload.alive_player_names)
                 await self._emit(event)
         if applied:
             self._buffer.extend(applied)
@@ -555,6 +558,22 @@ class MessageScanner:
         player_id, display_name = referenced
         await self._register_player(player_id, display_name)
 
+    async def _persist_alive_placeholders(self, names: list[str]) -> None:
+        """Publish name-only registrations for persistence and subsequent bot events."""
+        for name in names:
+            pid = _placeholder_player_id(name)
+            # Do not create fake participation rows for already-known real users.
+            if not any(p.player_id == pid for p in self._game_state.players()):
+                continue
+            self._name_to_id.setdefault(name, pid)
+            if self._on_player_registered is not None:
+                try:
+                    await self._on_player_registered(pid, name)
+                except Exception:  # noqa: BLE001 — defensive callback boundary
+                    logger.bind(channel=_LOGGER_CHANNEL).debug(
+                        "placeholder persistence failed for {}", name
+                    )
+
     def _apply_safely(self, event: AnyEvent) -> bool:
         """Apply an event, downgrading domain rejections to a log record.
 
@@ -567,12 +586,15 @@ class MessageScanner:
         try:
             self._game_state.apply(event)
         except Exception as e:  # noqa: BLE001 — one bad event must not stop the game
-            logger.bind(channel=_LOGGER_CHANNEL).error(
-                "GameState.apply({}) failed: {}: {}",
-                event.kind,
-                type(e).__name__,
-                str(e),
-            )
+            msg = str(e).lower()
+            if "already dead" in msg or "already registered" in msg:
+                logger.bind(channel=_LOGGER_CHANNEL).debug(
+                    "GameState.apply({}) skipped (idempotent): {}", event.kind, e
+                )
+            else:
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "GameState.apply({}) failed: {}: {}", event.kind, type(e).__name__, e
+                )
             return False
         return True
 
