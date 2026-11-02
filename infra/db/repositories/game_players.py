@@ -22,6 +22,7 @@ class GamePlayersRepository:
         player_id: int,
         final_role: str | None = None,
         survived: bool | None = None,
+        is_winner: bool | None = None,
     ) -> int:
         """Insert a game_players row and return its row identifier.
 
@@ -37,6 +38,8 @@ class GamePlayersRepository:
                 None while the role is still unknown.
             survived: True/False when the outcome is known, None otherwise;
                 stored as INTEGER 1/0/NULL.
+            is_winner: True/False when the final report named the player,
+                None otherwise; stored as INTEGER 1/0/NULL.
 
         Returns:
             The ``game_players.id`` of the inserted row.
@@ -49,8 +52,15 @@ class GamePlayersRepository:
             raise ConfigError(f"player {player_id} already registered in game {game_id}")
 
         cursor = self._conn.execute(
-            "INSERT INTO game_players(game_id, player_id, final_role, survived) VALUES (?, ?, ?, ?)",
-            (game_id, player_id, final_role, _to_db_survived(survived)),
+            "INSERT INTO game_players(game_id, player_id, final_role, survived, is_winner) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                game_id,
+                player_id,
+                final_role,
+                _to_db_survived(survived),
+                _to_db_optional_flag(is_winner),
+            ),
         )
         assert cursor.lastrowid is not None
         return cursor.lastrowid
@@ -62,31 +72,35 @@ class GamePlayersRepository:
         player_id: int,
         final_role: str,
         survived: bool | None = None,
+        is_winner: bool | None = None,
     ) -> None:
-        """Store a player's final role, optionally updating the survival flag.
+        """Store a player's final role and outcome flags.
 
-        When ``survived`` is None the stored survival value is left untouched.
+        ``survived`` and ``is_winner`` use ``COALESCE``: passing None leaves
+        the stored value untouched instead of erasing ground truth that was
+        written earlier (retro may run more than once for the same game).
 
         Args:
             game_id: Identifier of the game.
             player_id: Identifier of the player.
             final_role: Russian role name (``name_ru`` from ``roles.yaml``).
             survived: True/False to also store the outcome, None to keep it.
+            is_winner: True/False to also store the result, None to keep it.
 
         Raises:
             ConfigError: If the player has no participation row in this game.
         """
-        if survived is None:
-            cursor = self._conn.execute(
-                "UPDATE game_players SET final_role = ? WHERE game_id = ? AND player_id = ?",
-                (final_role, game_id, player_id),
-            )
-        else:
-            cursor = self._conn.execute(
-                "UPDATE game_players SET final_role = ?, survived = ? "
-                "WHERE game_id = ? AND player_id = ?",
-                (final_role, _to_db_survived(survived), game_id, player_id),
-            )
+        cursor = self._conn.execute(
+            "UPDATE game_players SET final_role = ?, survived = COALESCE(?, survived), "
+            "is_winner = COALESCE(?, is_winner) WHERE game_id = ? AND player_id = ?",
+            (
+                final_role,
+                _to_db_survived(survived),
+                _to_db_optional_flag(is_winner),
+                game_id,
+                player_id,
+            ),
+        )
         if cursor.rowcount == 0:
             raise ConfigError(f"player {player_id} not registered in game {game_id}")
 
@@ -108,6 +122,11 @@ class GamePlayersRepository:
 
 def _to_db_survived(survived: bool | None) -> int | None:
     """Map an optional survival flag to the INTEGER 1/0/NULL stored in SQLite."""
-    if survived is None:
+    return _to_db_optional_flag(survived)
+
+
+def _to_db_optional_flag(flag: bool | None) -> int | None:
+    """Map an optional boolean flag to the INTEGER 1/0/NULL stored in SQLite."""
+    if flag is None:
         return None
-    return int(survived)
+    return int(flag)

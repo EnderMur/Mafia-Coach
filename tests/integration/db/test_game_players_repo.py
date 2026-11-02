@@ -190,3 +190,41 @@ def test_add_player_with_unknown_player_id_raises_integrity_error(
 
     with pytest.raises(sqlite3.IntegrityError):
         repository.add_player(game_id=game_id, player_id=999)
+
+
+def test_set_final_role_with_is_winner(conn: sqlite3.Connection) -> None:
+    """11. The winner flag is stored as INTEGER 1/0 next to the final role."""
+    game_id, repository = create_participation_repository(conn)
+    repository.add_player(game_id=game_id, player_id=100)
+    repository.set_final_role(
+        game_id=game_id,
+        player_id=100,
+        final_role="Мафия",
+        is_winner=True,
+    )
+
+    row = repository.get_player_in_game(game_id=game_id, player_id=100)
+    assert row is not None
+    assert row["final_role"] == "Мафия"
+    assert row["is_winner"] == 1
+    assert isinstance(row["is_winner"], int)
+
+
+def test_set_final_role_coalesce_preserves(conn: sqlite3.Connection) -> None:
+    """12. Omitting survived/is_winner keeps the ground truth already stored."""
+    game_id, repository = create_participation_repository(conn)
+    repository.add_player(
+        game_id=game_id,
+        player_id=100,
+        final_role="Мирный житель",
+        survived=False,
+        is_winner=False,
+    )
+
+    repository.set_final_role(game_id=game_id, player_id=100, final_role="Дон")
+
+    row = repository.get_player_in_game(game_id=game_id, player_id=100)
+    assert row is not None
+    assert row["final_role"] == "Дон"
+    assert row["survived"] == 0
+    assert row["is_winner"] == 0

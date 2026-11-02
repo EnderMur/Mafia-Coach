@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import pytest
+from loguru import logger
 
 from domain.events import (
     AliveListEvent,
     AliveListPayload,
     DeathEvent,
     DeathPayload,
+    EndGameEvent,
+    EndGamePayload,
     MessageEvent,
     MessagePayload,
     PhaseChangeEvent,
@@ -26,6 +31,9 @@ from domain.game_state import GameState
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
 
+if TYPE_CHECKING:
+    from loguru import Record
+
 ROLES_PATH = Path(__file__).parents[3] / "configs" / "roles.yaml"
 
 
@@ -39,6 +47,17 @@ def registry() -> RoleRegistry:
 def game(registry: RoleRegistry) -> GameState:
     """Create an empty game state with the real role registry."""
     return GameState(game_id=1, registry=registry)
+
+
+@pytest.fixture
+def log_records() -> Iterator[list[Record]]:
+    """Capture WARNING-and-above loguru records emitted during a test."""
+    records: list[Record] = []
+    sink_id = logger.add(lambda message: records.append(message.record), level="WARNING")
+    try:
+        yield records
+    finally:
+        logger.remove(sink_id)
 
 
 def event_time() -> datetime:
@@ -365,3 +384,131 @@ def test_apply_alive_list_no_unknown_players_added(game: GameState, registry: Ro
     fresh = GameState(game_id=1, registry=registry)
     assert fresh.role_count is None
     assert fresh.total_players is None
+
+
+# ===================================================================
+# Step 10c-fix-11: END_GAME → final_role / is_winner (7-10)
+# ===================================================================
+
+
+def make_end_game(
+    *,
+    winners: list[tuple[str, str]] | None = None,
+    losers: list[tuple[str, str]] | None = None,
+    duration_minutes: int | None = 20,
+    game_id: int = 1,
+) -> EndGameEvent:
+    """Build the bot's final report event."""
+    return EndGameEvent(
+        ts=event_time(),
+        game_id=game_id,
+        payload=EndGamePayload(
+            winners=winners or [],
+            losers=losers or [],
+            duration_minutes=duration_minutes,
+        ),
+    )
+
+
+def test_apply_end_game_sets_final_role(game: GameState) -> None:
+    """7. Winners and losers get final_role/is_winner; unmentioned players stay None."""
+    game.register_player(1, "A")
+    game.register_player(2, "B")
+    game.register_player(3, "C")
+
+    game.apply(
+        make_end_game(
+            winners=[("A", "Мафия")],
+            losers=[("B", "Мирный Житель")],
+        )
+    )
+
+    player_a = game.player(1)
+    player_b = game.player(2)
+    player_c = game.player(3)
+    assert player_a.final_role is not None and player_a.final_role.id == "mafia"
+    assert player_b.final_role is not None and player_b.final_role.id == "civilian"
+    assert player_c.final_role is None
+    assert player_a.is_winner is True
+    assert player_b.is_winner is False
+    assert player_c.is_winner is None
+
+
+def test_apply_end_game_phase_end(game: GameState) -> None:
+    """8. The final report moves the game to Phase.END."""
+    game.register_player(1, "A")
+    game.apply(make_phase_change(from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT))
+    assert game.current_phase() is Phase.NIGHT
+
+    game.apply(make_end_game(winners=[("A", "Мафия")]))
+
+    assert game.current_phase() is Phase.END
+    assert game.events()[-1].kind == "end_game"
+
+
+def test_apply_end_game_warns_on_role_mismatch(game: GameState, log_records: list[Record]) -> None:
+    """9. A reveal that contradicts the final report warns but END_GAME wins (B2-3)."""
+    game.register_player(1, "A")
+    game.apply(
+        RoleRevealEvent(
+            ts=event_time(),
+            game_id=1,
+            payload=RoleRevealPayload(
+                player_id=1,
+                player_name="A",
+                role_name_ru="Мирный житель",
+            ),
+        )
+    )
+    assert game.player(1).known_role is not None
+
+    game.apply(make_end_game(winners=[("A", "Мафия")]))
+
+    assert any("final_role mismatch for A" in record["message"] for record in log_records)
+    final_role = game.player(1).final_role
+    assert final_role is not None and final_role.id == "mafia"
+    assert game.player(1).is_winner is True
+
+
+def test_apply_end_game_resolves_name_ru(game: GameState) -> None:
+    """10. The bot's Russian role name (any capitalisation) resolves to a Role."""
+    game.register_player(1, "A")
+
+    game.apply(make_end_game(losers=[("A", "Мирный Житель")]))
+
+    final_role = game.player(1).final_role
+    assert final_role is not None
+    assert final_role.id == "civilian"
+    assert game.player(1).is_winner is False
+
+
+def test_apply_end_game_matching_reveal_does_not_warn(
+    game: GameState, log_records: list[Record]
+) -> None:
+    """A reveal that agrees with the final report is updated silently."""
+    game.register_player(1, "A")
+    game.apply(
+        RoleRevealEvent(
+            ts=event_time(),
+            game_id=1,
+            payload=RoleRevealPayload(player_id=1, player_name="A", role_name_ru="Мафия"),
+        )
+    )
+
+    game.apply(make_end_game(winners=[("A", "Мафия")]))
+
+    assert not any("final_role mismatch" in record["message"] for record in log_records)
+    assert game.player(1).is_winner is True
+
+
+def test_apply_end_game_unknown_role_keeps_final_role_empty(
+    game: GameState, log_records: list[Record]
+) -> None:
+    """An unresolvable role name warns but still records the winner flag."""
+    game.register_player(1, "A")
+
+    game.apply(make_end_game(winners=[("A", "Несуществующая роль")]))
+
+    assert any("unknown final role name" in record["message"] for record in log_records)
+    assert game.player(1).final_role is None
+    assert game.player(1).is_winner is True

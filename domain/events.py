@@ -84,6 +84,19 @@ class AliveListPayload(BaseModel):
     total_players: int | None = Field(default=None, ge=0)
 
 
+class EndGamePayload(BaseModel):
+    """Bot's end-of-game report: winners + losers + duration."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    #: ``[(player_name, role_name_ru), ...]`` — победители (достигли цели,
+    #: не обязательно выжили: самоубийца повешен — победил).
+    winners: list[tuple[str, str]] = Field(default_factory=list)
+    #: ``[(player_name, role_name_ru), ...]`` — остальные участники.
+    losers: list[tuple[str, str]] = Field(default_factory=list)
+    duration_minutes: int | None = Field(default=None, ge=0)
+
+
 class _EventModel(BaseModel):
     """Common immutable event fields and timestamp validation."""
 
@@ -143,6 +156,19 @@ class AliveListEvent(_EventModel):
     payload: AliveListPayload
 
 
+class EndGameEvent(_EventModel):
+    """Bot reports the final standings: 'Игра окончена!'."""
+
+    kind: Literal["end_game"] = "end_game"
+    payload: EndGamePayload
+
+
 AnyEvent: TypeAlias = (
-    MessageEvent | DeathEvent | VoteEvent | RoleRevealEvent | PhaseChangeEvent | AliveListEvent
+    MessageEvent
+    | DeathEvent
+    | VoteEvent
+    | RoleRevealEvent
+    | PhaseChangeEvent
+    | AliveListEvent
+    | EndGameEvent
 )

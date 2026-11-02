@@ -13,6 +13,7 @@ Mapping (``BotMessageKind`` → events)
 ``VOTE``           → ``[VoteEvent, ...]``     (one event per vote pair)
 ``LAST_WORDS``     → ``[MessageEvent]``       (author is the dying player)
 ``ALIVE_LIST``     → ``[AliveListEvent]``     (bot snapshot, names unresolved)
+``END_GAME``       → ``[EndGameEvent]``       (final report, ground truth)
 everything else    → ``[]``                   (informational only)
 
 Unresolvable data is never fatal: the event is skipped with a WARNING on
@@ -41,6 +42,8 @@ from domain.events import (
     AnyEvent,
     DeathEvent,
     DeathPayload,
+    EndGameEvent,
+    EndGamePayload,
     MessageEvent,
     MessagePayload,
     PhaseChangeEvent,
@@ -225,6 +228,8 @@ def resolve_bot_message(
             total_players=parse.total_players,
         )
         return [AliveListEvent(ts=ts, game_id=game_id, payload=payload)]
+    if kind is BotMessageKind.END_GAME:
+        return _resolve_end_game(parse=parse, game_id=game_id, ts=ts)
     # REGISTRATION, ROLE_ACTION, SYSTEM, GIFT, PROTECTION_USED,
     # VOTE_ABSTAIN, UNKNOWN — informational, no domain event.
     return []
@@ -255,6 +260,30 @@ def _resolve_phase_change(
         day_number=parse.day_number or 0,
     )
     return [PhaseChangeEvent(ts=ts, game_id=game_id, payload=payload)]
+
+
+def _resolve_end_game(
+    *,
+    parse: BotMessageParse,
+    game_id: int,
+    ts: datetime,
+) -> list[AnyEvent]:
+    """Build the final-report event, skipping an empty report with a warning.
+
+    Role names stay as the bot wrote them (``name_ru``); resolving them to
+    ``Role`` objects happens in :meth:`domain.game_state.GameState.apply`.
+    """
+    winners: list[tuple[str, str]] = list(parse.winners or [])
+    losers: list[tuple[str, str]] = list(parse.losers or [])
+    if not winners and not losers:
+        _warn("end_game without any players, skipped")
+        return []
+    payload = EndGamePayload(
+        winners=winners,
+        losers=losers,
+        duration_minutes=parse.duration_minutes,
+    )
+    return [EndGameEvent(ts=ts, game_id=game_id, payload=payload)]
 
 
 def _resolve_death(
