@@ -11,8 +11,13 @@ from typing import Any
 import pytest
 from rich.console import Console
 
+from features.ui import stats_window as stats_window_module
 from features.ui.protocol import IPCEnvelope, StatsMessage, StatsRow, encode
 from features.ui.stats_window import main, render_table
+
+# The autouse conftest fixture stubs this out on Windows; the CONOUT$ tests
+# need the real implementation, so keep a reference captured at import time.
+_REAL_REOPEN_WINDOWS_CONSOLE = stats_window_module._reopen_windows_console
 
 
 class _FlushSpy(io.StringIO):
@@ -130,6 +135,9 @@ def test_win32_reopens_conout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(os, "system", lambda command: 0)  # chcp on POSIX
     monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(
+        stats_window_module, "_reopen_windows_console", _REAL_REOPEN_WINDOWS_CONSOLE
+    )
 
     lines = encode(IPCEnvelope(type="shutdown")) + "\n"
 

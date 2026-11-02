@@ -10,8 +10,13 @@ from typing import Any
 
 import pytest
 
+from features.ui import reasoning_window as reasoning_window_module
 from features.ui.protocol import IPCEnvelope, ReasoningMessage, encode
 from features.ui.reasoning_window import main
+
+# The autouse conftest fixture stubs this out on Windows; the CONOUT$ test
+# needs the real implementation, so keep a reference captured at import time.
+_REAL_REOPEN_WINDOWS_CONSOLE = reasoning_window_module._reopen_windows_console
 
 
 def _line(text: str, *, truncated: bool = False) -> str:
@@ -102,6 +107,9 @@ def test_win32_reopens_conout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(os, "system", lambda command: 0)  # chcp on POSIX
     monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(
+        reasoning_window_module, "_reopen_windows_console", _REAL_REOPEN_WINDOWS_CONSOLE
+    )
 
     assert (
         main(io.StringIO(_line("Окно") + "\n" + encode(IPCEnvelope(type="shutdown")) + "\n")) == 0
