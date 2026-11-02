@@ -13,16 +13,17 @@ Bot templates overlap heavily, so the order of the branches in
    section (``"Другие пользователи:"``) and must win over ``ALIVE_LIST``.
 3. ``ALIVE_LIST``       — the list body contains role emoji.
 4. ``REGISTRATION``
-5. ``DEATH``            — BEFORE phase change (``"🌙 Кто-то был убит"``).
-6. ``PHASE_CHANGE``     — vote start / vote end only.
-7. ``VOTE``             — multi-line, collects ``votes``.
-8. ``PROTECTION_USED``  — ``"использовал защиту от линчевания"`` is NOT death.
-9. ``VOTE_ABSTAIN``
-10. ``ROLE_REVEAL``     — *grammatical* player reveals only.
-11. ``ROLE_ACTION``     — role "action notifications" (``"Дон выбрал жертву"``).
-12. ``PHASE_CHANGE``    — night / day transitions (short messages only).
-13. ``SYSTEM``
-14. ``UNKNOWN``         — fallback, kept for C3 statistics.
+5. ``GAME_START``       — new-game marker must become a state-changing event.
+6. ``DEATH``            — BEFORE phase change (``"🌙 Кто-то был убит"``).
+7. ``PHASE_CHANGE``     — vote start / vote end only.
+8. ``VOTE``             — multi-line, collects ``votes``.
+9. ``PROTECTION_USED``  — ``"использовал защиту от линчевания"`` is NOT death.
+10. ``VOTE_ABSTAIN``
+11. ``ROLE_REVEAL``     — *grammatical* player reveals only.
+12. ``ROLE_ACTION``     — role "action notifications" (``"Дон выбрал жертву"``).
+13. ``PHASE_CHANGE``    — night / day transitions (short messages only).
+14. ``SYSTEM``
+15. ``UNKNOWN``         — fallback, kept for C3 statistics.
 """
 
 from __future__ import annotations
@@ -45,6 +46,7 @@ class BotMessageKind(str, Enum):
     """Semantic kind of a parsed game-bot message."""
 
     REGISTRATION = "registration"
+    GAME_START = "game_start"
     PHASE_CHANGE = "phase_change"
     DEATH = "death"
     #: Only grammatical player reveals: ``"X был[а] Роль"`` / ``"X — Роль"``.
@@ -59,7 +61,7 @@ class BotMessageKind(str, Enum):
     PROTECTION_USED = "protection_used"
     #: "X решил никого не вешать".
     VOTE_ABSTAIN = "vote_abstain"
-    #: "Город ветров начинает игру", "Автоматический старт игры".
+    #: Informational system announcements such as "Недостаточно игроков для начала игры".
     SYSTEM = "system"
     #: Final report: ``"Игра окончена!"`` + winners / losers / duration.
     END_GAME = "end_game"
@@ -391,6 +393,12 @@ _RE_REGISTRATION: Final[re.Pattern[str]] = re.compile(
     r"|регистраци[яию])",
 )
 
+_RE_GAME_START: Final[re.Pattern[str]] = re.compile(
+    r"(?i)(?:город\s+ветров\s+начинает"
+    r"|начинается\s+(?:новая\s+)?игра"
+    r"|старт\s+игры)",
+)
+
 # --- alive list -----------------------------------------------------------
 
 _RE_ALIVE_LIST: Final[re.Pattern[str]] = re.compile(
@@ -554,7 +562,7 @@ _RE_ACTION_TARGET: Final[re.Pattern[str]] = re.compile(
 # --- system ---------------------------------------------------------------
 
 _RE_SYSTEM: Final[re.Pattern[str]] = re.compile(
-    r"(?i)(?:город\s+ветров|автоматическ\w*\s+старт(?:\s+игры)?"
+    r"(?i)(?:автоматическ\w*\s+старт(?:\s+игры)?"
     r"|странно.{0,30}этой\s+ночью\s+все\s+остались\s+в\s+живых"
     r"|недостаточно\s+игроков\s+для\s+начала\s+игры)",
 )
@@ -822,6 +830,16 @@ def _parse_end_game(text: str) -> BotMessageParse | None:
 def _parse_registration(text: str) -> BotMessageParse | None:
     if _RE_REGISTRATION.search(text):
         return BotMessageParse(kind=BotMessageKind.REGISTRATION, raw_text=text)
+    return None
+
+
+def _parse_game_start(text: str) -> BotMessageParse | None:
+    if _RE_GAME_START.search(text):
+        return BotMessageParse(
+            kind=BotMessageKind.GAME_START,
+            confidence=1.0,
+            raw_text=text,
+        )
     return None
 
 
@@ -1248,7 +1266,12 @@ def parse_bot_message(
     if result is not None:
         return result
 
-    # 6. Death — BEFORE phase change ("🌙 Кто-то был убит" is a death)
+    # 6. New-game marker must win over generic system announcements.
+    result = _parse_game_start(stripped)
+    if result is not None:
+        return result
+
+    # 7. Death — BEFORE phase change ("🌙 Кто-то был убит" is a death)
     result = _parse_death(stripped)
     if result is not None:
         return result

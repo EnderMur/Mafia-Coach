@@ -366,6 +366,34 @@ async def test_player_speech_added_to_buffer(
     assert analyzer.calls == 0
 
 
+async def test_live_game_start_re_registers_players(
+    game_state: GameState,
+    registry: RoleRegistry,
+) -> None:
+    """Known Telegram users can be tracked again after an END → new-game reset."""
+    scanner, _analyzer, _telegram = build_scanner(game_state=game_state, registry=registry)
+    await scanner._register_player(VASYA, "Вася")
+    game_state.apply(
+        PhaseChangeEvent(
+            ts=TS,
+            game_id=GAME_ID,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION,
+                to_phase=Phase.END,
+                day_number=0,
+            ),
+        )
+    )
+
+    await scanner._on_event(bot_event("Город ветров начинает игру"))
+
+    assert game_state.current_phase() is Phase.REGISTRATION
+    assert game_state.players() == ()
+    await scanner._on_event(player_event(VASYA, "Вася", "Мы снова играем вместе"))
+    assert len(game_state.players()) == 1
+    assert game_state.player(VASYA).display_name == "Вася"
+
+
 async def test_on_event_callback_invoked_for_player_speech(
     game_state: GameState,
     registry: RoleRegistry,
@@ -827,7 +855,6 @@ async def test_bot_message_without_text(
     "text",
     [
         "абракадабра без смысла",
-        "Город ветров начинает игру",
         "Регистрация открыта",
     ],
 )
@@ -1342,6 +1369,88 @@ async def test_backfill_applies_after_game_start(
     assert game_state.player(PETYA).display_name == f"user_{PETYA}"
 
 
+async def test_backfill_skips_completed_game(
+    game_state: GameState,
+    registry: RoleRegistry,
+) -> None:
+    """A final report after the latest start means the game must not be replayed."""
+    scanner, analyzer, telegram = build_scanner(game_state=game_state, registry=registry)
+    chronological = [
+        history_message(
+            sender_id=BOT_ID,
+            text="Город ветров начинает свою игру над жителями!",
+            second=0,
+        ),
+        history_message(
+            sender_id=VASYA,
+            sender=FakeSender(first_name="Вася"),
+            text="Сообщение из завершённой игры",
+            second=1,
+        ),
+        history_message(sender_id=BOT_ID, text=END_GAME_TEXT, second=2),
+        history_message(
+            sender_id=PETYA,
+            sender=FakeSender(first_name="Петя"),
+            text="Позднее сообщение",
+            second=3,
+        ),
+    ]
+    telegram.recent_messages = list(reversed(chronological))
+
+    info_records: list[Record] = []
+    sink_id = logger.add(lambda message: info_records.append(message.record), level="INFO")
+    try:
+        applied = await scanner.backfill()
+    finally:
+        logger.remove(sink_id)
+
+    assert applied == 0
+    assert game_state.events() == ()
+    assert game_state.players() == ()
+    assert analyzer.calls == 0
+    assert any("game is completed" in record["message"] for record in info_records)
+
+
+async def test_backfill_applies_current_game(
+    game_state: GameState,
+    registry: RoleRegistry,
+) -> None:
+    """An old END_GAME before the latest start does not block the active game."""
+    scanner, _analyzer, telegram = build_scanner(game_state=game_state, registry=registry)
+    chronological = [
+        history_message(sender_id=BOT_ID, text=END_GAME_TEXT, second=0),
+        history_message(
+            sender_id=BOT_ID,
+            text="Город ветров начинает свою игру над жителями!",
+            second=1,
+        ),
+        history_message(
+            sender_id=VASYA,
+            sender=FakeSender(first_name="Вася"),
+            text="Новое обсуждение 1",
+            second=2,
+        ),
+        history_message(
+            sender_id=PETYA,
+            sender=FakeSender(first_name="Петя"),
+            text="Новое обсуждение 2",
+            second=3,
+        ),
+    ]
+    telegram.recent_messages = list(reversed(chronological))
+
+    applied = await scanner.backfill()
+
+    assert applied == 2
+    messages = game_state.events_by_kind("message")
+    assert len(messages) == 2
+    assert [event.payload.text for event in messages if isinstance(event, MessageEvent)] == [
+        "Новое обсуждение 1",
+        "Новое обсуждение 2",
+    ]
+    assert {player.display_name for player in game_state.players()} == {"Вася", "Петя"}
+
+
 async def test_backfill_no_game_start_returns_zero(
     game_state: GameState,
     registry: RoleRegistry,
@@ -1515,12 +1624,12 @@ async def test_backfill_forces_flush_even_at_end(
     registry: RoleRegistry,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """11b-fix-3. Replaying a finished game still analyses it once at the end.
+    """A phase-END marker without a final report still gets a forced flush.
 
-    After 98 messages the bot's final report moves ``GameState`` to
-    ``Phase.END``. A normal ``_flush`` would clear the buffer and skip the
-    analyzer, leaving retro with no predictions; backfill must call
-    ``_flush_force`` so the single final analysis still happens.
+    A normal ``_flush`` would clear the buffer and skip the analyzer, leaving
+    retro with no predictions; backfill must call ``_flush_force`` so the
+    single final analysis still happens. A real END_GAME report is skipped by
+    the completed-game guard above.
     """
     start_game(game_state)
     scanner, analyzer, telegram = build_scanner(
@@ -1546,7 +1655,7 @@ async def test_backfill_forces_flush_even_at_end(
             )
             for i in range(98)
         ],
-        history_message(sender_id=BOT_ID, text=END_GAME_TEXT, second=99),
+        history_message(sender_id=BOT_ID, text="Победа мафии", second=99),
     ]
     telegram.recent_messages = list(reversed(chronological))
 

@@ -111,6 +111,20 @@ def test_phase_change_builds_event_with_current_phase_as_from_phase() -> None:
     assert event.game_id == GAME_ID
 
 
+def test_game_start_creates_registration_phase_change() -> None:
+    """GAME_START emits a registration event even when already in registration."""
+    events = _resolve(_parse(BotMessageKind.GAME_START), current_phase=Phase.REGISTRATION)
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, PhaseChangeEvent)
+    assert event.payload.from_phase is Phase.REGISTRATION
+    assert event.payload.to_phase is Phase.REGISTRATION
+    assert event.payload.day_number == 0
+    assert event.ts == TS
+    assert event.game_id == GAME_ID
+
+
 def test_phase_change_to_current_phase_is_skipped_with_warning(
     log_records: list[Record],
 ) -> None:

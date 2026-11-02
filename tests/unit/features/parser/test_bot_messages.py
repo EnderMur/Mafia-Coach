@@ -592,26 +592,39 @@ class TestVoteAbstain:
         assert r.kind is BotMessageKind.VOTE_ABSTAIN
 
 
-class TestSystem:
-    """``SYSTEM`` — служебные объявления бота."""
+class TestGameStart:
+    """New-game markers are distinct from informational system messages."""
 
-    def test_city_of_winds_starts(self, registry: RoleRegistry) -> None:
-        r = parse_bot_message("Город ветров начинает свою игру", registry=registry)
+    def test_game_start_detected(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Город ветров начинает свою игру над жителями!", registry=registry)
         assert r is not None
-        assert r.kind is BotMessageKind.SYSTEM
+        assert r.kind is BotMessageKind.GAME_START
+
+    def test_game_start_before_system(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Город ветров начинает игру", registry=registry)
+        assert r is not None
+        assert r.kind is not BotMessageKind.SYSTEM
+        assert r.kind is BotMessageKind.GAME_START
 
     def test_automatic_start(self, registry: RoleRegistry) -> None:
         r = parse_bot_message("Автоматический старт игры", registry=registry)
         assert r is not None
-        assert r.kind is BotMessageKind.SYSTEM
+        assert r.kind is BotMessageKind.GAME_START
 
 
 class TestNewKinds:
     """All step 7b-fix-1 kinds must exist on the enum."""
 
     def test_new_kinds_present(self) -> None:
-        for name in ("ROLE_ACTION", "PROTECTION_USED", "VOTE_ABSTAIN", "SYSTEM"):
+        for name in (
+            "ROLE_ACTION",
+            "PROTECTION_USED",
+            "VOTE_ABSTAIN",
+            "GAME_START",
+            "SYSTEM",
+        ):
             assert hasattr(BotMessageKind, name)
+        assert BotMessageKind("game_start") is BotMessageKind.GAME_START
         assert BotMessageKind("role_action") is BotMessageKind.ROLE_ACTION
         assert BotMessageKind("protection_used") is BotMessageKind.PROTECTION_USED
         assert BotMessageKind("vote_abstain") is BotMessageKind.VOTE_ABSTAIN
