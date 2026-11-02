@@ -73,6 +73,17 @@ class PhaseChangePayload(BaseModel):
     day_number: int = Field(ge=0)
 
 
+class AliveListPayload(BaseModel):
+    """Bot's snapshot of the alive players and role composition."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    alive_player_names: list[str] = Field(min_length=1)
+    #: ``name_ru → count`` exactly as written by the bot.
+    role_count: dict[str, int] | None = None
+    total_players: int | None = Field(default=None, ge=0)
+
+
 class _EventModel(BaseModel):
     """Common immutable event fields and timestamp validation."""
 
@@ -125,4 +136,13 @@ class PhaseChangeEvent(_EventModel):
     payload: PhaseChangePayload
 
 
-AnyEvent: TypeAlias = MessageEvent | DeathEvent | VoteEvent | RoleRevealEvent | PhaseChangeEvent
+class AliveListEvent(_EventModel):
+    """Bot reports 'Живые игроки: ... Из них: ... Всего: N'."""
+
+    kind: Literal["alive_list"] = "alive_list"
+    payload: AliveListPayload
+
+
+AnyEvent: TypeAlias = (
+    MessageEvent | DeathEvent | VoteEvent | RoleRevealEvent | PhaseChangeEvent | AliveListEvent
+)

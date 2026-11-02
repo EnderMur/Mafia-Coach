@@ -5,6 +5,7 @@ from __future__ import annotations
 from pydantic import BaseModel, ConfigDict, Field
 
 from domain.events import (
+    AliveListEvent,
     AnyEvent,
     DeathEvent,
     MessageEvent,
@@ -40,6 +41,8 @@ class GameState:
         self._events: list[AnyEvent] = []
         self._phase = Phase.REGISTRATION
         self._day_number = 0
+        self._role_count: dict[str, int] | None = None
+        self._total_players: int | None = None
 
     @property
     def game_id(self) -> int:
@@ -95,6 +98,24 @@ class GameState:
                     f"phase change starts at {payload.from_phase.value}, "
                     f"but current phase is {self._phase.value}"
                 )
+        elif isinstance(event, AliveListEvent):
+            # A2-1: every registered player absent from the bot's snapshot is
+            # dead. Names are display_name strings; unknown names are ignored
+            # (the bot's list never introduces players on its own).
+            alive_names = set(event.payload.alive_player_names)
+            updated: dict[int, Player] = {}
+            for pid, player in self._players.items():
+                if player.display_name in alive_names:
+                    updated[pid] = player
+                elif player.alive:
+                    updated[pid] = player.model_copy(update={"alive": False})
+                else:
+                    updated[pid] = player
+            self._players = updated
+            self._role_count = (
+                dict(event.payload.role_count) if event.payload.role_count is not None else None
+            )
+            self._total_players = event.payload.total_players
         elif isinstance(event, (MessageEvent, VoteEvent)):
             pass
         else:
@@ -130,6 +151,16 @@ class GameState:
     def current_day(self) -> int:
         """Return the current game day number."""
         return self._day_number
+
+    @property
+    def role_count(self) -> dict[str, int] | None:
+        """Bot-reported role composition (name_ru → count), or None."""
+        return dict(self._role_count) if self._role_count is not None else None
+
+    @property
+    def total_players(self) -> int | None:
+        """Bot-reported total alive count, or None."""
+        return self._total_players
 
     def events(self) -> tuple[AnyEvent, ...]:
         """Return successfully applied events in append order."""

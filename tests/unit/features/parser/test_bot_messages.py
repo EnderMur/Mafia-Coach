@@ -144,6 +144,59 @@ class TestAliveList:
 
 
 # ===================================================================
+# Step 10c-fix-8: ALIVE_LIST payload extraction (4)
+# ===================================================================
+
+
+class TestAliveListExtraction:
+    """The parser must carry names, role composition and headcount."""
+
+    def test_alive_list_parses_player_names(self, registry: RoleRegistry) -> None:
+        text = (
+            "Живые игроки:\n1. user_1\n2. user_2\n\n"
+            "Из них: 👨🏼‍💼 Адвокат, 🤵🏼 Мафия - 5\n\nВсего: 2"
+        )
+        r = parse_bot_message(text, registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ALIVE_LIST
+        assert r.alive_player_names == ["user_1", "user_2"]
+
+    def test_alive_list_parses_role_count(self, registry: RoleRegistry) -> None:
+        text = (
+            "Живые игроки:\n1. user_1\n\n"
+            "Из них: 👨🏼‍💼 Адвокат, 🤵🏼 Мафия - 5, 💣 Камикадзе - 3\n\n"
+            "Всего: 10"
+        )
+        r = parse_bot_message(text, registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ALIVE_LIST
+        assert r.role_count == {"Адвокат": 1, "Мафия": 5, "Камикадзе": 3}
+
+    def test_alive_list_parses_total(self, registry: RoleRegistry) -> None:
+        text = "Живые игроки:\n1. user_1\n\nИз них: 🤵🏼 Мафия - 1\n\nВсего: 30"
+        r = parse_bot_message(text, registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ALIVE_LIST
+        assert r.total_players == 30
+
+    def test_alive_list_no_role_section(self, registry: RoleRegistry) -> None:
+        text = "Живые игроки:\n1. user_1\n\nВсего: 1"
+        r = parse_bot_message(text, registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ALIVE_LIST
+        assert r.alive_player_names == ["user_1"]
+        assert r.role_count is None
+        assert r.total_players == 1
+
+    def test_new_fields_default_to_none_for_other_kinds(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message("Кто-то был убит этой ночью.", registry=registry)
+        assert r is not None
+        assert r.alive_player_names is None
+        assert r.role_count is None
+        assert r.total_players is None
+
+
+# ===================================================================
 # Death tests (5)
 # ===================================================================
 

@@ -8,6 +8,8 @@ from pathlib import Path
 import pytest
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     DeathEvent,
     DeathPayload,
     MessageEvent,
@@ -71,6 +73,25 @@ def make_phase_change(
         ts=event_time(),
         game_id=game_id,
         payload=PhaseChangePayload(from_phase=from_phase, to_phase=to_phase, day_number=day_number),
+    )
+
+
+def make_alive_list(
+    names: list[str],
+    *,
+    role_count: dict[str, int] | None = None,
+    total_players: int | None = None,
+    game_id: int = 1,
+) -> AliveListEvent:
+    """Build a bot alive-list snapshot event."""
+    return AliveListEvent(
+        ts=event_time(),
+        game_id=game_id,
+        payload=AliveListPayload(
+            alive_player_names=names,
+            role_count=role_count,
+            total_players=total_players,
+        ),
     )
 
 
@@ -242,3 +263,75 @@ def test_event_from_another_game_is_rejected(game: GameState) -> None:
     with pytest.raises(ConfigError, match="belongs to game"):
         game.apply(make_phase_change(game_id=2))
     assert game.events() == ()
+
+
+# ===================================================================
+# Step 10c-fix-8: AliveListEvent (A2-1 + bot snapshot)
+# ===================================================================
+
+
+def test_apply_alive_list_marks_absent_dead(game: GameState) -> None:
+    """Every registered player missing from the snapshot is dead (A2-1)."""
+    game.register_player(1, "A")
+    game.register_player(2, "B")
+    game.register_player(3, "C")
+
+    event = make_alive_list(["A"])
+    game.apply(event)
+
+    assert game.player(1).alive is True
+    assert game.player(2).alive is False
+    assert game.player(3).alive is False
+    assert game.alive_players() == (game.player(1),)
+    assert game.dead_players() == (game.player(2), game.player(3))
+    # The event itself is kept in the history, like every other event.
+    assert game.events() == (event,)
+    assert game.events_by_kind("alive_list") == (event,)
+
+    # Re-applying a snapshot is idempotent: already-dead players stay dead.
+    game.apply(make_alive_list(["A"]))
+    assert game.player(1).alive is True
+    assert game.player(2).alive is False
+    assert game.player(3).alive is False
+
+
+def test_apply_alive_list_sets_role_count(game: GameState) -> None:
+    """The bot-reported role composition is stored and exposed as a copy."""
+    game.register_player(1, "A")
+    role_count = {"Мафия": 5, "Дон": 1, "Мирный Житель": 4}
+
+    game.apply(make_alive_list(["A"], role_count=role_count, total_players=10))
+
+    assert game.role_count == role_count
+    assert game.role_count is not role_count
+
+
+def test_apply_alive_list_sets_total_players(game: GameState) -> None:
+    """The bot-reported headcount is stored verbatim."""
+    game.register_player(1, "A")
+
+    game.apply(make_alive_list(["A"], total_players=10))
+
+    assert game.total_players == 10
+    assert game.role_count is None
+
+
+def test_apply_alive_list_no_unknown_players_added(game: GameState, registry: RoleRegistry) -> None:
+    """A name absent from GameState is ignored, never registered (A2-1)."""
+    game.register_player(1, "A")
+    game.register_player(2, "B")
+    game.register_player(3, "C")
+
+    game.apply(make_alive_list(["A", "D"]))
+
+    assert len(game.players()) == 3
+    assert {player.display_name for player in game.players()} == {"A", "B", "C"}
+    assert {player.player_id for player in game.players()} == {1, 2, 3}
+    assert game.player(1).alive is True
+    assert game.player(2).alive is False
+    assert game.player(3).alive is False
+
+    # Defaults before any snapshot arrives.
+    fresh = GameState(game_id=1, registry=registry)
+    assert fresh.role_count is None
+    assert fresh.total_players is None

@@ -12,6 +12,7 @@ Mapping (``BotMessageKind`` → events)
 ``ROLE_REVEAL``    → ``[RoleRevealEvent]``    (role id and name must resolve)
 ``VOTE``           → ``[VoteEvent, ...]``     (one event per vote pair)
 ``LAST_WORDS``     → ``[MessageEvent]``       (author is the dying player)
+``ALIVE_LIST``     → ``[AliveListEvent]``     (bot snapshot, names unresolved)
 everything else    → ``[]``                   (informational only)
 
 Unresolvable data is never fatal: the event is skipped with a WARNING on
@@ -35,6 +36,8 @@ from typing import Final, Literal, TypeAlias
 from loguru import logger
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     AnyEvent,
     DeathEvent,
     DeathPayload,
@@ -134,9 +137,10 @@ def resolve_bot_message(
         message), 1 event, or N events (multi-vote message).
 
     Notes:
-        Informational kinds (``REGISTRATION``, ``ROLE_ACTION``,
-        ``ALIVE_LIST``, ``SYSTEM``, ``GIFT``, ``PROTECTION_USED``,
-        ``VOTE_ABSTAIN``, ``UNKNOWN``) produce no events.
+        Informational kinds (``REGISTRATION``, ``ROLE_ACTION``, ``SYSTEM``,
+        ``GIFT``, ``PROTECTION_USED``, ``VOTE_ABSTAIN``, ``UNKNOWN``) produce
+        no events. ``ALIVE_LIST`` produces an ``AliveListEvent`` unless the
+        parser found no player names.
     """
     kind = parse.kind
     if kind is BotMessageKind.PHASE_CHANGE:
@@ -153,7 +157,17 @@ def resolve_bot_message(
         return _resolve_votes(parse=parse, name_to_id=name_to_id, game_id=game_id, ts=ts)
     if kind is BotMessageKind.LAST_WORDS:
         return _resolve_last_words(parse=parse, name_to_id=name_to_id, game_id=game_id, ts=ts)
-    # REGISTRATION, ROLE_ACTION, ALIVE_LIST, SYSTEM, GIFT, PROTECTION_USED,
+    if kind is BotMessageKind.ALIVE_LIST:
+        if not parse.alive_player_names:
+            _warn("alive_list without player names, skipped")
+            return []
+        payload = AliveListPayload(
+            alive_player_names=list(parse.alive_player_names),
+            role_count=dict(parse.role_count) if parse.role_count else None,
+            total_players=parse.total_players,
+        )
+        return [AliveListEvent(ts=ts, game_id=game_id, payload=payload)]
+    # REGISTRATION, ROLE_ACTION, SYSTEM, GIFT, PROTECTION_USED,
     # VOTE_ABSTAIN, UNKNOWN — informational, no domain event.
     return []
 
