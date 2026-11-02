@@ -75,11 +75,19 @@ def render_table(console: Console, msg: StatsMessage) -> None:
 
 def main(stream: TextIO | None = None) -> int:
     """Read IPC lines and render until shutdown or EOF."""
+    # sys.stdin.reconfigure(utf-8): parent шлёт UTF-8 bytes в pipe; без
+    # этого child читает их как cp1251 → кракозябры в player_name.
     stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
     stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
-    if stdout_reconfigure is not None and stderr_reconfigure is not None:
+    stdin_reconfigure = getattr(sys.stdin, "reconfigure", None)
+    if (
+        stdout_reconfigure is not None
+        and stderr_reconfigure is not None
+        and stdin_reconfigure is not None
+    ):
         stdout_reconfigure(encoding="utf-8", errors="replace")
         stderr_reconfigure(encoding="utf-8", errors="replace")
+        stdin_reconfigure(encoding="utf-8", errors="replace")
 
     # Windows: set console output/input code page to UTF-8 for THIS
     # process (not a subshell). A chcp command in a child cmd.exe
