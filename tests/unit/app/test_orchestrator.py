@@ -11,6 +11,7 @@ from typing import cast
 from unittest.mock import AsyncMock
 
 import pytest
+from loguru import logger
 
 from app.bootstrap import BootstrapResult, bootstrap
 from app.orchestrator import Orchestrator
@@ -388,6 +389,29 @@ async def test_orchestrator_send_stats_empty_predictions_clears_rows(tmp_path: P
     assert len(ui.stats) == 2
     assert ui.stats[-1].game_id == result.game_state.game_id
     assert ui.stats[-1].rows == []
+    await orchestrator.shutdown()
+
+
+async def test_send_stats_logs_debug_info(tmp_path: Path) -> None:
+    """_send_stats logs the UI state and prediction count before sending."""
+    result, _telegram, _llm = await make_result(tmp_path)
+
+    class FakeUI:
+        stats_running = True
+
+    ui = FakeUI()
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        window_host=ui,  # type: ignore[arg-type]
+    )
+    captured = io.StringIO()
+    sink_id = logger.add(captured, level="INFO", format="{message}")
+    try:
+        await orchestrator._send_stats()
+    finally:
+        logger.remove(sink_id)
+
+    assert "send_stats called: ui=True stats_running=True" in captured.getvalue()
     await orchestrator.shutdown()
 
 

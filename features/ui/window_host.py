@@ -53,6 +53,7 @@ class WindowHost:
             "stats": None,
             "reasoning": None,
         }
+        self._stderr_tasks: dict[str, asyncio.Task[None]] = {}
         self._last_warning_at: float | None = None
         self._shutdown = False
 
@@ -84,13 +85,59 @@ class WindowHost:
                 self._warn(f"cannot start {name} window: {error}")
                 continue
             self._processes[name] = proc
+            self._stderr_tasks[name] = asyncio.create_task(
+                self._drain_stderr(proc, f"{name}_window")
+            )
+
+    async def _drain_stderr(
+        self,
+        proc: asyncio.subprocess.Process,
+        name: str,
+    ) -> None:
+        """Read child stderr and log every line.
+
+        If the child crashes, its traceback appears in the logs instead of
+        being lost with an unread pipe.
+        """
+        if proc.stderr is None:
+            return
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    break
+                text = line.decode("utf-8", errors="replace").rstrip()
+                if text:
+                    logger.bind(channel=_LOGGER_CHANNEL).warning("{} stderr: {}", name, text)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # noqa: BLE001 — keep the drainer alive
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "{} stderr drain failed: {}",
+                name,
+                str(e),
+            )
 
     async def send_stats(self, msg: StatsMessage) -> None:
         """Send a stats frame, silently ignoring disabled or dead windows."""
+        proc = self._processes["stats"]
+        if proc is None or proc.returncode is not None:
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "stats_window is dead (returncode={}), skip send",
+                proc.returncode if proc is not None else None,
+            )
+            return
         await self._send("stats", IPCEnvelope(type="stats", payload=msg.model_dump()))
 
     async def send_reasoning(self, msg: ReasoningMessage) -> None:
         """Send one reasoning update, silently ignoring disabled or dead windows."""
+        proc = self._processes["reasoning"]
+        if proc is None or proc.returncode is not None:
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "reasoning_window is dead (returncode={}), skip send",
+                proc.returncode if proc is not None else None,
+            )
+            return
         await self._send(
             "reasoning",
             IPCEnvelope(type="reasoning", payload=msg.model_dump()),
@@ -111,6 +158,13 @@ class WindowHost:
         if self._shutdown:
             return
         self._shutdown = True
+        for name, task in self._stderr_tasks.items():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._stderr_tasks.clear()
         for name, proc in self._processes.items():
             if proc is None:
                 continue
