@@ -31,7 +31,7 @@ from typing import Any, cast
 import jinja2
 import pytest
 
-from domain.events import MessageEvent
+from domain.events import MessageEvent, PhaseChangeEvent, PhaseChangePayload
 from domain.game_state import GameState
 from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
@@ -353,7 +353,11 @@ async def test_e2e_scanner_full_cycle(
     # --- Persistence: the analyzer wrote predictions ----------------------
     assert llm_client.calls > 0
     predictions = predictions_repo.list_predictions(game_id)
-    assert len(predictions) == llm_client.calls
+    assert len(predictions) == 1
+    assert (
+        connection.execute("SELECT COUNT(*) FROM predictions_history").fetchone()[0]
+        == llm_client.calls
+    )
     assert {row["player_id"] for row in predictions} == {VASYA}
     assert {row["predicted_role"] for row in predictions} == {"Мафия"}
 
@@ -370,6 +374,15 @@ async def test_e2e_scanner_full_cycle(
 async def test_e2e_scanner_batch_debounce(registry: RoleRegistry) -> None:
     """2. In ``batch_debounce`` a quiet burst is analyzed exactly once."""
     game_state = GameState(game_id=1, registry=registry)
+    game_state.apply(
+        PhaseChangeEvent(
+            ts=TS,
+            game_id=1,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+            ),
+        )
+    )
     analyzer = CountingAnalyzer()
     telegram = FakeTelegramWrapper()
     scanner = MessageScanner(

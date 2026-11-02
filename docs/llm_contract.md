@@ -102,6 +102,13 @@ request transport, and streaming orchestration are implemented in later layers.
   no dedicated table. If a mechanism to retry an analysis later is needed, add a
   `status` column to `predictions` in step 12 or later.
 
+### predictions split
+
+`predictions` — текущее состояние (одна строка на game_id + player_id,
+upsert при каждом flush). Используется /status, Stats Window и retro.
+`predictions_history` — append-only (все flush), для будущего анализа
+эволюции предсказаний и fine-tune. История не получает retro-метки correct.
+
 ## Async DB
 
 SQLite через stdlib `sqlite3` с `check_same_thread=False`.
@@ -112,7 +119,7 @@ SQLite через stdlib `sqlite3` с `check_same_thread=False`.
 ```python
 # analyzer.py
 await asyncio.to_thread(
-    self._predictions_repo.insert_prediction,
+    self._predictions_repo.upsert_prediction,
     game_id=game_id, player_id=player_id, ...
 )
 ```

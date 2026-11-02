@@ -22,7 +22,14 @@ from typing import TYPE_CHECKING, Any, cast
 import pytest
 from loguru import logger
 
-from domain.events import AnyEvent, DeathEvent, MessageEvent, VoteEvent
+from domain.events import (
+    AnyEvent,
+    DeathEvent,
+    MessageEvent,
+    PhaseChangeEvent,
+    PhaseChangePayload,
+    VoteEvent,
+)
 from domain.exceptions import ConfigError
 from domain.game_state import GameState
 from domain.phases import Phase
@@ -189,6 +196,19 @@ def registry() -> RoleRegistry:
 def game_state(registry: RoleRegistry) -> GameState:
     """Provide an empty game state for a fresh game."""
     return GameState(game_id=GAME_ID, registry=registry)
+
+
+def start_game(game_state: GameState) -> None:
+    """Enter an active phase without triggering a scanner flush."""
+    game_state.apply(
+        PhaseChangeEvent(
+            ts=TS,
+            game_id=GAME_ID,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+            ),
+        )
+    )
 
 
 @pytest.fixture
@@ -487,6 +507,7 @@ async def test_message_debounce(
     registry: RoleRegistry,
 ) -> None:
     """10. In ``batch_debounce`` a message flushes only after the quiet period."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(
         game_state=game_state,
         registry=registry,
@@ -508,6 +529,7 @@ async def test_buffer_size_forces_flush(
     registry: RoleRegistry,
 ) -> None:
     """11. Reaching ``batch_max_messages`` flushes without waiting for the timer."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(
         game_state=game_state,
         registry=registry,
@@ -529,6 +551,7 @@ async def test_every_message_mode_flushes_every_time(
     registry: RoleRegistry,
 ) -> None:
     """12. ``every_message`` analyzes after each buffered event."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(
         game_state=game_state,
         registry=registry,
@@ -548,6 +571,7 @@ async def test_queue_mode_no_auto_flush(
     registry: RoleRegistry,
 ) -> None:
     """13. ``queue`` never auto-flushes until the buffer is full."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(
         game_state=game_state,
         registry=registry,
@@ -646,6 +670,7 @@ async def test_flush_in_progress_no_reentry(
     registry: RoleRegistry,
 ) -> None:
     """17. Overlapping flush triggers call the analyzer only once."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(game_state=game_state, registry=registry)
 
     await asyncio.gather(scanner._flush(), scanner._flush())
@@ -694,6 +719,7 @@ async def test_handler_never_raises(
     log_records: list[Record],
 ) -> None:
     """20. An analyzer crash escapes ``_flush`` but never the Telegram handler."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(
         game_state=game_state,
         registry=registry,
@@ -819,6 +845,7 @@ async def test_flush_failure_logs_warning(
     log_records: list[Record],
 ) -> None:
     """25. A failed analysis is a warning, not an exception."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(
         game_state=game_state,
         registry=registry,
@@ -837,6 +864,7 @@ async def test_messages_arriving_during_flush_are_rescheduled(
     registry: RoleRegistry,
 ) -> None:
     """26. Events buffered while the LLM thinks are re-debounced, never starved."""
+    start_game(game_state)
     scanner, analyzer, _telegram = build_scanner(
         game_state=game_state,
         registry=registry,
@@ -1001,8 +1029,10 @@ async def test_flush_forwards_successful_reasoning(registry: RoleRegistry) -> No
 
     analyzer = FakeAnalyzer()
     analyzer.next_reasoning_text = "Краткий разбор партии"
+    game_state = GameState(game_id=GAME_ID, registry=registry)
+    start_game(game_state)
     scanner, _fake_analyzer, _telegram = build_scanner(
-        game_state=GameState(game_id=GAME_ID, registry=registry),
+        game_state=game_state,
         registry=registry,
         analyzer=analyzer,
         on_reasoning=on_reasoning,
@@ -1021,6 +1051,7 @@ async def test_on_flush_complete_callback_invoked(
     callback_fails: bool,
 ) -> None:
     """A successful flush notifies completion once, after empty reasoning too."""
+    start_game(game_state)
     steps: list[str] = []
 
     async def on_reasoning(text: str) -> None:
@@ -1059,6 +1090,7 @@ async def test_on_flush_complete_not_called_on_error(
     registry: RoleRegistry,
 ) -> None:
     """Failed analysis emits neither reasoning nor a flush-completed notification."""
+    start_game(game_state)
     steps: list[str] = []
 
     async def on_reasoning(_text: str) -> None:
@@ -1093,8 +1125,10 @@ async def test_flush_ignores_failed_analysis_reasoning(registry: RoleRegistry) -
     analyzer = FakeAnalyzer()
     analyzer.next_success = False
     analyzer.next_reasoning_text = "не должно появиться"
+    game_state = GameState(game_id=GAME_ID, registry=registry)
+    start_game(game_state)
     scanner, _fake_analyzer, _telegram = build_scanner(
-        game_state=GameState(game_id=GAME_ID, registry=registry),
+        game_state=game_state,
         registry=registry,
         analyzer=analyzer,
         on_reasoning=on_reasoning,
@@ -1156,3 +1190,47 @@ async def test_bot_markdown_links_resolve_through_parser(game_state, registry):
     assert isinstance(vote, VoteEvent)
     assert vote.payload.target_id == PETYA
     assert not game_state.player(VASYA).alive
+
+
+async def test_flush_skips_registration_phase(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, analyzer, _ = build_scanner(game_state=game_state, registry=registry)
+    for player_id, name in ((VASYA, "Вася"), (PETYA, "Петя"), (LENA, "Лена")):
+        await scanner._on_event(player_event(player_id, name, "Игровое сообщение"))
+    assert scanner.buffer_size == 3
+    await scanner._flush()
+    assert analyzer.calls == 0
+    assert scanner.buffer_size == 0
+
+
+async def test_flush_skips_end_phase(game_state: GameState, registry: RoleRegistry) -> None:
+    scanner, analyzer, _ = build_scanner(game_state=game_state, registry=registry)
+    await scanner._on_event(player_event(VASYA, "Вася", "Игровое сообщение"))
+    await scanner._on_event(bot_event("🌙 Наступает ночь"))
+    # Transition via a domain event so the test does not depend on bot end wording.
+    game_state.apply(
+        PhaseChangeEvent(
+            ts=TS,
+            game_id=GAME_ID,
+            payload=PhaseChangePayload(from_phase=Phase.NIGHT, to_phase=Phase.END, day_number=0),
+        )
+    )
+    await scanner._on_event(player_event(PETYA, "Петя", "После игры"))
+    before = analyzer.calls
+    await scanner._flush()
+    assert analyzer.calls == before
+    assert scanner.buffer_size == 0
+
+
+async def test_flush_works_after_registration(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, analyzer, _ = build_scanner(game_state=game_state, registry=registry)
+    await scanner._on_event(player_event(VASYA, "Вася", "Регистрация"))
+    await scanner._flush()
+    assert analyzer.calls == 0
+    await scanner._on_event(bot_event("🌙 Наступает ночь"))
+    await scanner._flush()
+    assert analyzer.calls == 1
+    assert scanner.buffer_size == 0

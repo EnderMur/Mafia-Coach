@@ -14,7 +14,8 @@ import pytest
 
 from app.bootstrap import BootstrapResult, bootstrap
 from app.orchestrator import Orchestrator
-from domain.events import MessageEvent, MessagePayload
+from domain.events import MessageEvent, MessagePayload, PhaseChangeEvent, PhaseChangePayload
+from domain.phases import Phase
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
 from infra.llm.schemas import AnalysisResponse, PlayerPrediction
@@ -420,6 +421,15 @@ async def test_orchestrator_send_stats_on_flush_complete(
     assert scanner is not None
     assert scanner._on_flush_complete_callback is orchestrator._send_stats
     await scanner._register_player(PLAYER_ID, "Вася")
+    result.game_state.apply(
+        PhaseChangeEvent(
+            ts=EVENT_TS,
+            game_id=result.game_state.game_id,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+            ),
+        )
+    )
 
     await scanner._flush()
 
@@ -481,6 +491,15 @@ async def test_orchestrator_sends_reasoning_after_scanner_flush(tmp_path: Path) 
         window_host=ui,  # type: ignore[arg-type]
     )
     scanner = orchestrator._default_scanner(GAME_CHAT_ID)
+    result.game_state.apply(
+        PhaseChangeEvent(
+            ts=EVENT_TS,
+            game_id=result.game_state.game_id,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+            ),
+        )
+    )
 
     await scanner._flush()
 

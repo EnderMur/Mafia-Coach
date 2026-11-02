@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
+from typing import Any
 
 import pytest
 
@@ -68,5 +70,66 @@ def test_mark_prediction_incorrect_as_zero(conn: sqlite3.Connection) -> None:
 
 def test_mark_missing_prediction_raises_config_error(conn: sqlite3.Connection) -> None:
     """Updating a missing prediction reports a configuration error."""
-    with pytest.raises(ConfigError, match="prediction 404 not found"):
+    with pytest.raises(ConfigError, match=re.escape("prediction 404 not found")):
         PredictionsRepository(conn).mark_correct(prediction_id=404, correct=True)
+
+
+def test_upsert_prediction_inserts_new(conn: sqlite3.Connection) -> None:
+    game_id, repo = create_prediction_repository(conn)
+    row_id = repo.upsert_prediction(
+        game_id=game_id, player_id=100, predicted_role="mafia", confidence=0.8, reasoning="reason"
+    )
+    assert repo.list_predictions(game_id)[0]["id"] == row_id
+
+
+def test_upsert_prediction_updates_existing(conn: sqlite3.Connection) -> None:
+    game_id, repo = create_prediction_repository(conn)
+    args: dict[str, Any] = {
+        "game_id": game_id,
+        "player_id": 100,
+        "predicted_role": "town",
+        "confidence": 0.4,
+        "reasoning": "old",
+    }
+    first = repo.insert_prediction(**args)
+    args.update(predicted_role="mafia", confidence=0.9, reasoning="new")
+    assert repo.upsert_prediction(**args) == first
+    assert repo.insert_prediction(**args) == first
+    rows = repo.list_predictions(game_id)
+    assert len(rows) == 1
+    assert (rows[0]["predicted_role"], rows[0]["confidence"], rows[0]["reasoning"]) == (
+        "mafia",
+        0.9,
+        "new",
+    )
+
+
+def test_insert_history_appends(conn: sqlite3.Connection) -> None:
+    game_id, repo = create_prediction_repository(conn)
+    ids = [
+        repo.insert_history(
+            game_id=game_id,
+            player_id=100,
+            predicted_role="town",
+            confidence=0.4,
+            reasoning="reason",
+        )
+        for _ in range(3)
+    ]
+    assert len(set(ids)) == 3
+    assert conn.execute("SELECT COUNT(*) FROM predictions_history").fetchone()[0] == 3
+
+
+def test_upsert_preserves_correct(conn: sqlite3.Connection) -> None:
+    game_id, repo = create_prediction_repository(conn)
+    args: dict[str, Any] = {
+        "game_id": game_id,
+        "player_id": 100,
+        "predicted_role": "town",
+        "confidence": 0.4,
+        "reasoning": "reason",
+    }
+    row_id = repo.upsert_prediction(**args)
+    repo.mark_correct(prediction_id=row_id, correct=True)
+    repo.upsert_prediction(**args)
+    assert repo.list_predictions(game_id)[0]["correct"] == 1

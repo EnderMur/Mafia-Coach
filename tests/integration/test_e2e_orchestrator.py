@@ -13,7 +13,9 @@ import jinja2
 from app.bootstrap import BootstrapResult, Repositories
 from app.config import load_config
 from app.orchestrator import Orchestrator
+from domain.events import PhaseChangeEvent, PhaseChangePayload
 from domain.game_state import GameState
+from domain.phases import Phase
 from domain.roles import load_roles
 from features.analyzer.analyzer import GameAnalyzer
 from features.scanner.scanner import MessageScanner
@@ -166,6 +168,16 @@ async def test_e2e_headless_pipeline(tmp_path: Path) -> None:
         assert telegram.handler is not None
         assert telegram.handler_chat_id == CHAT_ID
 
+        # Registration messages are not analyzed; start the game before the burst.
+        game_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
         texts = (
             "Всем привет, предлагаю внимательно слушать друг друга",
             "Я думаю, что Вася слишком быстро обвиняет игроков",
@@ -191,7 +203,8 @@ async def test_e2e_headless_pipeline(tmp_path: Path) -> None:
         stored_predictions = repos.predictions.list_predictions(game_id)
         assert len(stored_events) == 5
         assert {event.kind for event in stored_events} == {"message"}
-        assert len(stored_predictions) == 5
+        assert len(stored_predictions) == 1
+        assert conn.execute("SELECT COUNT(*) FROM predictions_history").fetchone()[0] == 5
         assert llm_client.calls == 5
     finally:
         if run_task is not None and not run_task.done():
