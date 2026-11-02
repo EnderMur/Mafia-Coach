@@ -15,9 +15,19 @@ _HEADER = "Stats"
 _MAX_ROWS = 20
 
 
+def _safe_clear(console: Console) -> None:
+    """Clear the screen, falling back to blank lines when unsupported."""
+    try:
+        console.clear()
+    except Exception:  # noqa: BLE001
+        # Fallback: 25 пустых строк
+        for _ in range(25):
+            console.print("", highlight=False)
+
+
 def render_table(console: Console, msg: StatsMessage) -> None:
     """Render one stats frame."""
-    console.clear()
+    _safe_clear(console)
     table = Table(
         title=f"{_HEADER} — партия #{msg.game_id}, {msg.phase}, день {msg.day}",
         show_lines=False,
@@ -32,9 +42,26 @@ def render_table(console: Console, msg: StatsMessage) -> None:
 
 def main(stream: TextIO | None = None) -> int:
     """Read IPC lines and render until shutdown or EOF."""
+    stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+    stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if stdout_reconfigure is not None and stderr_reconfigure is not None:
+        stdout_reconfigure(encoding="utf-8", errors="replace")
+        stderr_reconfigure(encoding="utf-8", errors="replace")
+
+    # Windows cmd.exe (CREATE_NEW_CONSOLE): chcp 65001
+    if sys.platform == "win32":
+        import os
+
+        os.system("chcp 65001 > nul")
+
     if stream is None:
         stream = sys.stdin
-    console = Console()
+    console = Console(
+        force_terminal=True,
+        legacy_windows=True,
+        color_system="standard",
+        width=120,
+    )
     for raw in stream:
         line = raw.strip()
         if not line:

@@ -13,9 +13,21 @@ from features.ui.protocol import ReasoningMessage, decode
 
 def main(stream: TextIO | None = None) -> int:
     """Read IPC lines and render reasoning until shutdown or EOF."""
+    stdout_reconfigure = getattr(sys.stdout, "reconfigure", None)
+    stderr_reconfigure = getattr(sys.stderr, "reconfigure", None)
+    if stdout_reconfigure is not None and stderr_reconfigure is not None:
+        stdout_reconfigure(encoding="utf-8", errors="replace")
+        stderr_reconfigure(encoding="utf-8", errors="replace")
+
+    # Windows cmd.exe (CREATE_NEW_CONSOLE): chcp 65001
+    if sys.platform == "win32":
+        import os
+
+        os.system("chcp 65001 > nul")
+
     if stream is None:
         stream = sys.stdin
-    console = Console()
+    console = Console(force_terminal=True, legacy_windows=True)
     for raw in stream:
         line = raw.strip()
         if not line:
