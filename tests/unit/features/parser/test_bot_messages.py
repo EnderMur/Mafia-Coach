@@ -1007,3 +1007,68 @@ def test_regressions_and_multiline_vote(registry):
     )
     assert result is not None and result.kind is BotMessageKind.VOTE
     assert result.votes == [("Вася", "Петя"), ("Лена", "Игорь")]
+
+
+# ===================================================================
+# End game (final report) tests (4)
+# ===================================================================
+
+
+END_GAME_TEXT = """Игра окончена!
+
+Победители:
+    1. user_01 - 💣 Камикадзе
+    7. user_07 - 🤵🏼 Мафия
+
+Другие пользователи:
+    8. user_08 - 🔪 Маньяк
+    30. user_30 - 👮🏼 Сержант
+
+Игра длилась: 20 минут"""
+
+
+class TestEndGame:
+    def test_end_game_parses_winners_losers(self, registry: RoleRegistry) -> None:
+        """1. The real final report yields both sections with Russian role names."""
+        result = parse_bot_message(END_GAME_TEXT, registry=registry)
+
+        assert result is not None
+        assert result.kind is BotMessageKind.END_GAME
+        assert result.winners == [("user_01", "Камикадзе"), ("user_07", "Мафия")]
+        assert result.losers == [("user_08", "Маньяк"), ("user_30", "Сержант")]
+        # Roles stay as written by the bot — no role_id resolution in the parser.
+        assert result.role_id is None
+
+    def test_end_game_duration(self, registry: RoleRegistry) -> None:
+        """2. "Игра длилась: 20 минут" becomes ``duration_minutes``."""
+        result = parse_bot_message(END_GAME_TEXT, registry=registry)
+
+        assert result is not None
+        assert result.kind is BotMessageKind.END_GAME
+        assert result.duration_minutes == 20
+
+    def test_end_game_no_data(self, registry: RoleRegistry) -> None:
+        """3. A report without entries is still END_GAME, just without data."""
+        result = parse_bot_message("Игра окончена!\n\nНет победителей", registry=registry)
+
+        assert result is not None
+        assert result.kind is BotMessageKind.END_GAME
+        assert result.winners is None
+        assert result.losers is None
+        assert result.duration_minutes is None
+
+    def test_end_game_not_mistaken_for_alive_list(self, registry: RoleRegistry) -> None:
+        """4. A report that also contains an alive list stays END_GAME."""
+        text = (
+            "Игра окончена!\n\n"
+            "Победители:\n    1. user_01 - 💣 Камикадзе\n\n"
+            "Живые игроки:\n    1. user_01\n\n"
+            "Из них:\n    💣 Камикадзе: 1\n\n"
+            "Всего: 1"
+        )
+
+        result = parse_bot_message(text, registry=registry)
+
+        assert result is not None
+        assert result.kind is BotMessageKind.END_GAME
+        assert result.winners == [("user_01", "Камикадзе")]

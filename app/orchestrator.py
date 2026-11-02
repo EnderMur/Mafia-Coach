@@ -10,7 +10,7 @@ from typing import TextIO
 from loguru import logger
 
 from app.bootstrap import BootstrapResult, shutdown_result
-from domain.events import AnyEvent
+from domain.events import AnyEvent, EndGameEvent
 from domain.game_state import GameState
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
@@ -197,12 +197,99 @@ class Orchestrator:
                 )
 
     async def _persist_event(self, event: AnyEvent) -> None:
-        """Persist one applied scanner event without blocking the event loop."""
+        """Persist one applied scanner event without blocking the event loop.
+
+        The bot's final report is the trigger for the automatic retrospective:
+        once it is stored, :meth:`_run_retro` writes the ground truth into
+        ``game_players`` and labels the game's predictions.
+        """
         try:
             await asyncio.to_thread(self._result.repos.events.insert_event, event)
         except Exception as error:  # noqa: BLE001 — defensive callback boundary
             logger.bind(channel=_LOGGER_CHANNEL).error(
                 "persist event failed: {}: {}",
+                type(error).__name__,
+                str(error),
+            )
+            return
+        if isinstance(event, EndGameEvent):
+            try:
+                await self._run_retro()
+            except Exception as error:  # noqa: BLE001 — retro must not break scanning
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "auto-retro failed: {}: {}",
+                    type(error).__name__,
+                    str(error),
+                )
+
+    async def _run_retro(self) -> None:
+        """Persist the final standings and run the end-of-game retrospective.
+
+        Order is load-bearing: ``retro_analyze`` reads
+        ``game_players.final_role``, so the ground truth from the bot's final
+        report must be written first. Both steps are idempotent — running retro
+        twice only rewrites the same values.
+
+        Everything is best-effort: a failing player update is logged and the
+        remaining players are still persisted, and a failing ``retro_analyze``
+        ends the method without touching the stats window.
+        """
+        game_state = self._result.game_state
+        game_id = game_state.game_id
+        if game_id == 0:
+            return
+
+        for player in game_state.players():
+            if player.final_role is None:
+                continue
+            try:
+                await asyncio.to_thread(
+                    self._result.repos.game_players.set_final_role,
+                    game_id=game_id,
+                    player_id=player.player_id,
+                    final_role=player.final_role.name_ru,
+                    survived=player.alive,
+                    is_winner=player.is_winner,
+                )
+            except Exception as error:  # noqa: BLE001 — keep processing players
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "persist final_role failed for {}: {}: {}",
+                    player.player_id,
+                    type(error).__name__,
+                    str(error),
+                )
+
+        from features.memory.retro import retro_analyze
+
+        try:
+            report = await asyncio.to_thread(
+                retro_analyze,
+                game_id=game_id,
+                registry=self._result.registry,
+                predictions_repo=self._result.repos.predictions,
+                game_players_repo=self._result.repos.game_players,
+            )
+        except Exception as error:  # noqa: BLE001 — retro is best-effort
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "retro_analyze failed: {}: {}",
+                type(error).__name__,
+                str(error),
+            )
+            return
+        logger.bind(channel="retro").info(
+            "game {} retro: total={} correct={} wrong={} unknown={}",
+            game_id,
+            report.total_predictions,
+            report.correct,
+            report.wrong,
+            report.unknown,
+        )
+
+        try:
+            await self._send_stats()
+        except Exception as error:  # noqa: BLE001 — UI is best-effort
+            logger.bind(channel=_LOGGER_CHANNEL).debug(
+                "stats refresh after retro failed: {}: {}",
                 type(error).__name__,
                 str(error),
             )

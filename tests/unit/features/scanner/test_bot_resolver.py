@@ -20,6 +20,8 @@ from domain.events import (
     AliveListPayload,
     AnyEvent,
     DeathEvent,
+    EndGameEvent,
+    EndGamePayload,
     MessageEvent,
     PhaseChangeEvent,
     RoleRevealEvent,
@@ -771,3 +773,39 @@ def test_role_prefix_resolved_in_reveal_last_words_and_votes() -> None:
     assert second_vote.payload.voter_id == 102
     assert second_vote.payload.target_id is None
     assert second_vote.payload.target_name == "Призрак"
+
+
+# ===================================================================
+# Step 10c-fix-11: END_GAME (24-25)
+# ===================================================================
+
+
+def test_end_game_creates_event() -> None:
+    """24. A final report becomes one EndGameEvent carrying winners and losers."""
+    parse = _parse(
+        BotMessageKind.END_GAME,
+        winners=[("user_01", "Камикадзе"), ("user_07", "Мафия")],
+        losers=[("user_08", "Маньяк")],
+        duration_minutes=20,
+    )
+
+    events = _resolve(parse, name_to_id={})
+
+    assert len(events) == 1
+    event = events[0]
+    assert isinstance(event, EndGameEvent)
+    assert isinstance(event.payload, EndGamePayload)
+    assert event.kind == "end_game"
+    assert event.game_id == GAME_ID
+    assert event.ts == TS
+    assert event.payload.winners == [("user_01", "Камикадзе"), ("user_07", "Мафия")]
+    assert event.payload.losers == [("user_08", "Маньяк")]
+    assert event.payload.duration_minutes == 20
+
+
+def test_end_game_empty_skipped(log_records: list[Record]) -> None:
+    """25. A report without any players is dropped with a warning."""
+    parse = _parse(BotMessageKind.END_GAME, winners=[], losers=[])
+
+    assert _resolve(parse) == []
+    assert any("end_game without any players" in text for text in _messages(log_records))

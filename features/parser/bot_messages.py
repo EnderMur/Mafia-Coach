@@ -9,18 +9,20 @@ Bot templates overlap heavily, so the order of the branches in
 :func:`parse_bot_message` is load-bearing:
 
 1. empty / ``None``     — returns ``None`` (not ``UNKNOWN``).
-2. ``ALIVE_LIST``       — first: the list body contains role emoji.
-3. ``REGISTRATION``
-4. ``DEATH``            — BEFORE phase change (``"🌙 Кто-то был убит"``).
-5. ``PHASE_CHANGE``     — vote start / vote end only.
-6. ``VOTE``             — multi-line, collects ``votes``.
-7. ``PROTECTION_USED``  — ``"использовал защиту от линчевания"`` is NOT death.
-8. ``VOTE_ABSTAIN``
-9. ``ROLE_REVEAL``      — *grammatical* player reveals only.
-10. ``ROLE_ACTION``     — role "action notifications" (``"Дон выбрал жертву"``).
-11. ``PHASE_CHANGE``    — night / day transitions (short messages only).
-12. ``SYSTEM``
-13. ``UNKNOWN``         — fallback, kept for C3 statistics.
+2. ``END_GAME``         — first: final report may contain a "Живые игроки"-like
+   section (``"Другие пользователи:"``) and must win over ``ALIVE_LIST``.
+3. ``ALIVE_LIST``       — the list body contains role emoji.
+4. ``REGISTRATION``
+5. ``DEATH``            — BEFORE phase change (``"🌙 Кто-то был убит"``).
+6. ``PHASE_CHANGE``     — vote start / vote end only.
+7. ``VOTE``             — multi-line, collects ``votes``.
+8. ``PROTECTION_USED``  — ``"использовал защиту от линчевания"`` is NOT death.
+9. ``VOTE_ABSTAIN``
+10. ``ROLE_REVEAL``     — *grammatical* player reveals only.
+11. ``ROLE_ACTION``     — role "action notifications" (``"Дон выбрал жертву"``).
+12. ``PHASE_CHANGE``    — night / day transitions (short messages only).
+13. ``SYSTEM``
+14. ``UNKNOWN``         — fallback, kept for C3 statistics.
 """
 
 from __future__ import annotations
@@ -59,6 +61,8 @@ class BotMessageKind(str, Enum):
     VOTE_ABSTAIN = "vote_abstain"
     #: "Город ветров начинает игру", "Автоматический старт игры".
     SYSTEM = "system"
+    #: Final report: ``"Игра окончена!"`` + winners / losers / duration.
+    END_GAME = "end_game"
     UNKNOWN = "unknown"
 
 
@@ -105,6 +109,16 @@ class BotMessageParse(BaseModel):
     role_count: dict[str, int] | None = None
     #: Bot-reported "Всего: N" headcount of alive players.
     total_players: int | None = None
+
+    # end_game
+    #: ``[(player_name, role_name_ru), ...]`` — победители (достигли цели,
+    #: не обязательно выжили). ``role_name_ru`` — как пишет бот (``name_ru``),
+    #: резолв в ``role_id`` — дело ``GameState``.
+    winners: list[tuple[str, str]] | None = None
+    #: ``[(player_name, role_name_ru), ...]`` — остальные участники.
+    losers: list[tuple[str, str]] | None = None
+    #: ``"Игра длилась: N минут"``.
+    duration_minutes: int | None = None
 
     raw_text: str = ""
 
@@ -460,6 +474,26 @@ _RE_GAME_END: Final[re.Pattern[str]] = re.compile(
     r"|победа\s+(?:мафии|мирных|города|маньяка))",
 )
 
+# --- end game (final report) ----------------------------------------------
+
+#: The final report *starts* with this line; only there is it authoritative
+#: (a mid-game message mentioning "игра окончена" stays a phase change).
+_END_GAME_RE: Final[re.Pattern[str]] = re.compile(r"^\s*Игра\s+окончена!", re.MULTILINE)
+
+#: One report section: ``"Победители:"`` or ``"Другие пользователи:"`` with its
+#: indented ``"N. name - role"`` body, terminated by the next section header or
+#: by the duration line.
+_SECTION_RE: Final[re.Pattern[str]] = re.compile(
+    r"(Победители|Другие\s+пользователи):\s*\n(.*?)(?=\n\s*(?:Другие\s+пользователи|Игра\s+длилась)|\Z)",
+    re.DOTALL,
+)
+
+#: One ``"N. имя - 🎭 Роль"`` entry inside a report section.
+_ENTRY_RE: Final[re.Pattern[str]] = re.compile(r"^\s*\d+\.\s+(.+?)\s+-\s+(.+?)\s*$", re.MULTILINE)
+
+#: ``"Игра длилась: 20 минут"``.
+_DURATION_RE: Final[re.Pattern[str]] = re.compile(r"Игра\s+длилась:\s*(\d+)\s*минут")
+
 # --- votes ----------------------------------------------------------------
 
 _VOTE_VERB: Final[str] = r"(?:про)?голос(?:овал[аи]?|ует)(?:\(а\))?"
@@ -727,6 +761,62 @@ def _find_role_in_text(text: str, registry: RoleRegistry) -> Role | None:
 # ---------------------------------------------------------------------------
 # Individual parsers (one per kind)
 # ---------------------------------------------------------------------------
+
+
+def _parse_end_game(text: str) -> BotMessageParse | None:
+    """Parse the bot's final report.
+
+    Ground truth for the fine-tune dataset: ``is_winner``, ``final_role`` and
+    ``survived`` all come from this message, so it must never be confused with
+    an ``ALIVE_LIST`` (both wrap numbered ``"N. name"`` blocks).
+
+    Role names are kept exactly as the bot wrote them (``name_ru``) with the
+    leading emoji removed; resolving them to ``role_id`` belongs to
+    :meth:`domain.game_state.GameState.apply`. A report without any parseable
+    entry still yields ``kind=END_GAME`` but no data — the resolver then drops
+    it with a warning instead of silently inventing players.
+
+    Args:
+        text: message text as received (already stripped of outer whitespace).
+
+    Returns:
+        ``BotMessageParse`` for a final report, or ``None`` when this is not one.
+    """
+    if _END_GAME_RE.match(text) is None:
+        return None
+
+    winners: list[tuple[str, str]] = []
+    losers: list[tuple[str, str]] = []
+    for section_match in _SECTION_RE.finditer(text):
+        section_name = section_match.group(1)
+        block = section_match.group(2)
+        entries: list[tuple[str, str]] = []
+        for entry_match in _ENTRY_RE.finditer(block):
+            name = _strip_leading_emoji(entry_match.group(1).strip()).strip()
+            role_clean = _strip_leading_emoji(entry_match.group(2).strip()).strip()
+            if name and role_clean:
+                entries.append((name, role_clean))
+        if "Победители" in section_name:
+            winners.extend(entries)
+        else:
+            losers.extend(entries)
+
+    duration: int | None = None
+    duration_match = _DURATION_RE.search(text)
+    if duration_match is not None:
+        try:
+            duration = int(duration_match.group(1))
+        except (ValueError, OverflowError):  # pragma: no cover - regex is \d+
+            duration = None
+
+    return BotMessageParse(
+        kind=BotMessageKind.END_GAME,
+        confidence=1.0,
+        winners=winners or None,
+        losers=losers or None,
+        duration_minutes=duration,
+        raw_text=text,
+    )
 
 
 def _parse_registration(text: str) -> BotMessageParse | None:
@@ -1136,23 +1226,29 @@ def parse_bot_message(
     except (TypeError, ValueError, AttributeError, KeyError):  # defensive input guard
         return None
 
-    # 2. Last words: arbitrary multi-line payload; classify before other patterns.
+    # 2. Final report FIRST: it wraps its own numbered sections ("Другие
+    #    пользователи:") and would otherwise be mistaken for an alive list.
+    result = _parse_end_game(stripped)
+    if result is not None:
+        return result
+
+    # 3. Last words: arbitrary multi-line payload; classify before other patterns.
     result = _parse_last_words(stripped)
     if result is not None:
         return result
 
-    # 3. Alive list FIRST: "Живые игроки:" wraps a multi-line body that
+    # 4. Alive list: "Живые игроки:" wraps a multi-line body that
     #    contains role emoji (would otherwise look like role reveals).
     result = _parse_alive_list(stripped)
     if result is not None:
         return result
 
-    # 3. Registration
+    # 5. Registration
     result = _parse_registration(stripped)
     if result is not None:
         return result
 
-    # 4. Death — BEFORE phase change ("🌙 Кто-то был убит" is a death)
+    # 6. Death — BEFORE phase change ("🌙 Кто-то был убит" is a death)
     result = _parse_death(stripped)
     if result is not None:
         return result

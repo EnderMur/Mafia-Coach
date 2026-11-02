@@ -4,21 +4,38 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
+import jinja2
 import pytest
 
+from app.bootstrap import BootstrapResult, Repositories
+from app.config import load_config
+from app.orchestrator import Orchestrator
+from domain.events import EndGameEvent, PhaseChangeEvent, PhaseChangePayload
+from domain.game_state import GameState
+from domain.phases import Phase
 from domain.roles import RoleRegistry, load_roles
+from features.analyzer.analyzer import GameAnalyzer
 from features.memory.retro import retro_analyze
+from features.scanner.trigger_policy import TriggerMode, TriggerPolicy
 from infra.db.connection import connect
 from infra.db.migrations.runner import apply_migrations
+from infra.db.repositories.events import EventsRepository
 from infra.db.repositories.game_players import GamePlayersRepository
 from infra.db.repositories.games import GamesRepository
 from infra.db.repositories.players import PlayersRepository
 from infra.db.repositories.predictions import PredictionsRepository
+from infra.llm.schemas import AnalysisResponse, PlayerPrediction
+from tests.unit.app.conftest import FakeLLMClient, FakeTelegram, create_settings_file
 
-ROLES_PATH = Path(__file__).resolve().parents[2] / "configs" / "roles.yaml"
+ROOT = Path(__file__).resolve().parents[2]
+ROLES_PATH = ROOT / "configs" / "roles.yaml"
 CHAT_ID = -1001111111111
+BASE_TS = datetime(2026, 11, 1, 20, 0, tzinfo=UTC)
 
 
 @pytest.fixture(name="registry")
@@ -136,3 +153,180 @@ def test_e2e_retro_no_final_roles(conn: sqlite3.Connection, registry: RoleRegist
     assert report.wrong == 0
     assert report.by_role == {}
     assert stored_correct(conn, game_id) == [None, None]
+
+
+# ---------------------------------------------------------------------------
+# Step 10c-fix-11: END_GAME → auto-retro through the orchestrator
+# ---------------------------------------------------------------------------
+
+PLAYER_A = 301
+PLAYER_B = 302
+CHAT_ID_E2E = -1007654321
+BOT_ID = 42
+
+END_GAME_TEXT = """Игра окончена!
+
+Победители:
+    1. Вася - 🤵🏼 Мафия
+
+Другие пользователи:
+    2. Петя - 👨🏼 Мирный Житель
+
+Игра длилась: 20 минут"""
+
+
+class FakeMessage:
+    """Telegram message subset consumed by MessageScanner."""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+
+class FakeSender:
+    """Telegram sender subset consumed by MessageScanner."""
+
+    def __init__(self, first_name: str) -> None:
+        self.first_name = first_name
+        self.last_name: str | None = None
+
+
+def telegram_event(sender_id: int, name: str, text: str, index: int) -> Any:
+    """Build one Telethon-shaped message event for the scanner."""
+    return SimpleNamespace(
+        sender_id=sender_id,
+        sender=FakeSender(name),
+        message=FakeMessage(text),
+        date=BASE_TS + timedelta(seconds=index),
+    )
+
+
+async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
+    """13. The bot's final report labels predictions and stores the ground truth."""
+    config = load_config(
+        create_settings_file(
+            tmp_path,
+            chat_id=CHAT_ID_E2E,
+            trigger_mode="every_message",
+            db_path=":memory:",
+        )
+    )
+    conn = connect(":memory:")
+    apply_migrations(conn)
+    repos = Repositories(
+        games=GamesRepository(conn),
+        players=PlayersRepository(conn),
+        events=EventsRepository(conn),
+        predictions=PredictionsRepository(conn),
+        game_players=GamePlayersRepository(conn),
+    )
+    game_id = repos.games.create_game(chat_id=CHAT_ID_E2E, player_count=2)
+
+    registry = load_roles(config.roles_file)
+    game_state = GameState(game_id=game_id, registry=registry)
+    response = AnalysisResponse(
+        analysis=[
+            PlayerPrediction(
+                player_id=PLAYER_A,
+                player_name="Вася",
+                suspected_role="Мафия",
+                confidence=0.8,
+                reasons=["путается в показаниях"],
+            ),
+            PlayerPrediction(
+                player_id=PLAYER_B,
+                player_name="Петя",
+                suspected_role="Мирный житель",
+                confidence=0.6,
+                reasons=["спокойно отвечает"],
+            ),
+        ],
+        game_read="Вася — мафия.",
+        reasoning="Вася давит на Петю без аргументов.",
+    )
+    llm_client = FakeLLMClient(response)
+    jinja_env = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(str(ROOT / "infra" / "llm" / "prompts")),
+        autoescape=False,
+    )
+    analyzer = GameAnalyzer(
+        llm_client=llm_client,
+        predictions_repo=repos.predictions,
+        registry=registry,
+        jinja_env=jinja_env,
+        max_messages=config.llm.context_window_messages,
+        reasoning_max_chars=config.llm.reasoning_max_chars,
+    )
+    bootstrap_result = BootstrapResult(
+        config=config,
+        conn=conn,
+        repos=repos,
+        registry=registry,
+        llm_client=llm_client,
+        telegram=FakeTelegram(),  # type: ignore[arg-type]
+        game_state=game_state,
+        analyzer=analyzer,
+        trigger_policy=TriggerPolicy(mode=TriggerMode.EVERY_MESSAGE),
+        jinja_env=jinja_env,
+        owns_telegram=False,
+        owns_llm=False,
+    )
+    orchestrator = Orchestrator(
+        bootstrap_result=bootstrap_result,
+        enable_ui=False,
+    )
+    scanner = orchestrator._default_scanner(CHAT_ID_E2E)
+    await scanner.start()
+    try:
+        game_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
+        for index, (player_id, name) in enumerate(((PLAYER_A, "Вася"), (PLAYER_B, "Петя"))):
+            await scanner._on_event(
+                telegram_event(
+                    player_id,
+                    name,
+                    "Я думаю, что кто-то из нас двоих ведёт себя подозрительно",
+                    index,
+                )
+            )
+
+        stored_before = repos.predictions.list_predictions(game_id)
+        assert len(stored_before) == 2
+        assert {row["correct"] for row in stored_before} == {None}
+
+        for player_id in (PLAYER_A, PLAYER_B):
+            repos.game_players.add_player(game_id=game_id, player_id=player_id)
+
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", END_GAME_TEXT, 10))
+    finally:
+        await scanner.shutdown()
+
+    # --- Ground truth -----------------------------------------------------
+    assert game_state.current_phase() is Phase.END
+    winner = repos.game_players.get_player_in_game(game_id=game_id, player_id=PLAYER_A)
+    loser = repos.game_players.get_player_in_game(game_id=game_id, player_id=PLAYER_B)
+    assert winner is not None and loser is not None
+    assert winner["final_role"] == "Мафия"
+    assert winner["is_winner"] == 1
+    assert loser["final_role"] == "Мирный житель"
+    assert loser["is_winner"] == 0
+
+    # --- Auto-retro labelled the predictions ------------------------------
+    stored_after = repos.predictions.list_predictions(game_id)
+    labels = {row["player_id"]: row["correct"] for row in stored_after}
+    assert labels == {PLAYER_A: 1, PLAYER_B: 1}
+
+    # --- The final report itself is persisted and round-trips -------------
+    stored_events = repos.events.list_events(game_id)
+    end_game_events = [event for event in stored_events if event.kind == "end_game"]
+    assert len(end_game_events) == 1
+    assert isinstance(end_game_events[0], EndGameEvent)
+    assert end_game_events[0].payload.winners == [("Вася", "Мафия")]
+    assert end_game_events[0].payload.losers == [("Петя", "Мирный Житель")]
+    assert end_game_events[0].payload.duration_minutes == 20

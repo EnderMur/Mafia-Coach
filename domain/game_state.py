@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from domain.events import (
     AliveListEvent,
     AnyEvent,
     DeathEvent,
+    EndGameEvent,
     MessageEvent,
     PhaseChangeEvent,
     RoleRevealEvent,
@@ -29,6 +31,11 @@ class Player(BaseModel):
     alive: bool = True
     known_role: Role | None = None
     revealed: bool = False
+    #: Final role from the bot's end-of-game report (B2-3: takes precedence
+    #: over ``known_role`` from a mid-game ``ROLE_REVEAL``).
+    final_role: Role | None = None
+    #: ``True`` for winners, ``False`` for losers, ``None`` while unknown.
+    is_winner: bool | None = None
 
 
 class GameState:
@@ -68,6 +75,8 @@ class GameState:
                 alive=existing.alive,
                 known_role=existing.known_role,
                 revealed=existing.revealed,
+                final_role=existing.final_role,
+                is_winner=existing.is_winner,
             )
         self._players[player_id] = player
         return player
@@ -118,6 +127,8 @@ class GameState:
             self._total_players = event.payload.total_players
         elif isinstance(event, (MessageEvent, VoteEvent)):
             pass
+        elif isinstance(event, EndGameEvent):
+            self._apply_end_game(event)
         else:
             raise ConfigError(f"unsupported event type: {type(event).__name__}")
 
@@ -138,6 +149,74 @@ class GameState:
                 ):
                     self._day_number += 1
         self._events.append(event)
+
+    def _apply_end_game(self, event: EndGameEvent) -> None:
+        """Write ``final_role`` / ``is_winner`` from the bot's final report.
+
+        B2-3: the final report is ground truth and takes precedence over a
+        ``ROLE_REVEAL`` seen earlier in the game. A mismatch means the bot or
+        the parser is wrong, so it is reported as a WARNING instead of being
+        silently overwritten.
+
+        Names are ``display_name`` strings; players the bot mentions but that
+        were never registered are ignored, and roles that do not resolve to a
+        configured ``Role`` leave ``final_role`` untouched (the winner flag is
+        still recorded — it does not depend on the role).
+
+        The phase always moves to :attr:`~domain.phases.Phase.END`.
+        """
+        winners_map = dict(event.payload.winners)
+        losers_map = dict(event.payload.losers)
+
+        for player_id, player in self._players.items():
+            winner_role = winners_map.get(player.display_name)
+            loser_role = losers_map.get(player.display_name)
+            if winner_role is None and loser_role is None:
+                continue
+
+            final_role_ru = winner_role if winner_role is not None else loser_role
+            if final_role_ru is None:  # pragma: no cover - narrowed above
+                continue
+            is_winner = winner_role is not None
+
+            final_role = self._resolve_final_role(final_role_ru)
+            if player.known_role is not None:
+                mismatch = (
+                    player.known_role.id != final_role.id
+                    if final_role is not None
+                    else player.known_role.name_ru != final_role_ru
+                )
+                if mismatch:
+                    logger.bind(channel="game_state").warning(
+                        "final_role mismatch for {}: known={} final={}",
+                        player.display_name,
+                        player.known_role.name_ru,
+                        final_role_ru,
+                    )
+
+            update: dict[str, object] = {"is_winner": is_winner, "revealed": True}
+            if final_role is not None:
+                update["final_role"] = final_role
+            self._players[player_id] = player.model_copy(update=update)
+
+        self._phase = Phase.END
+
+    def _resolve_final_role(self, role_name_ru: str) -> Role | None:
+        """Resolve the bot's role name (``name_ru``) to a registered role.
+
+        The bot capitalises names inconsistently (``"Мирный Житель"`` vs
+        ``"Мирный житель"``), so matching is case-insensitive; surrounding
+        quotes and trailing punctuation are tolerated as well.
+        """
+        candidate = role_name_ru.strip().strip("«»\"'()")
+        role = self._registry.resolve_alias(candidate)
+        if role is not None:
+            return role
+        collapsed = " ".join(candidate.split())
+        role = self._registry.resolve_alias(collapsed)
+        if role is None:
+            logger.bind(channel="game_state").warning("unknown final role name: {!r}", role_name_ru)
+        return role
 
     def player(self, player_id: int) -> Player:
         """Return a registered player or raise a configuration error."""

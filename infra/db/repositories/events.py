@@ -11,6 +11,8 @@ from domain.events import (
     AliveListPayload,
     AnyEvent,
     DeathEvent,
+    EndGameEvent,
+    EndGamePayload,
     MessageEvent,
     PhaseChangeEvent,
     RoleRevealEvent,
@@ -45,8 +47,8 @@ class EventsRepository:
         elif isinstance(event, PhaseChangeEvent):
             phase = event.payload.to_phase.value
             day_number = event.payload.day_number
-        elif isinstance(event, AliveListEvent):
-            # alive_list carries no actor/target/phase/day metadata —
+        elif isinstance(event, (AliveListEvent, EndGameEvent)):
+            # alive_list / end_game carry no actor/target/phase/day metadata —
             # actor_id, target_id, phase, day_number stay NULL.
             pass
 
@@ -98,6 +100,15 @@ class EventsRepository:
                         "ts": row["ts"],
                         "game_id": row["game_id"],
                         "payload": payload,
+                    }
+                )
+            elif kind == "end_game":
+                end_game_payload = EndGamePayload.model_validate_json(row["payload_json"])
+                event = EndGameEvent.model_validate(
+                    {
+                        "ts": row["ts"],
+                        "game_id": row["game_id"],
+                        "payload": end_game_payload,
                     }
                 )
             else:
