@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import sys
 from typing import TextIO
 
@@ -13,6 +14,37 @@ from features.ui.protocol import IPCEnvelope, StatsMessage, decode
 
 _HEADER = "Stats"
 _MAX_ROWS = 20
+_WINDOW_NAME = "stats_window"
+
+
+def _reopen_windows_console() -> None:
+    """Reopen std streams on the console created by CREATE_NEW_CONSOLE.
+
+    The parent launches this child with ``stdout=DEVNULL``, so ``sys.stdout``
+    points at NUL. ``CONOUT$`` is the active console — the freshly created
+    window — and reopening it lets ``rich.Console`` draw there.
+    """
+    try:
+        sys.stdout = open(  # noqa: SIM115 — lifetime = process
+            "CONOUT$",
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+        sys.stderr = open(  # noqa: SIM115 — lifetime = process
+            "CONOUT$",
+            "w",
+            encoding="utf-8",
+            buffering=1,
+        )
+    except OSError:
+        pass  # fallback: остаёмся на DEVNULL
+
+
+def _log_startup() -> None:
+    """Announce the child pid so the parent log proves the process is alive."""
+    sys.stderr.write(f"[{_WINDOW_NAME}] starting pid={os.getpid()}\n")
+    sys.stderr.flush()
 
 
 def _safe_clear(console: Console) -> None:
@@ -50,9 +82,12 @@ def main(stream: TextIO | None = None) -> int:
 
     # Windows cmd.exe (CREATE_NEW_CONSOLE): chcp 65001
     if sys.platform == "win32":
-        import os
-
         os.system("chcp 65001 > nul")
+        _reopen_windows_console()
+
+    # Startup debug: подтверждение, что child жив и открыл консоль
+    _log_startup()
+    sys.stdout.flush()  # новый консольный поток — сброс до первого кадра
 
     if stream is None:
         stream = sys.stdin
@@ -78,6 +113,7 @@ def main(stream: TextIO | None = None) -> int:
             except ValidationError:
                 continue
             render_table(console, msg)
+            sys.stdout.flush()  # не буферизуем в pipe
     return 0
 
 

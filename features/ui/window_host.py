@@ -77,6 +77,9 @@ class WindowHost:
                 proc = await asyncio.create_subprocess_exec(
                     *command,
                     stdin=asyncio.subprocess.PIPE,
+                    # stdout=DEVNULL: ребёнок не пишет в родительский PowerShell.
+                    # На Windows child переоткрывает CONOUT$ (см. stats_window.py /
+                    # reasoning_window.py), чтобы рисовать в свою новую консоль.
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.PIPE,
                     creationflags=(_WINDOWS_CREATE_NEW_CONSOLE if self._create_new_console else 0),
@@ -107,8 +110,12 @@ class WindowHost:
                 if not line:
                     break
                 text = line.decode("utf-8", errors="replace").rstrip()
-                if text:
-                    logger.bind(channel=_LOGGER_CHANNEL).warning("{} stderr: {}", name, text)
+                if not text:
+                    continue
+                if "Traceback" in text or "Error" in text:
+                    logger.bind(channel=_LOGGER_CHANNEL).error("{} stderr: {}", name, text)
+                else:
+                    logger.bind(channel=_LOGGER_CHANNEL).info("{} stderr: {}", name, text)
         except asyncio.CancelledError:
             pass
         except Exception as e:  # noqa: BLE001 — keep the drainer alive
