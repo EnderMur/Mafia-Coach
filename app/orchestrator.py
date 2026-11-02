@@ -67,7 +67,7 @@ class Orchestrator:
         self._player_persistence_lock = asyncio.Lock()
 
     def _default_scanner(self, chat_id: int) -> MessageScanner:
-        """Build the production scanner with event persistence wired in."""
+        """Build the production scanner with persistence and UI callbacks wired in."""
         bot_id = self._result.config.telegram.bot_id
         if bot_id is None:
             bot_id = self._result.telegram.bot_id
@@ -82,6 +82,7 @@ class Orchestrator:
             on_player_registered=self._persist_player,
             on_event=self._persist_event,
             on_reasoning=self._send_reasoning,
+            on_flush_complete=self._send_stats,
         )
 
     async def run(self) -> None:
@@ -205,11 +206,9 @@ class Orchestrator:
                 type(error).__name__,
                 str(error),
             )
-            return
-        await self._send_stats()
 
     async def _send_stats(self) -> None:
-        """Build and send the strongest current predictions to the stats window."""
+        """Send persisted predictions after a flush, or empty rows to clear stale stats."""
         if self._ui is None:
             return
         game_state = self._result.game_state
@@ -220,53 +219,48 @@ class Orchestrator:
                 self._result.repos.predictions.list_predictions,
                 game_state.game_id,
             )
+            min_confidence = self._result.config.analysis.min_confidence_to_display
+            sorted_predictions = sorted(
+                predictions,
+                key=lambda row: float(row["confidence"]),
+                reverse=True,
+            )[:20]
+            players = game_state.players()
+            rows: list[StatsRow] = []
+            for prediction in sorted_predictions:
+                confidence = float(prediction["confidence"])
+                if confidence < min_confidence:
+                    continue
+                player = next(
+                    (item for item in players if item.player_id == prediction["player_id"]),
+                    None,
+                )
+                if player is None:
+                    continue
+                rows.append(
+                    StatsRow(
+                        player_name=player.display_name,
+                        role=str(prediction["predicted_role"]),
+                        confidence=confidence,
+                    )
+                )
+            # Empty predictions still send a frame so the UI clears stale rows.
+            message = StatsMessage(
+                game_id=game_state.game_id,
+                phase=game_state.current_phase().value,
+                day=game_state.current_day(),
+                rows=rows,
+            )
+            await self._ui.send_stats(message)
         except Exception:  # noqa: BLE001 — UI is best-effort
             logger.bind(channel=_LOGGER_CHANNEL).opt(exception=True).error("send_stats failed")
-            predictions = []
-
-        min_confidence = self._result.config.analysis.min_confidence_to_display
-        sorted_predictions = sorted(
-            predictions,
-            key=lambda row: float(row["confidence"]),
-            reverse=True,
-        )[:20]
-        players = game_state.players()
-        rows: list[StatsRow] = []
-        for prediction in sorted_predictions:
-            confidence = float(prediction["confidence"])
-            if confidence < min_confidence:
-                continue
-            player = next(
-                (item for item in players if item.player_id == prediction["player_id"]),
-                None,
-            )
-            if player is None:
-                continue
-            rows.append(
-                StatsRow(
-                    player_name=player.display_name,
-                    role=str(prediction["predicted_role"]),
-                    confidence=confidence,
-                )
-            )
-        message = StatsMessage(
-            game_id=game_state.game_id,
-            phase=game_state.current_phase().value,
-            day=game_state.current_day(),
-            rows=rows,
-        )
-        try:
-            await self._ui.send_stats(message)
-        except Exception as error:  # noqa: BLE001 — UI is best-effort
-            logger.bind(channel=_LOGGER_CHANNEL).error(
-                "send_stats failed: {}",
-                str(error),
-            )
 
     async def _send_reasoning(self, text: str) -> None:
         """Send one reasoning result, clipping the IPC frame defensively."""
-        if self._ui is None or not text:
+        if self._ui is None:
             return
+        if not text:
+            text = "(streaming reasoning unavailable — non-thinking model)"
         truncated = len(text) > 4096
         message = ReasoningMessage(
             text=text[:4096],

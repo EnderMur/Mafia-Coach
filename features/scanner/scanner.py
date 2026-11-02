@@ -139,6 +139,7 @@ class MessageScanner:
         on_event: Callable[[AnyEvent], Awaitable[None]] | None = None,
         on_reasoning: Callable[[str], Awaitable[None]] | None = None,
         on_player_registered: Callable[[int, str], Awaitable[None]] | None = None,
+        on_flush_complete: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Retain dependencies and initialize the empty scan state.
 
@@ -151,11 +152,14 @@ class MessageScanner:
             chat_id: chat observed by this scanner.
             bot_id: Telegram id of the game bot.
             on_event: Optional async callback for each successfully applied event.
-            on_reasoning: Optional async callback for successful analysis reasoning.
+            on_reasoning: Optional async callback for successful analysis reasoning,
+                including empty text when the model supplies no streaming reasoning.
             on_player_registered: Optional async callback invoked once per player
                 the first time it is introduced to ``GameState``. The
                 orchestrator uses it to persist the player in SQLite, so later
                 prediction rows satisfy the ``players(id)`` foreign key.
+            on_flush_complete: Optional async callback after successful analysis
+                persistence and reasoning delivery, used to refresh UI stats.
         """
         self._telegram = telegram
         self._game_state = game_state
@@ -169,6 +173,7 @@ class MessageScanner:
         self._event_callback = on_event
         self._on_reasoning_callback = on_reasoning
         self._on_player_registered = on_player_registered
+        self._on_flush_complete_callback = on_flush_complete
 
         self._name_to_id: dict[str, int] = {}
         self._registered_ids: set[int] = set()
@@ -505,6 +510,10 @@ class MessageScanner:
         request. Events applied during the analysis are kept in the buffer and
         a new debounce timer is scheduled for ``batch_debounce`` mode so they
         are never starved.
+
+        Successful analysis notifies reasoning first, then flush completion, so
+        stats are refreshed only after the analyzer has persisted predictions.
+        Callback failures are logged without interrupting the scanner.
         """
         if self._flushing:
             return
@@ -514,7 +523,7 @@ class MessageScanner:
             self._buffer.clear()
             result = await self._analyzer.analyze(self._game_state, persist=True)
             response = result.response
-            if result.success and result.reasoning_text and self._on_reasoning_callback is not None:
+            if result.success and self._on_reasoning_callback is not None:
                 try:
                     await self._on_reasoning_callback(result.reasoning_text)
                 except Exception as error:  # noqa: BLE001 — UI must not break scanning
@@ -522,6 +531,15 @@ class MessageScanner:
                         "on_reasoning callback failed: {}: {}",
                         type(error).__name__,
                         str(error),
+                    )
+            if result.success and self._on_flush_complete_callback is not None:
+                try:
+                    await self._on_flush_complete_callback()
+                except Exception as e:  # noqa: BLE001
+                    logger.bind(channel=_LOGGER_CHANNEL).error(
+                        "on_flush_complete callback failed: {}: {}",
+                        type(e).__name__,
+                        str(e),
                     )
             if not result.success or response is None:
                 logger.bind(channel=_LOGGER_CHANNEL).warning(
