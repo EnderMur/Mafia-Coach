@@ -809,3 +809,16 @@ def test_end_game_empty_skipped(log_records: list[Record]) -> None:
 
     assert _resolve(parse) == []
     assert any("end_game without any players" in text for text in _messages(log_records))
+
+
+def test_strip_role_prefix_strips_parens() -> None:
+    assert _strip_role_prefix("Мирный Житель ^‿^", REGISTRY) == "^‿^"
+    assert _strip_role_prefix("( ^‿^ )", REGISTRY) == "^‿^"
+    assert _strip_role_prefix("Мирный Житель ( ^‿^ )", REGISTRY) == "^‿^"
+    assert _strip_role_prefix("Мирный Житель ( ^‿^", REGISTRY) == "^‿^"
+    assert _strip_role_prefix("Мирный Житель ^‿^ )", REGISTRY) == "^‿^"
+
+
+def test_strip_role_prefix_plain_name_unchanged() -> None:
+    assert _strip_role_prefix("Вася", REGISTRY) == "Вася"
+    assert _strip_role_prefix("Вася Петров", REGISTRY) == "Вася Петров"

@@ -53,7 +53,7 @@ from domain.roles import RoleRegistry
 from features.analyzer.analyzer import GameAnalyzer
 from features.parser.bot_messages import parse_bot_message
 from features.parser.classifier import MessageKind, classify_message
-from features.scanner.bot_resolver import _strip_markdown, resolve_bot_message
+from features.scanner.bot_resolver import _strip_markdown, _strip_role_prefix, resolve_bot_message
 from features.scanner.trigger_policy import TriggerPolicy
 from infra.telegram.client import TelegramClientWrapper
 
@@ -242,10 +242,10 @@ class MessageScanner:
 
         Finds the ``GAME_START`` marker (``"Город ветров начинает свою игру над
         жителями!"``) in the loaded window. Messages before the marker belong to
-        finished games and are ignored; messages from the marker onward are
-        applied chronologically via :meth:`_process_event`. Phase events may
-        trigger immediate flushes according to :class:`TriggerPolicy`, and any
-        remaining buffered events at the end of history are flushed once.
+        finished games and are ignored; messages after the marker are applied
+        chronologically via :meth:`_process_event`. Intermediate
+        flushes are suppressed, with one flush after the replay when a flush
+        completion callback is configured.
 
         If ``GAME_START`` is not found in the loaded window, logs a warning,
         applies nothing, and returns ``0``. On :class:`TelegramFloodWaitError`,
@@ -257,8 +257,8 @@ class MessageScanner:
             max_messages: Default window size when ``limit`` is not given.
 
         Returns:
-            Number of messages replayed starting from ``GAME_START``, or ``0``
-            when the marker was not found.
+            Number of messages replayed after ``GAME_START``, or ``0`` when
+            the marker was not found.
         """
         fetch_limit = limit if limit is not None else max_messages
         logger.bind(channel=_LOGGER_CHANNEL).info(
@@ -312,28 +312,42 @@ class MessageScanner:
                 getattr(messages[-1], "date", None),
             )
             return 0
+        messages_after = messages[start_idx + 1 :]
         logger.bind(channel=_LOGGER_CHANNEL).info(
             "backfill: GAME_START at index {}/{}, will apply {}",
             start_idx,
             len(messages),
-            len(messages) - start_idx,
+            len(messages_after),
         )
 
-        messages_after = messages[start_idx:]
-        for msg in messages_after:
-            msg_text = getattr(msg, "text", None)
-            fake_event = SimpleNamespace(
-                sender_id=getattr(msg, "sender_id", None),
-                sender=getattr(msg, "sender", None),
-                message=SimpleNamespace(text=msg_text if isinstance(msg_text, str) else None),
-                date=getattr(msg, "date", None),
-            )
-            await self._process_event(fake_event)
+        # Suppress intermediate analyzer calls while reconstructing full context.
+        old_flushing = self._flushing
+        self._flushing = True
+        applied = 0
+        try:
+            for msg in messages_after:
+                msg_text = getattr(msg, "text", None)
+                fake_event = SimpleNamespace(
+                    sender_id=getattr(msg, "sender_id", None),
+                    sender=getattr(msg, "sender", None),
+                    message=SimpleNamespace(text=msg_text if isinstance(msg_text, str) else None),
+                    date=getattr(msg, "date", None),
+                )
+                await self._process_event(fake_event)
+                applied += 1
+        finally:
+            self._flushing = old_flushing
 
-        if self._buffer:
+        logger.bind(channel=_LOGGER_CHANNEL).info(
+            "backfill: applied {} messages, buffer={}, running single flush at end",
+            applied,
+            len(self._buffer),
+        )
+        if self._buffer and self._on_flush_complete_callback is not None:
             await self._flush()
+            logger.bind(channel=_LOGGER_CHANNEL).info("backfill: final flush done")
 
-        return len(messages_after)
+        return applied
 
     # ------------------------------------------------------------------
     # Telegram handler
@@ -503,9 +517,14 @@ class MessageScanner:
             display_name: nickname the bot writes in game.
         """
         async with self._registration_lock:
-            if player_id in self._registered_ids:
-                return
             if not display_name.strip():
+                return
+            # Preserve the first observed owner of each spelling, including aliases.
+            self._name_to_id.setdefault(display_name, player_id)
+            canonical = _strip_role_prefix(display_name, self._registry)
+            if canonical and canonical != display_name:
+                self._name_to_id.setdefault(canonical, player_id)
+            if player_id in self._registered_ids:
                 return
             self._game_state.register_player(player_id, display_name)
             self._registered_ids.add(player_id)
