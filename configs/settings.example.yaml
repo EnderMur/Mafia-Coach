@@ -15,14 +15,14 @@ llm:
   model: "qwen/qwen3.5-9b"                    # ОБЯЗАТЕЛЬНО: идентификатор из LM Studio
   temperature: 0.3
   top_p: 0.9
-  max_tokens: 1024
+  max_tokens: 4096
   request_timeout_sec: 120                    # первая генерация на CPU бывает долгой
   connect_timeout_sec: 5
   max_retries: 3                              # не больше 3 (см. §8.4)
   retry_backoff_sec: 2
   stream_reasoning: true
   reasoning_max_chars: 1024
-  context_window_messages: 100                # сколько последних сообщений в промпте
+  context_window_messages: 200                # сколько последних сообщений в промпте
   summarize_after_messages: 300               # после этого старая часть суммаризуется
   trigger_mode: "queue"              # Режимы: every_message | queue | batch_debounce
   batch_debounce_sec: 3                       # задержка накопления пачки сообщений для batch_debounce

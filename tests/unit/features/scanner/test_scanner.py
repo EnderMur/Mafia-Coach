@@ -213,6 +213,7 @@ def build_scanner(
     telegram: FakeTelegramWrapper | None = None,
     on_event: Callable[[AnyEvent], Awaitable[None]] | None = None,
     on_reasoning: Callable[[str], Awaitable[None]] | None = None,
+    on_flush_complete: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[MessageScanner, FakeAnalyzer, FakeTelegramWrapper]:
     """Assemble a scanner with fakes and the requested trigger policy."""
     fake_analyzer = analyzer if analyzer is not None else FakeAnalyzer()
@@ -231,6 +232,7 @@ def build_scanner(
         bot_id=BOT_ID,
         on_event=on_event,
         on_reasoning=on_reasoning,
+        on_flush_complete=on_flush_complete,
     )
     return scanner, fake_analyzer, fake_telegram
 
@@ -1009,6 +1011,76 @@ async def test_flush_forwards_successful_reasoning(registry: RoleRegistry) -> No
     await scanner._flush()
 
     assert received == ["Краткий разбор партии"]
+
+
+@pytest.mark.parametrize("callback_fails", [False, True])
+async def test_on_flush_complete_callback_invoked(
+    game_state: GameState,
+    registry: RoleRegistry,
+    log_records: list[Record],
+    callback_fails: bool,
+) -> None:
+    """A successful flush notifies completion once, after empty reasoning too."""
+    steps: list[str] = []
+
+    async def on_reasoning(text: str) -> None:
+        assert text == ""
+        steps.append("reasoning")
+
+    async def on_flush_complete() -> None:
+        steps.append("flush_complete")
+        if callback_fails:
+            raise RuntimeError("stats unavailable")
+
+    scanner, analyzer, _telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        mode=TriggerMode.EVERY_MESSAGE,
+        on_reasoning=on_reasoning,
+        on_flush_complete=on_flush_complete,
+    )
+
+    await scanner._on_event(player_event(VASYA, "Вася", "Я мирный житель"))
+
+    assert analyzer.calls == 1
+    assert steps == ["reasoning", "flush_complete"]
+    assert scanner.buffer_size == 0
+    if callback_fails:
+        assert any(
+            "on_flush_complete callback failed: RuntimeError: stats unavailable" in text
+            for text in _messages(log_records)
+        )
+    else:
+        assert log_records == []
+
+
+async def test_on_flush_complete_not_called_on_error(
+    game_state: GameState,
+    registry: RoleRegistry,
+) -> None:
+    """Failed analysis emits neither reasoning nor a flush-completed notification."""
+    steps: list[str] = []
+
+    async def on_reasoning(_text: str) -> None:
+        steps.append("reasoning")
+
+    async def on_flush_complete() -> None:
+        steps.append("flush_complete")
+
+    scanner, analyzer, _telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        mode=TriggerMode.EVERY_MESSAGE,
+        on_reasoning=on_reasoning,
+        on_flush_complete=on_flush_complete,
+    )
+    analyzer.next_success = False
+
+    await scanner._on_event(player_event(VASYA, "Вася", "Я мирный житель"))
+
+    assert analyzer.calls == 1
+    assert steps == []
+    assert scanner.buffer_size == 0
 
 
 async def test_flush_ignores_failed_analysis_reasoning(registry: RoleRegistry) -> None:

@@ -8,6 +8,7 @@ import queue
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -15,7 +16,8 @@ from app.bootstrap import BootstrapResult, bootstrap
 from app.orchestrator import Orchestrator
 from domain.events import MessageEvent, MessagePayload
 from features.scanner.scanner import MessageScanner
-from features.ui.protocol import ReasoningMessage, StatsMessage
+from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
+from infra.llm.schemas import AnalysisResponse, PlayerPrediction
 from tests.unit.app.conftest import FakeLLMClient, FakeTelegram, create_settings_file
 
 GAME_CHAT_ID = -100123
@@ -363,28 +365,110 @@ class FakeWindowHost:
         self.shutdown_calls += 1
 
 
-async def test_orchestrator_sends_stats_after_persist(tmp_path: Path) -> None:
-    """A successful event insert produces a stats frame."""
+async def test_orchestrator_send_stats_empty_predictions_clears_rows(tmp_path: Path) -> None:
+    """An empty prediction table sends an empty frame instead of leaving stale rows."""
     result, _telegram, _llm = await make_result(tmp_path)
+    ui = FakeWindowHost()
+    ui.stats.append(
+        StatsMessage(
+            game_id=result.game_state.game_id,
+            phase="day",
+            day=1,
+            rows=[StatsRow(player_name="Вася", role="Мафия", confidence=0.9)],
+        )
+    )
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        window_host=ui,  # type: ignore[arg-type]
+    )
+
+    await orchestrator._send_stats()
+
+    assert len(ui.stats) == 2
+    assert ui.stats[-1].game_id == result.game_state.game_id
+    assert ui.stats[-1].rows == []
+    await orchestrator.shutdown()
+
+
+async def test_orchestrator_send_stats_on_flush_complete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default factory refreshes stats once, after analyzer persistence."""
+    result, _telegram, llm = await make_result(tmp_path)
+    llm.response = AnalysisResponse(
+        analysis=[
+            PlayerPrediction(
+                player_id=PLAYER_ID,
+                player_name="Вася",
+                suspected_role="Мирный житель",
+                confidence=0.85,
+                reasons=["Спокойно разбирает аргументы"],
+            )
+        ],
+        game_read="Партия продолжается.",
+        reasoning="Разбор сохранённых событий.",
+    )
     ui = FakeWindowHost()
     orchestrator = Orchestrator(
         bootstrap_result=result,
         window_host=ui,  # type: ignore[arg-type]
     )
+    send_stats = AsyncMock(wraps=orchestrator._send_stats)
+    monkeypatch.setattr(orchestrator, "_send_stats", send_stats)
+    await orchestrator._start_scanner(GAME_CHAT_ID)
+    scanner = orchestrator._scanner
+    assert scanner is not None
+    assert scanner._on_flush_complete_callback is orchestrator._send_stats
+    await scanner._register_player(PLAYER_ID, "Вася")
+
+    await scanner._flush()
+
+    send_stats.assert_awaited_once_with()
+    assert len(ui.stats) == 1
+    assert ui.stats[0].rows == [StatsRow(player_name="Вася", role="Мирный житель", confidence=0.85)]
+    await orchestrator.shutdown()
+
+
+async def test_orchestrator_persist_event_does_not_call_send_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Event insertion alone no longer refreshes stats before analysis."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    send_stats = AsyncMock()
+    monkeypatch.setattr(orchestrator, "_send_stats", send_stats)
     event = MessageEvent(
         ts=EVENT_TS,
         game_id=result.game_state.game_id,
         payload=MessagePayload(
             author_id=PLAYER_ID,
             author_name="Игрок",
-            text="Сообщение для UI",
+            text="Сообщение для сохранения",
         ),
     )
 
     await orchestrator._persist_event(event)
 
-    assert len(ui.stats) == 1
-    assert ui.stats[0].game_id == result.game_state.game_id
+    send_stats.assert_not_awaited()
+    assert result.repos.events.list_events(result.game_state.game_id) == [event]
+    await orchestrator.shutdown()
+
+
+async def test_orchestrator_send_reasoning_uses_placeholder(tmp_path: Path) -> None:
+    """A non-thinking model produces an explicit explanation instead of a blank window."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        window_host=ui,  # type: ignore[arg-type]
+    )
+    placeholder = "(streaming reasoning unavailable — non-thinking model)"
+
+    await orchestrator._send_reasoning("")
+
+    assert ui.reasoning == [
+        ReasoningMessage(text=placeholder, truncated=False, total_chars=len(placeholder))
+    ]
     await orchestrator.shutdown()
 
 
