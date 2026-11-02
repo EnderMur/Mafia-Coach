@@ -323,8 +323,7 @@ class LMStudioClient(LLMClient):
                 if eof_retried or budget == 0:
                     break
                 eof_retried = True
-                if token_limit < 8192:
-                    token_limit = min(8192, token_limit * 2)
+                token_limit = min(4096, max(2048, token_limit * 2))
                 await self._sleep_before_retry(budget)
             except _SchemaRejectedHTTP as error:
                 if budget == 0:

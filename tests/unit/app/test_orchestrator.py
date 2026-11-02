@@ -731,6 +731,35 @@ async def test_persist_player_add_game_players_idempotent(tmp_path: Path) -> Non
     await orchestrator.shutdown()
 
 
+async def test_run_retro_persists_all_players(tmp_path: Path) -> None:
+    """11b-fix-2. _run_retro persists END_GAME placeholders before retro_analyze.
+
+    All players of game_state (including placeholders never registered by the
+    scanner) must reach game_players, otherwise retro drops them as unknown.
+    """
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+
+    game_state = result.game_state
+    game_state.register_player(PLAYER_ID, "Вася")
+    game_state.register_player(-1, "Игрок 1")
+    game_state.register_player(-2, "Игрок 2")
+    assert PLAYER_ID not in orchestrator._registered_player_ids
+
+    persist_spy = AsyncMock(wraps=orchestrator._persist_player)
+    orchestrator._persist_player = persist_spy  # type: ignore[method-assign]
+
+    await orchestrator._run_retro()
+
+    assert persist_spy.await_count == 3
+    persisted_ids = {call.args[0] for call in persist_spy.await_args_list}
+    assert persisted_ids == {PLAYER_ID, -1, -2}
+    game_id = result.game_state.game_id
+    rows = result.repos.game_players.list_game_players(game_id)
+    assert {row["player_id"] for row in rows} == {PLAYER_ID, -1, -2}
+    await orchestrator.shutdown()
+
+
 async def test_handle_status_uses_total_players(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

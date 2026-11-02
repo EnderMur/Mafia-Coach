@@ -15,7 +15,7 @@ llm:
   model: "qwen/qwen3.5-9b"                    # ОБЯЗАТЕЛЬНО: идентификатор из LM Studio
   temperature: 0.3
   top_p: 0.9
-  max_tokens: 8192
+  max_tokens: 2048
   request_timeout_sec: 120                    # первая генерация на CPU бывает долгой
   connect_timeout_sec: 5
   max_retries: 3                              # не больше 3 (см. §8.4)

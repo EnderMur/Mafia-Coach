@@ -388,6 +388,23 @@ class Orchestrator:
         if game_id == 0:
             return
 
+        # Persist ALL players (including END_GAME placeholders) to
+        # game_players before retro. Without this, placeholders
+        # registered by _apply_end_game never reach game_players →
+        # retro drops them as unknown.
+        for player in game_state.players():
+            if player.player_id in self._registered_player_ids:
+                continue
+            try:
+                await self._persist_player(player.player_id, player.display_name)
+            except Exception as e:  # noqa: BLE001 — defensive
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "persist placeholder failed for {}: {}: {}",
+                    player.player_id,
+                    type(e).__name__,
+                    str(e),
+                )
+
         # One lock for the whole loop keeps the ground truth atomic: no other
         # sqlite call can interleave between two players of the same game.
         async with self._db_lock:
