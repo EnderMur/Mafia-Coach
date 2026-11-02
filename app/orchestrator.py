@@ -209,12 +209,6 @@ class Orchestrator:
 
     async def _send_stats(self) -> None:
         """Send persisted predictions after a flush, or empty rows to clear stale stats."""
-        logger.bind(channel=_LOGGER_CHANNEL).info(
-            "send_stats called: ui={} stats_running={} game_id={}",
-            self._ui is not None,
-            getattr(self._ui, "stats_running", False) if self._ui else False,
-            self._result.game_state.game_id,
-        )
         if self._ui is None:
             return
         game_state = self._result.game_state
@@ -231,10 +225,6 @@ class Orchestrator:
                 key=lambda row: float(row["confidence"]),
                 reverse=True,
             )[:20]
-            logger.bind(channel=_LOGGER_CHANNEL).info(
-                "send_stats: preds_count={} rows_after_filter=?",
-                len(sorted_predictions),
-            )
             players = game_state.players()
             rows: list[StatsRow] = []
             for prediction in sorted_predictions:
@@ -254,8 +244,8 @@ class Orchestrator:
                         confidence=confidence,
                     )
                 )
-            logger.bind(channel=_LOGGER_CHANNEL).info(
-                "send_stats: sending {} rows",
+            logger.bind(channel=_LOGGER_CHANNEL).debug(
+                "send_stats: {} rows",
                 len(rows),
             )
             # Empty predictions still send a frame so the UI clears stale rows.
@@ -271,9 +261,8 @@ class Orchestrator:
 
     async def _send_reasoning(self, text: str) -> None:
         """Send one reasoning result, clipping the IPC frame defensively."""
-        logger.bind(channel=_LOGGER_CHANNEL).info(
-            "send_reasoning called: ui={} text_len={}",
-            self._ui is not None,
+        logger.bind(channel=_LOGGER_CHANNEL).debug(
+            "send_reasoning: text_len={}",
             len(text or ""),
         )
         if self._ui is None:
@@ -448,9 +437,12 @@ class Orchestrator:
         game_state = self._result.game_state
         players = game_state.players()
         alive = game_state.alive_players()
+        total = game_state.total_players
+        total_or_known = total if total is not None else len(players)
         print(
             f"Game #{game_state.game_id}, phase={game_state.current_phase().value}, "
-            f"current_day={game_state.current_day()}, alive={len(alive)}/{len(players)}"
+            f"current_day={game_state.current_day()}, "
+            f"alive={len(alive)}/{total_or_known}"
         )
 
         predictions = await asyncio.to_thread(

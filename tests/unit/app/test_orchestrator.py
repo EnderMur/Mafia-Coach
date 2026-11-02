@@ -15,7 +15,16 @@ from loguru import logger
 
 from app.bootstrap import BootstrapResult, bootstrap
 from app.orchestrator import Orchestrator
-from domain.events import MessageEvent, MessagePayload, PhaseChangeEvent, PhaseChangePayload
+from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
+    DeathEvent,
+    DeathPayload,
+    MessageEvent,
+    MessagePayload,
+    PhaseChangeEvent,
+    PhaseChangePayload,
+)
 from domain.phases import Phase
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
@@ -393,25 +402,27 @@ async def test_orchestrator_send_stats_empty_predictions_clears_rows(tmp_path: P
 
 
 async def test_send_stats_logs_debug_info(tmp_path: Path) -> None:
-    """_send_stats logs the UI state and prediction count before sending."""
+    """_send_stats and _send_reasoning log at DEBUG without noisy INFO lines."""
     result, _telegram, _llm = await make_result(tmp_path)
-
-    class FakeUI:
-        stats_running = True
-
-    ui = FakeUI()
+    ui = FakeWindowHost()
     orchestrator = Orchestrator(
         bootstrap_result=result,
         window_host=ui,  # type: ignore[arg-type]
     )
-    captured = io.StringIO()
-    sink_id = logger.add(captured, level="INFO", format="{message}")
+    debug_captured = io.StringIO()
+    info_captured = io.StringIO()
+    debug_sink = logger.add(debug_captured, level="DEBUG", format="{message}")
+    info_sink = logger.add(info_captured, level="INFO", format="{message}")
     try:
         await orchestrator._send_stats()
+        await orchestrator._send_reasoning("краткий разбор")
     finally:
-        logger.remove(sink_id)
+        logger.remove(debug_sink)
+        logger.remove(info_sink)
 
-    assert "send_stats called: ui=True stats_running=True" in captured.getvalue()
+    assert "send_stats: 0 rows" in debug_captured.getvalue()
+    assert "send_reasoning: text_len=" in debug_captured.getvalue()
+    assert info_captured.getvalue() == ""
     await orchestrator.shutdown()
 
 
@@ -585,4 +596,59 @@ async def test_orchestrator_persist_player_dedup(tmp_path: Path, monkeypatch) ->
         orchestrator._persist_player(PLAYER_ID, "Вася"),
     )
     assert len(calls) == 1
+    await orchestrator.shutdown()
+
+
+async def test_handle_status_uses_total_players(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_handle_status prefers GameState.total_players over len(players())."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    for idx in range(1, 6):
+        result.game_state.register_player(PLAYER_ID + idx, f"Игрок {idx}")
+    result.game_state.apply(
+        AliveListEvent(
+            ts=EVENT_TS,
+            game_id=result.game_state.game_id,
+            payload=AliveListPayload(
+                alive_player_names=[f"Игрок {idx}" for idx in range(1, 11)],
+                total_players=10,
+            ),
+        )
+    )
+    orchestrator = Orchestrator(bootstrap_result=result)
+
+    await orchestrator._handle_status()
+    output = capsys.readouterr().out
+
+    assert "alive=5/10" in output
+    assert "alive=5/5" not in output
+    await orchestrator.shutdown()
+
+
+async def test_handle_status_falls_back_to_len_players(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """_handle_status falls back to len(players()) when total_players is None."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    for idx in range(1, 4):
+        result.game_state.register_player(PLAYER_ID + idx, f"Игрок {idx}")
+    result.game_state.apply(
+        DeathEvent(
+            ts=EVENT_TS,
+            game_id=result.game_state.game_id,
+            payload=DeathPayload(
+                victim_id=PLAYER_ID + 1,
+                victim_name="Игрок 1",
+                cause="night_kill",
+            ),
+        )
+    )
+    assert result.game_state.total_players is None
+    orchestrator = Orchestrator(bootstrap_result=result)
+
+    await orchestrator._handle_status()
+    output = capsys.readouterr().out
+
+    assert "alive=2/3" in output
     await orchestrator.shutdown()
