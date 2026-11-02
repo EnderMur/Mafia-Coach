@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -201,6 +202,18 @@ def telegram_event(sender_id: int, name: str, text: str, index: int) -> Any:
     )
 
 
+async def wait_for_scheduled_retro(orchestrator: Orchestrator) -> None:
+    """Await the deferred END_GAME retro before checking labelled predictions.
+
+    Step 11b-fix-3 schedules retro a few seconds after the final report so
+    the final analysis flush can persist its predictions first. Tests shorten
+    the delay through ``app.orchestrator._RETRO_DELAY_SEC``.
+    """
+    task = orchestrator._pending_retro_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=2.0)
+
+
 @dataclass(frozen=True)
 class EndGameEnvironment:
     """Fully wired orchestrator over an empty, migrated in-memory database."""
@@ -291,13 +304,15 @@ def build_end_game_environment(tmp_path: Path) -> EndGameEnvironment:
     )
 
 
-async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
+async def test_e2e_end_game_auto_retro(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """13. The bot's final report labels predictions and stores the ground truth."""
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.01)
     environment = build_end_game_environment(tmp_path)
     repos = environment.repos
     game_state = environment.game_state
     game_id = environment.game_id
-    scanner = environment.orchestrator._default_scanner(CHAT_ID_E2E)
+    orchestrator = environment.orchestrator
+    scanner = orchestrator._default_scanner(CHAT_ID_E2E)
     await scanner.start()
     try:
         game_state.apply(
@@ -327,6 +342,7 @@ async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
             repos.game_players.add_player(game_id=game_id, player_id=player_id)
 
         await scanner._on_event(telegram_event(BOT_ID, "Бот", END_GAME_TEXT, 10))
+        await wait_for_scheduled_retro(orchestrator)
     finally:
         await scanner.shutdown()
 
@@ -360,13 +376,16 @@ async def test_e2e_end_game_auto_retro(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_e2e_end_game_auto_retro_with_persist_player(tmp_path: Path) -> None:
+async def test_e2e_end_game_auto_retro_with_persist_player(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """14. ``_persist_player`` alone fills game_players, so auto-retro labels predictions.
 
     No manual ``game_players.add_player`` call: the orchestrator's registration
     callback must create the participation rows, otherwise every final role
     write is rejected and ``predictions.correct`` stays NULL.
     """
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.01)
     environment = build_end_game_environment(tmp_path)
     repos = environment.repos
     game_state = environment.game_state
@@ -401,6 +420,7 @@ async def test_e2e_end_game_auto_retro_with_persist_player(tmp_path: Path) -> No
         assert len(repos.predictions.list_predictions(game_id)) == 2
 
         await scanner._on_event(telegram_event(BOT_ID, "Бот", END_GAME_TEXT, 10))
+        await wait_for_scheduled_retro(orchestrator)
     finally:
         await scanner.shutdown()
 

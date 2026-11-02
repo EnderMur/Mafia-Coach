@@ -434,8 +434,8 @@ def test_apply_end_game_sets_final_role(game: GameState) -> None:
     assert player_c.is_winner is None
 
 
-def test_apply_end_game_phase_end(game: GameState) -> None:
-    """8. The final report moves the game to Phase.END."""
+def test_phase_change_after_end_logged_at_debug(game: GameState, log_records: list[Record]) -> None:
+    """8. END_GAME sets Phase.END; later phase chatter is ignored at DEBUG."""
     game.register_player(1, "A")
     game.apply(make_phase_change(from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT))
     assert game.current_phase() is Phase.NIGHT
@@ -444,6 +444,24 @@ def test_apply_end_game_phase_end(game: GameState) -> None:
 
     assert game.current_phase() is Phase.END
     assert game.events()[-1].kind == "end_game"
+
+    debug_records: list[Record] = []
+    debug_sink = logger.add(lambda message: debug_records.append(message.record), level="DEBUG")
+    try:
+        game.apply(make_phase_change(from_phase=Phase.END, to_phase=Phase.DAY))
+    finally:
+        logger.remove(debug_sink)
+
+    # 11b-fix-3: repeated post-END phase changes are noise, not WARNINGs.
+    assert game.current_phase() is Phase.END
+    ignored = [
+        record
+        for record in debug_records
+        if "phase_change to" in record["message"] and "after END" in record["message"]
+    ]
+    assert len(ignored) == 1
+    assert ignored[0]["level"].name == "DEBUG"
+    assert not any("phase_change to" in record["message"] for record in log_records)
 
 
 def test_apply_end_game_warns_on_role_mismatch(game: GameState, log_records: list[Record]) -> None:

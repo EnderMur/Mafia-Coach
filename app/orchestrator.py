@@ -6,7 +6,7 @@ import asyncio
 import sys
 import threading
 from collections.abc import Callable
-from typing import TextIO
+from typing import Final, TextIO
 
 from loguru import logger
 
@@ -20,6 +20,11 @@ from features.ui.window_host import WindowHost
 
 _LOGGER_CHANNEL: str = "orchestrator"
 _ATTACH_PROMPT: str = "Введите номер чата для подключения (или пустую строку для отмены): "
+
+#: Grace period before the automatic END_GAME retro. The final analysis
+#: (a backfill catch-up flush or an in-flight LLM request) may still be
+#: writing predictions, and retro has to label those rows.
+_RETRO_DELAY_SEC: Final[float] = 5.0
 
 
 class _StdinReader:
@@ -129,6 +134,9 @@ class Orchestrator:
         self._db_lock = asyncio.Lock()
         self._stdin_reader = _StdinReader(self._stdin)
         self._backfill_task: asyncio.Task[None] | None = None
+        # END_GAME retro is deferred, not run inline with event persistence.
+        self._pending_retro: bool = False
+        self._pending_retro_task: asyncio.Task[None] | None = None
 
     def _default_scanner(self, chat_id: int) -> MessageScanner:
         """Build the production scanner with persistence and UI callbacks wired in."""
@@ -217,6 +225,24 @@ class Orchestrator:
         self._shutdown_complete = True
 
         self._stdin_reader.stop()
+
+        # A deferred END_GAME retro still sleeping on its grace period must not
+        # outlive the loop (or touch the DB after it was closed).
+        pending_retro = self._pending_retro_task
+        self._pending_retro_task = None
+        self._pending_retro = False
+        if pending_retro is not None and not pending_retro.done():
+            pending_retro.cancel()
+            try:
+                await pending_retro
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:  # noqa: BLE001 — continue resource cleanup
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "scheduled retro failed during shutdown: {}: {}",
+                    type(error).__name__,
+                    str(error),
+                )
 
         if self._backfill_task is not None and not self._backfill_task.done():
             self._backfill_task.cancel()
@@ -310,9 +336,11 @@ class Orchestrator:
     async def _persist_event(self, event: AnyEvent) -> None:
         """Persist one applied scanner event without blocking the event loop.
 
-        The bot's final report is the trigger for the automatic retrospective:
-        once it is stored, :meth:`_run_retro` writes the ground truth into
-        ``game_players`` and labels the game's predictions.
+        The bot's final report triggers the automatic retrospective, but it is
+        *scheduled* in the background instead of running inline: the final
+        flush (backfill catch-up or an in-flight analysis) may still be
+        persisting predictions, and retro must label those rows. Re-running
+        retro is idempotent (``upsert final_role`` + ``retro_analyze``).
         """
         try:
             async with self._db_lock:
@@ -324,15 +352,36 @@ class Orchestrator:
                 str(error),
             )
             return
+        # Schedule retro after END_GAME with a 5.0 s delay (flush may be in
+        # progress); the final analysis must persist predictions before retro.
         if isinstance(event, EndGameEvent):
-            try:
-                await self._run_retro()
-            except Exception as error:  # noqa: BLE001 — retro must not break scanning
-                logger.bind(channel=_LOGGER_CHANNEL).error(
-                    "auto-retro failed: {}: {}",
-                    type(error).__name__,
-                    str(error),
+            self._pending_retro = True
+            pending = self._pending_retro_task
+            if pending is None or pending.done():
+                self._pending_retro_task = asyncio.create_task(
+                    self._schedule_retro(delay=_RETRO_DELAY_SEC)
                 )
+
+    async def _schedule_retro(self, delay: float = 5.0) -> None:
+        """Run the retrospective after ``delay`` seconds, off the event path.
+
+        The default is the production grace period (:data:`_RETRO_DELAY_SEC`);
+        tests may pass a shorter delay explicitly.
+
+        Args:
+            delay: Grace period for the final analysis flush, in seconds.
+        """
+        try:
+            await asyncio.sleep(delay)
+            await self._run_retro()
+        except Exception as error:  # noqa: BLE001 — retro must not break scanning
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "scheduled retro failed: {}: {}",
+                type(error).__name__,
+                str(error),
+            )
+        finally:
+            self._pending_retro = False
 
     async def _persist_final_roles(self, game_state: GameState, game_id: int) -> None:
         """Write every known final role into ``game_players``.

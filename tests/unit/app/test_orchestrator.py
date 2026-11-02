@@ -21,6 +21,8 @@ from domain.events import (
     AliveListPayload,
     DeathEvent,
     DeathPayload,
+    EndGameEvent,
+    EndGamePayload,
     MessageEvent,
     MessagePayload,
     PhaseChangeEvent,
@@ -263,6 +265,47 @@ async def test_persist_event_inserts_into_db(tmp_path: Path) -> None:
 
     stored_events = result.repos.events.list_events(result.game_state.game_id)
     assert stored_events == [event]
+    await orchestrator.shutdown()
+
+
+async def test_end_game_schedules_retro_with_delay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """11b-fix-3. END_GAME defers retro so the final flush can finish first.
+
+    ``_persist_event`` stores the event, creates a pending retro task and
+    returns without running retro inline; retro is awaited only after the
+    grace period. The production delay is 5 s, patched down here to keep the
+    unit test fast.
+    """
+    result, _telegram, _llm = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    retro = AsyncMock()
+    orchestrator._run_retro = retro  # type: ignore[method-assign]
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.01)
+    event = EndGameEvent(
+        ts=EVENT_TS,
+        game_id=result.game_state.game_id,
+        payload=EndGamePayload(
+            winners=[("Вася", "Мафия")],
+            losers=[("Петя", "Мирный Житель")],
+            duration_minutes=20,
+        ),
+    )
+
+    await orchestrator._persist_event(event)
+
+    assert result.repos.events.list_events(result.game_state.game_id) == [event]
+    retro.assert_not_awaited()
+    assert orchestrator._pending_retro is True
+    pending = orchestrator._pending_retro_task
+    assert pending is not None
+    assert not pending.done()
+
+    await asyncio.wait_for(pending, timeout=1.0)
+
+    retro.assert_awaited_once_with()
+    assert orchestrator._pending_retro is False
     await orchestrator.shutdown()
 
 
