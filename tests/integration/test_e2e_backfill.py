@@ -262,6 +262,9 @@ async def test_e2e_backfill_full_cycle(
             display_name=display_name,
         )
 
+    async def flush_complete() -> None:
+        pass
+
     scanner = MessageScanner(
         telegram=cast(TelegramClientWrapper, telegram),
         game_state=game_state,
@@ -275,6 +278,7 @@ async def test_e2e_backfill_full_cycle(
         chat_id=CHAT_ID,
         bot_id=BOT_ID,
         on_player_registered=persist_player,
+        on_flush_complete=flush_complete,
     )
 
     await scanner.start()
@@ -282,7 +286,7 @@ async def test_e2e_backfill_full_cycle(
     await scanner.shutdown()
 
     assert telegram.list_calls == [(CHAT_ID, 5000)]
-    assert applied == 11
+    assert applied == 10
 
     # Old game (before GAME_START) was completely ignored.
     assert OLD_PLAYER not in {player.player_id for player in game_state.players()}
@@ -307,9 +311,8 @@ async def test_e2e_backfill_full_cycle(
     assert votes[0].payload.voter_id == VASYA
     assert votes[0].payload.target_id == PETYA
 
-    # Phase events (night 1, day 1, vote) triggered flushes, plus 1 final flush
-    # for Lena's trailing message after the vote.
-    assert llm_client.calls == 4
+    # Replay suppresses phase-triggered flushes; analyze the full state once.
+    assert llm_client.calls == 1
     assert scanner.buffer_size == 0
     predictions = predictions_repo.list_predictions(game_id)
     assert len(predictions) == 1

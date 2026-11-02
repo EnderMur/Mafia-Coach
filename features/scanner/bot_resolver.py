@@ -130,8 +130,8 @@ def _strip_role_prefix(
         registry: role registry providing canonical ``name_ru`` titles.
 
     Returns:
-        Player name without the leading emoji/role prefix, or the original
-        ``name`` when no role prefix matches.
+        Player name without the leading emoji/role prefix and surrounding
+        parentheses, or the original ``name`` when neither applies.
     """
     stripped = _strip_leading_emoji(name)
     stripped_folded = stripped.casefold()
@@ -139,10 +139,18 @@ def _strip_role_prefix(
         prefix_with_space = role.name_ru + " "
         if stripped_folded.startswith(prefix_with_space.casefold()):
             rest = stripped[len(prefix_with_space) :].strip()
+            if rest.startswith("(") and rest.endswith(")"):
+                rest = rest[1:-1].strip()
+            elif rest.startswith("("):
+                rest = rest[1:].strip()
+            elif rest.endswith(")"):
+                rest = rest[:-1].strip()
             if rest:
                 return rest
         if stripped_folded == role.name_ru.casefold():
             return stripped
+    if stripped.startswith("(") and stripped.endswith(")"):
+        return stripped[1:-1].strip()
     return name
 
 

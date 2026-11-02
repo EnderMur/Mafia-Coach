@@ -12,16 +12,19 @@ fast, long enough to be stable on a loaded machine.
 from __future__ import annotations
 
 import asyncio
+import inspect
 from collections.abc import Awaitable, Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from loguru import logger
 
+from app.orchestrator import Orchestrator
 from domain.events import (
     AnyEvent,
     DeathEvent,
@@ -452,7 +455,7 @@ async def test_fallback_name_used_when_sender_none(
 
     await scanner._on_event(make_event(sender_id=VASYA, text="Я без имени"))
 
-    assert scanner.name_to_id == {}
+    assert scanner.name_to_id == {f"user_{VASYA}": VASYA}
     assert game_state.players()[0].display_name == f"user_{VASYA}"
     event = game_state.events_by_kind("message")[0]
     assert isinstance(event, MessageEvent)
@@ -1310,7 +1313,7 @@ async def test_backfill_applies_after_game_start(
 
     applied = await scanner.backfill()
 
-    assert applied == 3
+    assert applied == 2
     assert telegram.list_calls == [(CHAT_ID, 5000)]
     assert 999 not in {player.player_id for player in game_state.players()}
     assert "Старожил" not in scanner.name_to_id
@@ -1367,6 +1370,7 @@ async def test_backfill_flood_wait_retries(
         game_state=game_state,
         registry=registry,
         mode=TriggerMode.BATCH_DEBOUNCE,
+        on_flush_complete=AsyncMock(),
     )
     telegram.flood_wait_once = 3
     chronological = [
@@ -1395,7 +1399,7 @@ async def test_backfill_flood_wait_retries(
 
     applied = await scanner.backfill()
 
-    assert applied == 2
+    assert applied == 1
     assert telegram.list_calls == [(CHAT_ID, 5000), (CHAT_ID, 5000)]
     assert slept == [3]
     assert game_state.current_phase() is Phase.NIGHT
@@ -1416,6 +1420,7 @@ async def test_backfill_flushes_at_end(
         mode=TriggerMode.BATCH_DEBOUNCE,
         debounce=10.0,
         max_messages=50,
+        on_flush_complete=AsyncMock(),
     )
     chronological = [
         history_message(
@@ -1446,8 +1451,80 @@ async def test_backfill_flushes_at_end(
 
     applied = await scanner.backfill()
 
-    assert applied == 4
+    assert applied == 3
     assert len(game_state.events_by_kind("message")) == 3
     assert analyzer.calls == 1
     assert scanner.buffer_size == 0
     assert scanner._debounce_task is None
+
+
+async def test_backfill_applies_without_intermediate_flush(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    """Replay all 72 messages before the only analysis, even in every-message mode."""
+    start_game(game_state)
+    scanner, analyzer, telegram = build_scanner(
+        game_state=game_state,
+        registry=registry,
+        mode=TriggerMode.EVERY_MESSAGE,
+        on_flush_complete=AsyncMock(),
+    )
+    chronological = [
+        history_message(sender_id=BOT_ID, text="Город ветров начинает свою игру над жителями!"),
+        *[
+            history_message(
+                sender_id=VASYA,
+                sender=FakeSender(first_name="Вася"),
+                text=f"Сообщение {i}",
+                second=i + 1,
+            )
+            for i in range(72)
+        ],
+    ]
+    telegram.recent_messages = list(reversed(chronological))
+    event_counts: list[int] = []
+
+    async def record_context() -> None:
+        event_counts.append(len(game_state.events_by_kind("message")))
+
+    analyzer.on_analyze = record_context
+    assert await scanner.backfill() == 72
+    assert analyzer.calls == 1
+    assert event_counts == [72]
+    assert scanner.buffer_size == 0
+
+
+def test_backfill_timeout_300s() -> None:
+    """The orchestrator gives backfill the requested five-minute budget."""
+    source = inspect.getsource(Orchestrator._backfill_safe)
+    assert "300.0" in source
+    assert "60.0" not in source
+
+
+async def test_register_player_adds_canonical_form(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, _analyzer, _telegram = build_scanner(game_state=game_state, registry=registry)
+    await scanner._register_player(1, "Мирный Житель ^‿^")
+    assert scanner.name_to_id["Мирный Житель ^‿^"] == 1
+    assert scanner.name_to_id["^‿^"] == 1
+
+
+async def test_backfill_restores_flushing_after_failure(
+    game_state: GameState, registry: RoleRegistry, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    scanner, _analyzer, telegram = build_scanner(game_state=game_state, registry=registry)
+    telegram.recent_messages = [
+        history_message(sender_id=VASYA, text="test", second=1),
+        history_message(sender_id=BOT_ID, text="Город ветров начинает свою игру над жителями!"),
+    ]
+    scanner._flushing = True
+
+    async def fail(_event: Any) -> None:
+        assert scanner._flushing
+        raise RuntimeError("replay failed")
+
+    monkeypatch.setattr(scanner, "_process_event", fail)
+    with pytest.raises(RuntimeError, match="replay failed"):
+        await scanner.backfill()
+    assert scanner._flushing is True

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import io
 import queue
 from datetime import UTC, datetime
@@ -347,7 +348,7 @@ async def test_run_backfills_in_background_after_scanner_start(
     await asyncio.wait_for(run_task, timeout=2.0)
 
     output = capsys.readouterr().out
-    assert "Backfill: loading recent messages..." in output
+    assert "Backfill: loading recent messages..." not in output
     assert "Backfilled 7 messages." in output
     assert scanner.backfill_calls == 1
     await orchestrator.shutdown()
@@ -379,7 +380,7 @@ async def test_backfill_failure_is_reported(
 async def test_backfill_timeout_is_reported(
     tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A hanging backfill is cut at the 60 s budget and reported."""
+    """A hanging backfill is cut at the 300 s budget and reported."""
     result, _telegram, _llm = await make_result(tmp_path)
     scanner = FakeScanner(GAME_CHAT_ID)
     scanner.backfill_gate = asyncio.Event()
@@ -393,12 +394,13 @@ async def test_backfill_timeout_is_reported(
     real_wait_for = asyncio.wait_for
 
     async def short_wait_for(awaitable: Any, timeout: float) -> Any:
+        assert timeout == 300.0
         return await real_wait_for(awaitable, timeout=0.01)
 
     monkeypatch.setattr("app.orchestrator.asyncio.wait_for", short_wait_for)
     await orchestrator._backfill_safe()
 
-    assert "Backfill: timed out after 60s." in capsys.readouterr().out
+    assert "Backfill: timed out after 300s." in capsys.readouterr().out
     await orchestrator.shutdown()
 
 
@@ -877,3 +879,9 @@ async def test_backfill_does_not_block_commands(tmp_path: Path) -> None:
     assert orchestrator._backfill_task is None
     assert scanner.backfill_calls == 1
     await asyncio.wait_for(orchestrator.shutdown(), timeout=2.0)
+
+
+def test_backfill_timeout_300_in_source() -> None:
+    source = inspect.getsource(Orchestrator._backfill_safe)
+    assert "300.0" in source
+    assert "60.0" not in source

@@ -658,15 +658,14 @@ class Orchestrator:
 
         Called as a task from :meth:`run`; every outcome (success, empty
         history, timeout, failure) is printed to the console *and* logged, so a
-        silent backfill can never go undiagnosed again. The 60 s timeout keeps a
+        silent backfill can never go undiagnosed again. The 300 s timeout keeps a
         wedged Telegram call from pinning the task forever.
         """
         scanner = self._scanner
         if scanner is None:
             return
-        print("Backfill: loading recent messages...", flush=True)
         try:
-            applied = await asyncio.wait_for(scanner.backfill(), timeout=60.0)
+            applied = await asyncio.wait_for(scanner.backfill(), timeout=300.0)
             if applied > 0:
                 print(f"Backfilled {applied} messages.", flush=True)
                 logger.bind(channel=_LOGGER_CHANNEL).info("backfilled {} messages", applied)
@@ -679,8 +678,8 @@ class Orchestrator:
                     "backfill: 0 applied (GAME_START not found?)"
                 )
         except TimeoutError:
-            print("Backfill: timed out after 60s.", flush=True)
-            logger.bind(channel=_LOGGER_CHANNEL).warning("backfill timeout (60s)")
+            print("Backfill: timed out after 300s.", flush=True)
+            logger.bind(channel=_LOGGER_CHANNEL).warning("backfill timeout (300s)")
         except Exception as e:  # noqa: BLE001 — background task boundary
             print(f"Backfill failed: {type(e).__name__}: {e}", flush=True)
             logger.bind(channel=_LOGGER_CHANNEL).error(
