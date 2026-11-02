@@ -172,10 +172,13 @@ def build_context(
             display_name=player.display_name,
             alive=player.alive,
             known_role_name_ru=(
-                player.known_role.name_ru if player.known_role is not None else None
+                player.known_role.name_ru
+                if player.revealed and player.known_role is not None
+                else None
             ),
         )
         for player in game_state.players()
+        if player.player_id > 0
     ]
 
     return LLMContext(
