@@ -245,10 +245,68 @@ def test_phase_change_with_wrong_source_phase_is_atomic(game: GameState) -> None
 
 
 def test_phase_change_to_same_phase_is_rejected(game: GameState) -> None:
-    """A phase-change event must represent an actual transition."""
+    """A phase-change event must represent an actual transition outside game start."""
+    game.apply(make_phase_change(to_phase=Phase.DAY, day_number=1))
     with pytest.raises(ConfigError, match="different phase"):
-        game.apply(make_phase_change(from_phase=Phase.REGISTRATION, to_phase=Phase.REGISTRATION))
-    assert game.events() == ()
+        game.apply(make_phase_change(from_phase=Phase.DAY, to_phase=Phase.DAY))
+    assert len(game.events()) == 1
+
+
+def test_game_start_after_end_resets(game: GameState) -> None:
+    """A new-game marker resets an ended game while retaining event history."""
+    for player_id in (1, 2, 3):
+        game.register_player(player_id, f"Player {player_id}")
+    game.apply(make_phase_change(to_phase=Phase.END, day_number=0))
+    assert game.current_phase() is Phase.END
+    assert len(game.players()) == 3
+
+    start_event = make_phase_change(
+        from_phase=Phase.END,
+        to_phase=Phase.REGISTRATION,
+        day_number=0,
+    )
+    game.apply(start_event)
+
+    assert game.current_phase() is Phase.REGISTRATION
+    assert game.players() == ()
+    assert game.current_day() == 0
+    assert game.events()[-1] == start_event
+
+
+def test_game_start_when_registration_no_players(game: GameState) -> None:
+    """A start marker is accepted even when REGISTRATION is already current."""
+    start_event = make_phase_change(
+        from_phase=Phase.REGISTRATION,
+        to_phase=Phase.REGISTRATION,
+        day_number=0,
+    )
+
+    game.apply(start_event)
+
+    assert game.current_phase() is Phase.REGISTRATION
+    assert game.players() == ()
+    assert game.events() == (start_event,)
+
+
+def test_game_start_drops_players(game: GameState) -> None:
+    """A new game clears the previous game's players from any active phase."""
+    for player_id in (1, 2, 3):
+        game.register_player(player_id, f"Player {player_id}")
+    game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=2))
+    assert game.current_phase() is Phase.NIGHT
+    assert len(game.players()) == 3
+
+    game.apply(
+        make_phase_change(
+            from_phase=Phase.NIGHT,
+            to_phase=Phase.REGISTRATION,
+            day_number=0,
+        )
+    )
+
+    assert game.current_phase() is Phase.REGISTRATION
+    assert game.players() == ()
+    assert game.current_day() == 0
 
 
 def test_message_event_is_recorded_without_changing_players(game: GameState) -> None:

@@ -103,6 +103,26 @@ class GameState:
                 raise UnknownRoleError(f"unknown role name: {event.payload.role_name_ru}")
             updated_player = player.model_copy(update={"known_role": role, "revealed": True})
         elif isinstance(event, PhaseChangeEvent):
+            payload = event.payload
+
+            # A transition to REGISTRATION marks a new game and resets the
+            # aggregate, including when the previous game had already ended.
+            if payload.to_phase == Phase.REGISTRATION:
+                if self._phase != Phase.REGISTRATION or self._players:
+                    logger.bind(channel="game_state").info(
+                        "new game detected: phase {} → REGISTRATION, "
+                        "resetting state ({} players dropped)",
+                        self._phase.value,
+                        len(self._players),
+                    )
+                self._phase = Phase.REGISTRATION
+                self._day_number = 0
+                self._players = {}
+                self._role_count = None
+                self._total_players = None
+                self._events.append(event)
+                return
+
             if self._phase == Phase.END:
                 # Post-END phase chatter is expected in backfills/replays:
                 # keep it out of WARNING logs (noise on every finished game).
@@ -110,7 +130,6 @@ class GameState:
                     "phase_change to {} after END — ignored", event.payload.to_phase
                 )
                 return
-            payload = event.payload
             if payload.from_phase == payload.to_phase:
                 raise ConfigError("phase change must transition to a different phase")
             if payload.from_phase != self._phase:

@@ -45,6 +45,7 @@ from domain.events import (
     DeathEvent,
     MessageEvent,
     MessagePayload,
+    PhaseChangeEvent,
     RoleRevealEvent,
 )
 from domain.exceptions import TelegramFloodWaitError
@@ -64,11 +65,12 @@ _LOGGER_CHANNEL: Final[str] = "scanner"
 #: (e.g. the sender left the chat and the entity is no longer resolvable).
 _FALLBACK_NAME_PREFIX: Final[str] = "user_"
 
-#: Bot marker announcing a new game ("Город ветров начинает свою игру над жителями!").
+#: Bot markers announcing a new game and the final report ending it.
 _GAME_START_RE: Final[re.Pattern[str]] = re.compile(
-    r"Город\s+ветров\s+начинает\s+свою\s+игру",
+    r"Город\s+ветров\s+начинает",
     re.IGNORECASE,
 )
+_END_GAME_RE: Final[re.Pattern[str]] = re.compile(r"Игра\s+окончена!", re.IGNORECASE)
 
 
 def _sender_display_name(sender: Any) -> str | None:
@@ -241,14 +243,15 @@ class MessageScanner:
     ) -> int:
         """Load recent chat history and apply it to ``GameState``.
 
-        Finds the ``GAME_START`` marker (``"Город ветров начинает свою игру над
-        жителями!"``) in the loaded window. Messages before the marker belong to
-        finished games and are ignored; messages after the marker are applied
-        chronologically via :meth:`_process_event`. Intermediate
-        flushes are suppressed, with one *forced* flush after the replay when a
-        flush completion callback is configured. That final flush bypasses the
-        phase guard so even a game already in ``Phase.END`` gets predictions
-        for the retrospective.
+        Finds the latest ``GAME_START`` marker in the loaded window. Messages
+        before it belong to finished games and are ignored. If an ``END_GAME``
+        follows that marker, the latest game is already complete and is skipped;
+        otherwise messages after the marker are applied chronologically via
+        :meth:`_process_event`. Intermediate flushes are suppressed, with one
+        *forced* flush after the replay when a flush completion callback is
+        configured. That final flush bypasses the phase guard if replay reaches
+        ``Phase.END`` via a phase marker without a final report; completed games
+        with an ``END_GAME`` report were skipped before replay.
 
         If ``GAME_START`` is not found in the loaded window, logs a warning,
         applies nothing, and returns ``0``. On :class:`TelegramFloodWaitError`,
@@ -298,14 +301,16 @@ class MessageScanner:
         messages = list(reversed(raw_messages))
 
         start_idx: int | None = None
+        end_game_idx: int | None = None
         for i, msg in enumerate(messages):
             msg_text = getattr(msg, "text", None)
-            if (
-                getattr(msg, "sender_id", None) == self._bot_id
-                and isinstance(msg_text, str)
-                and _GAME_START_RE.search(_strip_markdown(msg_text))
-            ):
+            if getattr(msg, "sender_id", None) != self._bot_id or not isinstance(msg_text, str):
+                continue
+            clean_text = _strip_markdown(msg_text)
+            if _GAME_START_RE.search(clean_text):
                 start_idx = i
+            if _END_GAME_RE.search(clean_text):
+                end_game_idx = i
 
         if start_idx is None:
             logger.bind(channel=_LOGGER_CHANNEL).warning(
@@ -315,6 +320,18 @@ class MessageScanner:
                 getattr(messages[-1], "date", None),
             )
             return 0
+
+        # The most recent game in the window has already ended. Don't replay
+        # its events into the state of a game that is no longer active.
+        if end_game_idx is not None and end_game_idx > start_idx:
+            logger.bind(channel=_LOGGER_CHANNEL).info(
+                "backfill: GAME_START at {} followed by END_GAME at {} — "
+                "game is completed, no backfill (waiting for new game)",
+                start_idx,
+                end_game_idx,
+            )
+            return 0
+
         messages_after = messages[start_idx + 1 :]
         logger.bind(channel=_LOGGER_CHANNEL).info(
             "backfill: GAME_START at index {}/{}, will apply {}",
@@ -462,6 +479,13 @@ class MessageScanner:
             await self._ensure_event_player(event)
             if self._apply_safely(event):
                 applied.append(event)
+                if (
+                    isinstance(event, PhaseChangeEvent)
+                    and event.payload.to_phase is Phase.REGISTRATION
+                ):
+                    # The new GameState is empty; allow known Telegram users
+                    # to be registered again as members of this game.
+                    self._registered_ids.clear()
                 if isinstance(event, AliveListEvent):
                     await self._persist_alive_placeholders(event.payload.alive_player_names)
                 await self._emit(event)
@@ -730,13 +754,14 @@ class MessageScanner:
                 self._schedule_debounce()
 
     async def _flush_force(self) -> None:
-        """Flush the buffer bypassing the phase guard (backfill post-END).
+        """Flush the buffer bypassing the phase guard for backfill.
 
         Mirrors :meth:`_flush` — re-entrancy guard, debounce cancellation,
         buffer drain, analysis, reasoning and flush-completion callbacks —
         but never skips the analysis because of ``REGISTRATION``/``END``.
-        Backfill is a catch-up flow: its last analysis must still run after
-        the replay reached ``Phase.END`` so retro has predictions to label.
+        This covers replays that reach ``Phase.END`` through a phase marker
+        without an ``END_GAME`` final report; completed games with a final
+        report are skipped by :meth:`backfill` before replay.
 
         Force-specific log messages make it obvious in the logs which path
         produced the final analysis.
@@ -799,3 +824,8 @@ class MessageScanner:
     def is_started(self) -> bool:
         """Return whether the scanner is subscribed to the chat."""
         return self._started
+
+    @property
+    def is_flushing(self) -> bool:
+        """Whether an analyze cycle is currently in progress."""
+        return self._flushing

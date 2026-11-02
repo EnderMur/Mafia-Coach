@@ -7,6 +7,7 @@ deterministic function of its arguments and is trivially unit-testable.
 
 Mapping (``BotMessageKind`` → events)
 -------------------------------------
+``GAME_START``     → ``[PhaseChangeEvent]``   (transition/reset to registration)
 ``PHASE_CHANGE``   → ``[PhaseChangeEvent]``   (only for a real transition)
 ``DEATH``          → ``[DeathEvent]``         (victim must resolve to an id)
 ``ROLE_REVEAL``    → ``[RoleRevealEvent]``    (role id and name must resolve)
@@ -206,6 +207,8 @@ def resolve_bot_message(
         parser found no player names.
     """
     kind = parse.kind
+    if kind is BotMessageKind.GAME_START:
+        return _resolve_game_start(parse=parse, game_id=game_id, ts=ts, current_phase=current_phase)
     if kind is BotMessageKind.PHASE_CHANGE:
         return _resolve_phase_change(
             parse=parse, game_id=game_id, ts=ts, current_phase=current_phase
@@ -246,6 +249,26 @@ def resolve_bot_message(
 # ---------------------------------------------------------------------------
 # Per-kind resolvers (pure helpers)
 # ---------------------------------------------------------------------------
+
+
+def _resolve_game_start(
+    *,
+    parse: BotMessageParse,
+    game_id: int,
+    ts: datetime,
+    current_phase: Phase,
+) -> list[AnyEvent]:
+    """Start a new game by transitioning to REGISTRATION.
+
+    Always emit this event, even when the current phase is already
+    REGISTRATION: the event also signals that ``GameState`` must reset.
+    """
+    payload = PhaseChangePayload(
+        from_phase=current_phase,
+        to_phase=Phase.REGISTRATION,
+        day_number=0,
+    )
+    return [PhaseChangeEvent(ts=ts, game_id=game_id, payload=payload)]
 
 
 def _resolve_phase_change(

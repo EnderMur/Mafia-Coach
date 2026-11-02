@@ -309,6 +309,40 @@ async def test_end_game_schedules_retro_with_delay(
     await orchestrator.shutdown()
 
 
+async def test_schedule_retro_waits_for_flush(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retro waits until the scanner's in-flight flush finishes."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    scanner = orchestrator._default_scanner(GAME_CHAT_ID)
+    orchestrator._scanner = scanner
+    scanner._flushing = True
+    retro = AsyncMock()
+    orchestrator._run_retro = retro  # type: ignore[method-assign]
+
+    real_sleep = asyncio.sleep
+    poll_count = 0
+
+    async def fake_sleep(delay: float) -> None:
+        nonlocal poll_count
+        if delay == 0.5:
+            poll_count += 1
+            if poll_count == 3:
+                scanner._flushing = False
+        await real_sleep(0)
+
+    monkeypatch.setattr("app.orchestrator.asyncio.sleep", fake_sleep)
+
+    await asyncio.wait_for(orchestrator._schedule_retro(delay=0), timeout=1.0)
+
+    assert poll_count == 3
+    assert scanner.is_flushing is False
+    retro.assert_awaited_once_with()
+    await orchestrator.shutdown()
+
+
 async def test_shutdown_idempotent(tmp_path: Path) -> None:
     """Calling orchestrator shutdown twice is harmless."""
     result, telegram, llm_client = await make_result(tmp_path)

@@ -373,6 +373,16 @@ class Orchestrator:
         """
         try:
             await asyncio.sleep(delay)
+            scanner = self._scanner
+            if scanner is not None:
+                waited = 0.0
+                while scanner.is_flushing and waited < 60.0:
+                    await asyncio.sleep(0.5)
+                    waited += 0.5
+                if waited > 0:
+                    logger.bind(channel=_LOGGER_CHANNEL).info(
+                        "retro: waited {:.1f}s for flush to complete", waited
+                    )
             await self._run_retro()
         except Exception as error:  # noqa: BLE001 — retro must not break scanning
             logger.bind(channel=_LOGGER_CHANNEL).error(
