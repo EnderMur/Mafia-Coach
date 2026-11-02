@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+import threading
 from collections.abc import Callable
 from typing import TextIO
 
@@ -19,6 +20,62 @@ from features.ui.window_host import WindowHost
 
 _LOGGER_CHANNEL: str = "orchestrator"
 _ATTACH_PROMPT: str = "Введите номер чата для подключения (или пустую строку для отмены): "
+
+
+class _StdinReader:
+    """Dedicated thread that reads stdin lines and pushes them to an asyncio queue.
+
+    ``asyncio.to_thread(sys.stdin.readline)`` on Windows has a race after a
+    prior read: the worker thread can lose the console input handle state and
+    block forever. A single dedicated reader thread that hands lines over with
+    ``call_soon_threadsafe`` is reliable, because exactly one thread ever
+    touches the stream.
+
+    EOF is signalled by pushing ``None`` onto the queue.
+    """
+
+    def __init__(self, stream: TextIO) -> None:
+        """Retain the stream to read from and prepare the handoff queue."""
+        self._stream = stream
+        self._queue: asyncio.Queue[str | None] = asyncio.Queue()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._stopped = False
+
+    def start(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Start the reader thread bound to ``loop``. Idempotent."""
+        if self._thread is not None:
+            return
+        self._loop = loop
+        self._thread = threading.Thread(
+            target=self._run,
+            daemon=True,
+            name="stdin-reader",
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        """Read the stream until EOF or :meth:`stop` and forward each line."""
+        loop = self._loop
+        while not self._stopped:
+            try:
+                line = self._stream.readline()
+            except Exception:  # noqa: BLE001 — a broken stream behaves like EOF
+                line = ""
+            if loop is None:
+                return
+            if not line:
+                loop.call_soon_threadsafe(self._queue.put_nowait, None)
+                return
+            loop.call_soon_threadsafe(self._queue.put_nowait, line)
+
+    async def get(self) -> str | None:
+        """Await the next line, or ``None`` at EOF."""
+        return await self._queue.get()
+
+    def stop(self) -> None:
+        """Ask the reader thread to exit after its current ``readline``."""
+        self._stopped = True
 
 
 class Orchestrator:
@@ -66,6 +123,12 @@ class Orchestrator:
         self._shutdown_complete = False
         self._registered_player_ids: set[int] = set()
         self._player_persistence_lock = asyncio.Lock()
+        # Serializes every sqlite3 access handed to ``asyncio.to_thread``: a
+        # single ``sqlite3.Connection`` is not usable from two threads at once
+        # (it raises ``InterfaceError`` and the write is lost).
+        self._db_lock = asyncio.Lock()
+        self._stdin_reader = _StdinReader(self._stdin)
+        self._backfill_task: asyncio.Task[None] | None = None
 
     def _default_scanner(self, chat_id: int) -> MessageScanner:
         """Build the production scanner with persistence and UI callbacks wired in."""
@@ -95,6 +158,8 @@ class Orchestrator:
         if self._quit_event.is_set():
             return
 
+        self._stdin_reader.start(asyncio.get_running_loop())
+
         if self._ui is not None:
             await self._ui.start()
 
@@ -102,6 +167,12 @@ class Orchestrator:
             await self._handle_attach(None)
         else:
             await self._start_scanner(self._chat_id)
+
+        # Backfill runs in the background so it never blocks the command loop.
+        if self._scanner is not None and self._result.game_state.game_id > 0:
+            self._backfill_task = asyncio.create_task(self._backfill_safe())
+        else:
+            self._backfill_task = None
 
         if self._quit_event.is_set():
             return
@@ -122,6 +193,7 @@ class Orchestrator:
                     await quit_task
                 except asyncio.CancelledError:
                     pass
+            await self._cancel_backfill()
             command_task = self._command_task
             if command_task is not None:
                 if not command_task.done():
@@ -143,6 +215,22 @@ class Orchestrator:
         if self._shutdown_complete:
             return
         self._shutdown_complete = True
+
+        self._stdin_reader.stop()
+
+        if self._backfill_task is not None and not self._backfill_task.done():
+            self._backfill_task.cancel()
+            try:
+                await self._backfill_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as error:  # noqa: BLE001 — continue resource cleanup
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "backfill failed during shutdown: {}: {}",
+                    type(error).__name__,
+                    str(error),
+                )
+            self._backfill_task = None
 
         if self._command_task is not None and not self._command_task.done():
             self._command_task.cancel()
@@ -196,22 +284,23 @@ class Orchestrator:
             if player_id in self._registered_player_ids:
                 return
             try:
-                await asyncio.to_thread(
-                    self._result.repos.players.upsert_player,
-                    player_id=player_id,
-                    username=name,
-                    display_name=name,
-                )
-                game_id = self._result.game_state.game_id
-                if game_id > 0:
+                async with self._db_lock:
                     await asyncio.to_thread(
-                        self._result.repos.game_players.add_player,
-                        game_id=game_id,
+                        self._result.repos.players.upsert_player,
                         player_id=player_id,
-                        final_role=None,
-                        survived=None,
-                        is_winner=None,
+                        username=name,
+                        display_name=name,
                     )
+                    game_id = self._result.game_state.game_id
+                    if game_id > 0:
+                        await asyncio.to_thread(
+                            self._result.repos.game_players.add_player,
+                            game_id=game_id,
+                            player_id=player_id,
+                            final_role=None,
+                            survived=None,
+                            is_winner=None,
+                        )
                 self._registered_player_ids.add(player_id)
             except Exception as error:  # noqa: BLE001 — best-effort persistence
                 logger.bind(channel=_LOGGER_CHANNEL).error(
@@ -226,7 +315,8 @@ class Orchestrator:
         ``game_players`` and labels the game's predictions.
         """
         try:
-            await asyncio.to_thread(self._result.repos.events.insert_event, event)
+            async with self._db_lock:
+                await asyncio.to_thread(self._result.repos.events.insert_event, event)
         except Exception as error:  # noqa: BLE001 — defensive callback boundary
             logger.bind(channel=_LOGGER_CHANNEL).error(
                 "persist event failed: {}: {}",
@@ -240,6 +330,43 @@ class Orchestrator:
             except Exception as error:  # noqa: BLE001 — retro must not break scanning
                 logger.bind(channel=_LOGGER_CHANNEL).error(
                     "auto-retro failed: {}: {}",
+                    type(error).__name__,
+                    str(error),
+                )
+
+    async def _persist_final_roles(self, game_state: GameState, game_id: int) -> None:
+        """Write every known final role into ``game_players``.
+
+        Must be called while holding :attr:`_db_lock`. A player missing from
+        ``game_players`` is expected (registered before 10c-fix-12, or the
+        backfill has not reached it yet) and only logged as a warning.
+
+        Args:
+            game_state: State holding the final roles parsed from the report.
+            game_id: Game whose participation rows are updated.
+        """
+        for player in game_state.players():
+            if player.final_role is None:
+                continue
+            try:
+                await asyncio.to_thread(
+                    self._result.repos.game_players.set_final_role,
+                    game_id=game_id,
+                    player_id=player.player_id,
+                    final_role=player.final_role.name_ru,
+                    survived=player.alive,
+                    is_winner=player.is_winner,
+                )
+            except ConfigError as error:
+                logger.bind(channel=_LOGGER_CHANNEL).warning(
+                    "final_role skipped for {} (not in game_players): {}",
+                    player.player_id,
+                    str(error),
+                )
+            except Exception as error:  # noqa: BLE001 — keep processing players
+                logger.bind(channel=_LOGGER_CHANNEL).error(
+                    "persist final_role failed for {}: {}: {}",
+                    player.player_id,
                     type(error).__name__,
                     str(error),
                 )
@@ -261,45 +388,22 @@ class Orchestrator:
         if game_id == 0:
             return
 
-        for player in game_state.players():
-            if player.final_role is None:
-                continue
-            try:
-                await asyncio.to_thread(
-                    self._result.repos.game_players.set_final_role,
-                    game_id=game_id,
-                    player_id=player.player_id,
-                    final_role=player.final_role.name_ru,
-                    survived=player.alive,
-                    is_winner=player.is_winner,
-                )
-            except ConfigError as error:
-                # The player is missing from game_players: either it was
-                # registered before 10c-fix-12 (empty table) or the backfill
-                # has not reached it yet. Expected, not a failure of the run.
-                logger.bind(channel=_LOGGER_CHANNEL).warning(
-                    "final_role skipped for {} (not in game_players): {}",
-                    player.player_id,
-                    str(error),
-                )
-            except Exception as error:  # noqa: BLE001 — keep processing players
-                logger.bind(channel=_LOGGER_CHANNEL).error(
-                    "persist final_role failed for {}: {}: {}",
-                    player.player_id,
-                    type(error).__name__,
-                    str(error),
-                )
+        # One lock for the whole loop keeps the ground truth atomic: no other
+        # sqlite call can interleave between two players of the same game.
+        async with self._db_lock:
+            await self._persist_final_roles(game_state, game_id)
 
         from features.memory.retro import retro_analyze
 
         try:
-            report = await asyncio.to_thread(
-                retro_analyze,
-                game_id=game_id,
-                registry=self._result.registry,
-                predictions_repo=self._result.repos.predictions,
-                game_players_repo=self._result.repos.game_players,
-            )
+            async with self._db_lock:
+                report = await asyncio.to_thread(
+                    retro_analyze,
+                    game_id=game_id,
+                    registry=self._result.registry,
+                    predictions_repo=self._result.repos.predictions,
+                    game_players_repo=self._result.repos.game_players,
+                )
         except Exception as error:  # noqa: BLE001 — retro is best-effort
             logger.bind(channel=_LOGGER_CHANNEL).error(
                 "retro_analyze failed: {}: {}",
@@ -333,10 +437,11 @@ class Orchestrator:
         if game_state.game_id == 0:
             return
         try:
-            predictions = await asyncio.to_thread(
-                self._result.repos.predictions.list_predictions,
-                game_state.game_id,
-            )
+            async with self._db_lock:
+                predictions = await asyncio.to_thread(
+                    self._result.repos.predictions.list_predictions,
+                    game_state.game_id,
+                )
             min_confidence = self._result.config.analysis.min_confidence_to_display
             sorted_predictions = sorted(
                 predictions,
@@ -402,17 +507,10 @@ class Orchestrator:
             )
 
     async def _read_commands(self) -> None:
-        """Read commands from stdin until ``/quit`` or EOF."""
+        """Read commands from the stdin reader thread until ``/quit`` or EOF."""
         while not self._quit_event.is_set():
-            try:
-                line = await asyncio.to_thread(self._stdin.readline)
-            except Exception as error:  # noqa: BLE001 — keep input failures visible
-                logger.bind(channel=_LOGGER_CHANNEL).error(
-                    "stdin read failed: {}",
-                    str(error),
-                )
-                return
-            if not line:
+            line = await self._stdin_reader.get()
+            if line is None:
                 return
             await self._handle_command(line.strip())
 
@@ -431,10 +529,19 @@ class Orchestrator:
         elif command == "/attach":
             await self._handle_attach(argument)
         else:
-            print(f"Unknown command: {line}. Available: /status, /quit, /attach [id]")
+            print(
+                f"Unknown command: {line}. Available: /status, /quit, /attach [id]",
+                flush=True,
+            )
 
     async def _handle_attach(self, arg: str | None) -> None:
-        """Select a chat interactively or attach directly to a numeric id."""
+        """Select a chat interactively or attach directly to a numeric id.
+
+        History backfill is *not* run here: it is started in the background by
+        :meth:`run` (see :meth:`_backfill_safe`) so an ``/attach`` command never
+        blocks the command loop.
+        """
+        self._stdin_reader.start(asyncio.get_running_loop())
         dialogs: list[dict[str, object]] = []
         if arg is None:
             try:
@@ -448,36 +555,31 @@ class Orchestrator:
                     type(error).__name__,
                     str(error),
                 )
-                print(f"Не удалось получить список чатов: {error}")
+                print(f"Не удалось получить список чатов: {error}", flush=True)
                 return
 
             if not dialogs:
-                print("Не найдено доступных групповых чатов.")
+                print("Не найдено доступных групповых чатов.", flush=True)
                 return
             for index, dialog in enumerate(dialogs, start=1):
                 title = str(dialog.get("title", ""))
                 kind = str(dialog.get("kind", ""))
-                print(f"{index}. {title} ({kind})")
+                print(f"{index}. {title} ({kind})", flush=True)
             print(_ATTACH_PROMPT, end="", flush=True)
-            try:
-                selection = await asyncio.to_thread(self._stdin.readline)
-            except Exception as error:  # noqa: BLE001 — console read boundary
-                logger.bind(channel=_LOGGER_CHANNEL).error(
-                    "stdin read failed during attach: {}",
-                    str(error),
-                )
-                print(f"Не удалось прочитать выбор чата: {error}")
-                return
+            # Read through the shared reader thread instead of
+            # ``asyncio.to_thread(stdin.readline)``: on Windows the worker-thread
+            # read races with the command reader and can block forever.
+            selection = await self._stdin_reader.get()
             if not selection or not selection.strip():
-                print("Выбор чата отменён.")
+                print("Выбор чата отменён.", flush=True)
                 return
             try:
                 dialog_index = int(selection.strip())
             except ValueError:
-                print("Некорректный номер чата.")
+                print("Некорректный номер чата.", flush=True)
                 return
             if not 1 <= dialog_index <= len(dialogs):
-                print("Номер чата вне списка.")
+                print("Номер чата вне списка.", flush=True)
                 return
             try:
                 dialog_chat_id = dialogs[dialog_index - 1]["id"]
@@ -489,13 +591,13 @@ class Orchestrator:
                     "invalid dialog entry: {}",
                     str(error),
                 )
-                print("Не удалось определить id выбранного чата.")
+                print("Не удалось определить id выбранного чата.", flush=True)
                 return
         else:
             try:
                 chat_id = int(arg)
             except ValueError:
-                print("chat_id должен быть числом.")
+                print("chat_id должен быть числом.", flush=True)
                 return
 
         try:
@@ -507,7 +609,7 @@ class Orchestrator:
                 type(error).__name__,
                 str(error),
             )
-            print(f"Не удалось подключиться к чату {chat_id}: {error}")
+            print(f"Не удалось подключиться к чату {chat_id}: {error}", flush=True)
             return
 
         if self._scanner is not None:
@@ -517,49 +619,32 @@ class Orchestrator:
         # Bootstrap uses game_id=0 as a placeholder while no chat is selected.
         # The first attach replaces that placeholder; later attaches intentionally
         # keep the current game/state in v1 rather than splitting it per chat.
-        created_new_game = False
         if self._result.game_state.game_id == 0:
             try:
-                game_id = await asyncio.to_thread(
-                    self._result.repos.games.create_game,
-                    chat_id=chat_id,
-                    player_count=0,
-                )
+                async with self._db_lock:
+                    game_id = await asyncio.to_thread(
+                        self._result.repos.games.create_game,
+                        chat_id=chat_id,
+                        player_count=0,
+                    )
             except Exception as error:  # noqa: BLE001 — database failures are logged
                 logger.bind(channel=_LOGGER_CHANNEL).error(
                     "cannot create game for attached chat: {}: {}",
                     type(error).__name__,
                     str(error),
                 )
-                print(f"Не удалось создать запись партии: {error}")
+                print(f"Не удалось создать запись партии: {error}", flush=True)
                 return
             self._result.game_state = GameState(
                 game_id=game_id,
                 registry=self._result.registry,
             )
-            created_new_game = True
             logger.bind(channel=_LOGGER_CHANNEL).info(
                 "created game {} for chat_id={}", game_id, chat_id
             )
 
         await self._start_scanner(chat_id)
-        print(f"Подключён чат {chat_id}.")
-        if created_new_game and self._scanner is not None:
-            try:
-                applied = await self._scanner.backfill()
-                if applied > 0:
-                    print(f"Backfilled {applied} messages from game start.")
-                    logger.bind(channel=_LOGGER_CHANNEL).info(
-                        "backfilled {} messages",
-                        applied,
-                    )
-            except Exception as e:  # noqa: BLE001 — backfill must not abort attach
-                logger.bind(channel=_LOGGER_CHANNEL).error(
-                    "backfill failed: {}: {}",
-                    type(e).__name__,
-                    str(e),
-                )
-                print(f"Backfill failed: {e}")
+        print(f"Подключён чат {chat_id}.", flush=True)
 
     async def _start_scanner(self, chat_id: int) -> None:
         """Construct and start a scanner for the selected chat."""
@@ -567,6 +652,58 @@ class Orchestrator:
         await scanner.start()
         self._scanner = scanner
         self._chat_id = chat_id
+
+    async def _backfill_safe(self) -> None:
+        """Run the history backfill in the background with full diagnostics.
+
+        Called as a task from :meth:`run`; every outcome (success, empty
+        history, timeout, failure) is printed to the console *and* logged, so a
+        silent backfill can never go undiagnosed again. The 60 s timeout keeps a
+        wedged Telegram call from pinning the task forever.
+        """
+        scanner = self._scanner
+        if scanner is None:
+            return
+        print("Backfill: loading recent messages...", flush=True)
+        try:
+            applied = await asyncio.wait_for(scanner.backfill(), timeout=60.0)
+            if applied > 0:
+                print(f"Backfilled {applied} messages.", flush=True)
+                logger.bind(channel=_LOGGER_CHANNEL).info("backfilled {} messages", applied)
+            else:
+                print(
+                    "Backfill: no messages applied (GAME_START not found or no history).",
+                    flush=True,
+                )
+                logger.bind(channel=_LOGGER_CHANNEL).warning(
+                    "backfill: 0 applied (GAME_START not found?)"
+                )
+        except TimeoutError:
+            print("Backfill: timed out after 60s.", flush=True)
+            logger.bind(channel=_LOGGER_CHANNEL).warning("backfill timeout (60s)")
+        except Exception as e:  # noqa: BLE001 — background task boundary
+            print(f"Backfill failed: {type(e).__name__}: {e}", flush=True)
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "backfill failed: {}: {}", type(e).__name__, str(e)
+            )
+
+    async def _cancel_backfill(self) -> None:
+        """Cancel and await the background backfill task, if any."""
+        task = self._backfill_task
+        self._backfill_task = None
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as error:  # noqa: BLE001 — cleanup must finish
+            logger.bind(channel=_LOGGER_CHANNEL).error(
+                "backfill failed while stopping: {}: {}",
+                type(error).__name__,
+                str(error),
+            )
 
     async def _handle_status(self) -> None:
         """Print the current game snapshot and the five strongest predictions."""
@@ -578,13 +715,15 @@ class Orchestrator:
         print(
             f"Game #{game_state.game_id}, phase={game_state.current_phase().value}, "
             f"current_day={game_state.current_day()}, "
-            f"alive={len(alive)}/{total_or_known}"
+            f"alive={len(alive)}/{total_or_known}",
+            flush=True,
         )
 
-        predictions = await asyncio.to_thread(
-            self._result.repos.predictions.list_predictions,
-            game_state.game_id,
-        )
+        async with self._db_lock:
+            predictions = await asyncio.to_thread(
+                self._result.repos.predictions.list_predictions,
+                game_state.game_id,
+            )
         top_predictions = sorted(
             predictions,
             key=lambda row: float(row["confidence"]),
@@ -593,13 +732,14 @@ class Orchestrator:
         for prediction in top_predictions:
             print(
                 f"player {prediction['player_id']}: {prediction['predicted_role']} "
-                f"({float(prediction['confidence']):.0%})"
+                f"({float(prediction['confidence']):.0%})",
+                flush=True,
             )
         if not top_predictions:
-            print("Предсказаний пока нет.")
+            print("Предсказаний пока нет.", flush=True)
 
         buffer_size = self._scanner.buffer_size if self._scanner is not None else 0
-        print(f"messages in buffer: {buffer_size}")
+        print(f"messages in buffer: {buffer_size}", flush=True)
 
     async def _handle_quit(self) -> None:
         """Signal the main loop to stop."""

@@ -7,14 +7,14 @@ import io
 import queue
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
 from loguru import logger
 
 from app.bootstrap import BootstrapResult, bootstrap
-from app.orchestrator import Orchestrator
+from app.orchestrator import Orchestrator, _StdinReader
 from domain.events import (
     AliveListEvent,
     AliveListPayload,
@@ -47,6 +47,8 @@ class FakeScanner:
         self.backfill_calls = 0
         self.backfill_result = 0
         self.backfill_error: Exception | None = None
+        self.backfill_started = asyncio.Event()
+        self.backfill_gate: asyncio.Event | None = None
 
     async def start(self) -> None:
         """Record scanner startup."""
@@ -55,6 +57,9 @@ class FakeScanner:
     async def backfill(self) -> int:
         """Record history backfill or raise the configured failure."""
         self.backfill_calls += 1
+        self.backfill_started.set()
+        if self.backfill_gate is not None:
+            await self.backfill_gate.wait()
         if self.backfill_error is not None:
             raise self.backfill_error
         return self.backfill_result
@@ -317,57 +322,83 @@ async def test_handle_attach_direct_chat_id(tmp_path: Path) -> None:
     assert telegram.get_chat_calls == [-100999]
     assert created_scanners[0].chat_id == -100999
     assert created_scanners[0].started is True
-    assert created_scanners[0].backfill_calls == 1
+    # 10a-fix-2: attach never backfills; run() schedules it in the background.
+    assert created_scanners[0].backfill_calls == 0
     await orchestrator.shutdown()
 
 
-async def test_handle_attach_backfill_only_on_first_game_creation(
+async def test_run_backfills_in_background_after_scanner_start(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Backfill runs on first /attach (game_id 0 -> N), never on re-attach."""
-    result, _telegram, _llm = await make_result(tmp_path, chat_id=None)
-    created_scanners: list[FakeScanner] = []
-
-    def scanner_factory(chat_id: int) -> MessageScanner:
-        scanner = FakeScanner(chat_id)
-        scanner.backfill_result = 7
-        created_scanners.append(scanner)
-        return cast(MessageScanner, scanner)
-
+    """Backfill is scheduled by run() once a scanner and a game exist."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    scanner = FakeScanner(GAME_CHAT_ID)
+    scanner.backfill_result = 7
     orchestrator = Orchestrator(
         bootstrap_result=result,
-        scanner_factory=scanner_factory,
+        scanner_factory=lambda _chat_id: cast(MessageScanner, scanner),
+        stdin=io.StringIO(""),
+        enable_ui=False,
     )
-    await orchestrator._handle_command("/attach -100999")
-    await orchestrator._handle_command("/attach -100888")
+
+    run_task = asyncio.create_task(orchestrator.run())
+    await asyncio.wait_for(scanner.backfill_started.wait(), timeout=2.0)
+    await asyncio.sleep(0.02)
+    await asyncio.wait_for(run_task, timeout=2.0)
 
     output = capsys.readouterr().out
-    assert "Backfilled 7 messages from game start." in output
-    assert len(created_scanners) == 2
-    assert created_scanners[0].backfill_calls == 1
-    assert created_scanners[1].backfill_calls == 0
+    assert "Backfill: loading recent messages..." in output
+    assert "Backfilled 7 messages." in output
+    assert scanner.backfill_calls == 1
     await orchestrator.shutdown()
 
 
-async def test_handle_attach_backfill_error_does_not_abort_attach(
+async def test_backfill_failure_is_reported(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A backfill error is logged and printed without detaching the scanner."""
-    result, _telegram, _llm = await make_result(tmp_path, chat_id=None)
+    """A backfill error is printed and logged without detaching the scanner."""
+    result, _telegram, _llm = await make_result(tmp_path)
     scanner = FakeScanner(-100999)
     scanner.backfill_error = RuntimeError("history unavailable")
 
     orchestrator = Orchestrator(
         bootstrap_result=result,
         scanner_factory=lambda _chat_id: cast(MessageScanner, scanner),
+        enable_ui=False,
     )
-    await orchestrator._handle_command("/attach -100999")
+    await orchestrator._start_scanner(-100999)
+    await orchestrator._backfill_safe()
 
     output = capsys.readouterr().out
-    assert "Подключён чат -100999." in output
-    assert "Backfill failed: history unavailable" in output
+    assert "Backfill failed: RuntimeError: history unavailable" in output
     assert scanner.started is True
     assert orchestrator._scanner is not None
+    await orchestrator.shutdown()
+
+
+async def test_backfill_timeout_is_reported(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hanging backfill is cut at the 60 s budget and reported."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    scanner = FakeScanner(GAME_CHAT_ID)
+    scanner.backfill_gate = asyncio.Event()
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        scanner_factory=lambda _chat_id: cast(MessageScanner, scanner),
+        enable_ui=False,
+    )
+    await orchestrator._start_scanner(GAME_CHAT_ID)
+
+    real_wait_for = asyncio.wait_for
+
+    async def short_wait_for(awaitable: Any, timeout: float) -> Any:
+        return await real_wait_for(awaitable, timeout=0.01)
+
+    monkeypatch.setattr("app.orchestrator.asyncio.wait_for", short_wait_for)
+    await orchestrator._backfill_safe()
+
+    assert "Backfill: timed out after 60s." in capsys.readouterr().out
     await orchestrator.shutdown()
 
 
@@ -751,3 +782,98 @@ async def test_handle_status_falls_back_to_len_players(
 
     assert "alive=2/3" in output
     await orchestrator.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# 10a-fix-2: stdin reader thread, DB lock, background backfill
+# ---------------------------------------------------------------------------
+
+
+async def test_stdin_reader_yields_lines() -> None:
+    """The reader thread forwards every line and a final ``None`` at EOF."""
+    reader = _StdinReader(io.StringIO("a\nb\n"))
+    reader.start(asyncio.get_running_loop())
+    try:
+        first = await asyncio.wait_for(reader.get(), timeout=2.0)
+        second = await asyncio.wait_for(reader.get(), timeout=2.0)
+        eof = await asyncio.wait_for(reader.get(), timeout=2.0)
+    finally:
+        reader.stop()
+
+    assert first == "a\n"
+    assert second == "b\n"
+    assert eof is None
+
+
+async def test_db_lock_serializes_persist_and_stats(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent persist/stats calls never hold the DB at the same time."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    event = MessageEvent(
+        ts=EVENT_TS,
+        game_id=result.game_state.game_id,
+        payload=MessagePayload(author_id=PLAYER_ID, author_name="Игрок", text="текст"),
+    )
+    overlaps: list[str] = []
+    active = 0
+    real_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(func: Any, /, *args: Any, **kwargs: Any) -> Any:
+        nonlocal active
+        active += 1
+        if active > 1:
+            overlaps.append(getattr(func, "__name__", repr(func)))
+        try:
+            await asyncio.sleep(0)
+            return await real_to_thread(func, *args, **kwargs)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr("app.orchestrator.asyncio.to_thread", spy_to_thread)
+    monkeypatch.setattr(orchestrator, "_ui", FakeWindowHost())
+
+    await asyncio.wait_for(
+        asyncio.gather(
+            orchestrator._persist_event(event),
+            orchestrator._send_stats(),
+            orchestrator._persist_event(event),
+            orchestrator._send_stats(),
+        ),
+        timeout=5.0,
+    )
+
+    assert overlaps == []
+    assert result.repos.events.list_events(result.game_state.game_id) == [event, event]
+    await orchestrator.shutdown()
+
+
+async def test_backfill_does_not_block_commands(tmp_path: Path) -> None:
+    """A hung backfill leaves the command loop alive and is cancelled on quit."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    scanner = FakeScanner(GAME_CHAT_ID)
+    scanner.backfill_gate = asyncio.Event()  # never released: backfill hangs
+    command_input = QueueInput()
+    orchestrator = Orchestrator(
+        bootstrap_result=result,
+        scanner_factory=lambda _chat_id: cast(MessageScanner, scanner),
+        stdin=command_input,  # type: ignore[arg-type]
+        enable_ui=False,
+    )
+
+    run_task = asyncio.create_task(orchestrator.run())
+    await asyncio.wait_for(scanner.backfill_started.wait(), timeout=2.0)
+    await asyncio.sleep(0.02)
+
+    assert orchestrator._backfill_task is not None
+    assert not orchestrator._backfill_task.done()
+    assert orchestrator._command_task is not None
+    assert not orchestrator._command_task.done()
+
+    command_input.send("/quit\n")
+    await asyncio.wait_for(run_task, timeout=2.0)
+
+    assert orchestrator._backfill_task is None
+    assert scanner.backfill_calls == 1
+    await asyncio.wait_for(orchestrator.shutdown(), timeout=2.0)

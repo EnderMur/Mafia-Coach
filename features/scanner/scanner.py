@@ -261,6 +261,11 @@ class MessageScanner:
             when the marker was not found.
         """
         fetch_limit = limit if limit is not None else max_messages
+        logger.bind(channel=_LOGGER_CHANNEL).info(
+            "backfill: loading limit={} max={}",
+            fetch_limit,
+            max_messages,
+        )
         try:
             raw_messages = await self._telegram.list_recent_messages(
                 chat_id=self._chat_id,
@@ -277,6 +282,16 @@ class MessageScanner:
                 limit=fetch_limit,
             )
 
+        logger.bind(channel=_LOGGER_CHANNEL).info(
+            "backfill: loaded {} messages",
+            len(raw_messages),
+        )
+        if not raw_messages:
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "backfill: no messages returned from chat",
+            )
+            return 0
+
         messages = list(reversed(raw_messages))
 
         start_idx: int | None = None
@@ -291,9 +306,18 @@ class MessageScanner:
 
         if start_idx is None:
             logger.bind(channel=_LOGGER_CHANNEL).warning(
-                "GAME_START not found in history, no backfill",
+                "GAME_START not found in {} messages (oldest: {}, newest: {})",
+                len(messages),
+                getattr(messages[0], "date", None),
+                getattr(messages[-1], "date", None),
             )
             return 0
+        logger.bind(channel=_LOGGER_CHANNEL).info(
+            "backfill: GAME_START at index {}/{}, will apply {}",
+            start_idx,
+            len(messages),
+            len(messages) - start_idx,
+        )
 
         messages_after = messages[start_idx:]
         for msg in messages_after:
