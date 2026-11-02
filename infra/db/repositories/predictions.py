@@ -23,14 +23,55 @@ class PredictionsRepository:
         confidence: float,
         reasoning: str,
     ) -> int:
-        """Insert a prediction and return its database identifier."""
+        """Deprecated compatibility alias for the current prediction upsert."""
+        return self.upsert_prediction(
+            game_id=game_id,
+            player_id=player_id,
+            predicted_role=predicted_role,
+            confidence=confidence,
+            reasoning=reasoning,
+        )
+
+    def upsert_prediction(
+        self,
+        *,
+        game_id: int,
+        player_id: int,
+        predicted_role: str,
+        confidence: float,
+        reasoning: str,
+    ) -> int:
+        """Insert or update the current prediction and return its stable id."""
         cursor = self._conn.execute(
-            "INSERT INTO predictions(game_id, ts, player_id, predicted_role, "
-            "confidence, reasoning) VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)",
+            "INSERT INTO predictions (game_id, ts, player_id, predicted_role, confidence, reasoning) "
+            "VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?) "
+            "ON CONFLICT(game_id, player_id) DO UPDATE SET "
+            "ts = CURRENT_TIMESTAMP, predicted_role = excluded.predicted_role, "
+            "confidence = excluded.confidence, reasoning = excluded.reasoning RETURNING id",
+            (game_id, player_id, predicted_role, confidence, reasoning),
+        )
+        row = cursor.fetchone()
+        assert row is not None
+        return int(row[0])
+
+    def insert_history(
+        self,
+        *,
+        game_id: int,
+        player_id: int,
+        predicted_role: str,
+        confidence: float,
+        reasoning: str,
+    ) -> int:
+        """Append a prediction to history and return its id."""
+        cursor = self._conn.execute(
+            "INSERT INTO predictions_history "
+            "(game_id, ts, player_id, predicted_role, confidence, reasoning) "
+            "VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)",
             (game_id, player_id, predicted_role, confidence, reasoning),
         )
         assert cursor.lastrowid is not None
-        return cursor.lastrowid
+        return int(cursor.lastrowid)
 
     def list_predictions(self, game_id: int) -> list[sqlite3.Row]:
         """Return a game's predictions in timestamp and insertion order."""

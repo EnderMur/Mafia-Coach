@@ -192,7 +192,7 @@ class GameAnalyzer:
             for prediction in response.analysis:
                 try:
                     await asyncio.to_thread(
-                        self._predictions_repo.insert_prediction,
+                        self._predictions_repo.upsert_prediction,
                         game_id=game_state.game_id,
                         player_id=prediction.player_id,
                         predicted_role=prediction.suspected_role,
@@ -202,6 +202,19 @@ class GameAnalyzer:
                 except Exception as error:  # noqa: BLE001 — persistence is defensive
                     warnings.append(f"persistence_failed: {error}")
                     logger.bind(channel="llm").error("persistence_failed: {}", str(error))
+                    continue
+                try:
+                    await asyncio.to_thread(
+                        self._predictions_repo.insert_history,
+                        game_id=game_state.game_id,
+                        player_id=prediction.player_id,
+                        predicted_role=prediction.suspected_role,
+                        confidence=prediction.confidence,
+                        reasoning="\n".join(prediction.reasons),
+                    )
+                except Exception as error:  # noqa: BLE001 — history is optional
+                    warnings.append(f"history_failed: {error}")
+                    logger.bind(channel="llm").warning("history_failed: {}", str(error))
 
         return AnalysisResult(
             response=response,

@@ -383,7 +383,7 @@ async def test_analyze_persistence_failure_adds_warning(
     class FailingPredictionsRepository(PredictionsRepository):
         """Repository double that always fails to insert predictions."""
 
-        def insert_prediction(
+        def upsert_prediction(
             self,
             *,
             game_id: int,
@@ -406,6 +406,7 @@ async def test_analyze_persistence_failure_adds_warning(
     assert "persistence_failed" in result.warnings[0]
     assert "disk full" in result.warnings[0]
     assert repository.list_predictions(game_id) == []
+    assert connection.execute("SELECT count(*) FROM predictions_history").fetchone()[0] == 0
 
 
 async def test_analyze_reasoning_truncated(
@@ -690,7 +691,7 @@ async def test_analyze_persist_runs_in_thread(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """insert_prediction is called via asyncio.to_thread,
+    """Both writes are called via asyncio.to_thread,
     not blocking the event loop."""
     import asyncio as _asyncio
 
@@ -698,7 +699,7 @@ async def test_analyze_persist_runs_in_thread(
     game_id = create_game_with_players(connection, [100])
 
     # Подменить asyncio.to_thread на spy, чтобы убедиться,
-    # что repo.insert_prediction вызывается через него.
+    # что оба метода репозитория вызываются через него.
     real_to_thread = _asyncio.to_thread
     calls: list[str] = []
 
@@ -730,4 +731,57 @@ async def test_analyze_persist_runs_in_thread(
         persist=True,
     )
     assert result.success
-    assert "insert_prediction" in calls, f"expected insert_prediction via to_thread, got {calls}"
+    assert calls == ["upsert_prediction", "insert_history"]
+
+
+async def test_analyzer_uses_upsert_and_history(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100, 101])
+    calls: list[tuple[str, int]] = []
+    for name in ("upsert_prediction", "insert_history"):
+        original = getattr(repository, name)
+
+        def spy(*, _name: str = name, _original: Any = original, **kwargs: Any) -> int:
+            calls.append((_name, kwargs["player_id"]))
+            return int(_original(**kwargs))
+
+        monkeypatch.setattr(repository, name, spy)
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(i, "Мафия") for i in (100, 101)]))
+    result = await make_analyzer(fake_llm, repository, registry, jinja_env).analyze(
+        make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    )
+    assert result.success and not result.warnings
+    assert calls == [
+        ("upsert_prediction", 100),
+        ("insert_history", 100),
+        ("upsert_prediction", 101),
+        ("insert_history", 101),
+    ]
+
+
+async def test_history_failure_is_warning(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+
+    def fail(**kwargs: Any) -> int:
+        raise sqlite3.OperationalError("history unavailable")
+
+    monkeypatch.setattr(repository, "insert_history", fail)
+    llm = FakeLLMClient()
+    llm.set_response(make_response([make_prediction(100, "Мафия")]))
+    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(
+        make_game_state(registry, game_id=game_id, player_ids=(100,))
+    )
+    assert result.success and result.warnings == ("history_failed: history unavailable",)
+    assert len(repository.list_predictions(game_id)) == 1

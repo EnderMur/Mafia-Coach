@@ -45,6 +45,7 @@ from domain.events import (
     RoleRevealEvent,
 )
 from domain.game_state import GameState
+from domain.phases import Phase
 from domain.roles import RoleRegistry
 from features.analyzer.analyzer import GameAnalyzer
 from features.parser.bot_messages import parse_bot_message
@@ -516,6 +517,19 @@ class MessageScanner:
         Callback failures are logged without interrupting the scanner.
         """
         if self._flushing:
+            return
+        phase = self._game_state.current_phase()
+        if phase == Phase.REGISTRATION:
+            logger.bind(channel=_LOGGER_CHANNEL).debug(
+                "flush skipped: phase=registration (game not started)",
+            )
+            self._buffer.clear()
+            self._cancel_debounce()
+            return
+        if phase == Phase.END:
+            logger.bind(channel=_LOGGER_CHANNEL).debug("flush skipped: phase=end")
+            self._buffer.clear()
+            self._cancel_debounce()
             return
         self._flushing = True
         try:
