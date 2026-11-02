@@ -733,6 +733,23 @@ async def test_analyze_stream_schema_validation_error_does_not_retry(
     assert route.call_count == 1
 
 
+async def test_eof_retry_caps_max_tokens_4096(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """EOF retry caps max_tokens at 4096 (was 8192 → 112s latency spike)."""
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        side_effect=[
+            sse_response({"choices": [{"delta": {"content": '{"analysis": ['}}]}, "[DONE]"),
+            sse_response({"choices": [{"delta": {"content": VALID_CONTENT}}]}, "[DONE]"),
+        ]
+    )
+    result = await run_stream(client)
+    assert result.analysis[0].player_id == 100
+    assert route.call_count == 2
+    assert json.loads(route.calls[0].request.content)["max_tokens"] == 2048
+    assert json.loads(route.calls[1].request.content)["max_tokens"] == 4096
+
+
 async def test_build_payload_contains_schema(client: LMStudioClient) -> None:
     """The JSON Schema request format embeds the public response schema."""
     payload = client._build_payload(MESSAGES, response_format="json_schema")
@@ -874,5 +891,5 @@ async def test_eof_retry(client: LMStudioClient, respx_mock: respx.MockRouter) -
     assert result.analysis[0].player_id == 100
     assert route.call_count == 2
     assert json.loads(route.calls[0].request.content)["max_tokens"] == 4096
-    assert json.loads(route.calls[1].request.content)["max_tokens"] == 8192
+    assert json.loads(route.calls[1].request.content)["max_tokens"] == 4096
     assert client.max_tokens == 4096
