@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import re
+
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
+
+_USER_ID_RE = re.compile(r"^user_(\d+)$")
 
 from domain.events import (
     AliveListEvent,
@@ -115,10 +119,24 @@ class GameState:
         elif isinstance(event, AliveListEvent):
             existing_names = {p.display_name for p in self._players.values()}
             for name in event.payload.alive_player_names:
-                if name not in existing_names:
-                    self.register_player(_placeholder_player_id(name), name, username=None)
-                    existing_names.add(name)
+                pid = _placeholder_player_id(name)
+                if pid in self._players:
+                    # Player registered earlier (real id from speech or
+                    # previously from ALIVE_LIST). Don't overwrite
+                    # display_name, just refresh alive.
+                    existing = self._players[pid]
+                    if existing.display_name not in existing_names:
+                        existing_names.add(existing.display_name)
+                    continue
+                if name in existing_names:
+                    continue
+                self.register_player(pid, name, username=None)
+                existing_names.add(name)
             alive_names = set(event.payload.alive_player_names)
+            for name in event.payload.alive_player_names:
+                pid = _placeholder_player_id(name)
+                if pid in self._players:
+                    alive_names.add(self._players[pid].display_name)
             updated: dict[int, Player] = {}
             for pid, player in self._players.items():
                 if player.display_name in alive_names:
@@ -275,9 +293,17 @@ class GameState:
 
 
 def _placeholder_player_id(name: str) -> int:
-    """Stable negative int64 for name-only players; Telegram user ids are positive."""
+    """Resolve player id from name.
+
+    If name matches "user_<id>" (bot fallback for users without
+    username), return the real id. Otherwise return a stable
+    negative int64 placeholder (Telegram user ids are positive).
+    """
     import hashlib
 
+    m = _USER_ID_RE.match(name)
+    if m:
+        return int(m.group(1))
     digest = hashlib.sha256(name.encode("utf-8")).digest()
     n = int.from_bytes(digest[:8], "big", signed=False)
     return -(n % (2**62)) - 1

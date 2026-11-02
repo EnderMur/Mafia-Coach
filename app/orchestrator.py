@@ -460,6 +460,8 @@ class Orchestrator:
                 )
                 if player is None:
                     continue
+                if player.player_id <= 0:
+                    continue  # skip placeholder in Stats Window
                 rows.append(
                     StatsRow(
                         player_name=player.display_name,
@@ -745,11 +747,18 @@ class Orchestrator:
         players = game_state.players()
         alive = game_state.alive_players()
         total = game_state.total_players
-        total_or_known = total if total is not None else len(players)
+        known = len(players)
+        # If bot total known and consistent — use it; otherwise use
+        # registered count (bot might be stale).
+        if total is not None and total >= len(alive):
+            display_total = total
+        else:
+            display_total = known
         print(
-            f"Game #{game_state.game_id}, phase={game_state.current_phase().value}, "
+            f"Game #{game_state.game_id}, "
+            f"phase={game_state.current_phase().value}, "
             f"current_day={game_state.current_day()}, "
-            f"alive={len(alive)}/{total_or_known}",
+            f"alive={len(alive)}/{display_total}",
             flush=True,
         )
 
