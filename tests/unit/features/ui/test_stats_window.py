@@ -182,3 +182,16 @@ def test_set_console_cp_called_on_win32() -> None:
     """
     assert main(io.StringIO(encode(IPCEnvelope(type="shutdown")) + "\n")) == 0
     assert hasattr(sys.stdout, "write")
+
+
+def test_main_utf8_stdin_payload_smoke(capsys: pytest.CaptureFixture[str]) -> None:
+    """Smoke (fix-7): a Cyrillic frame from a UTF-8 pipe survives main().
+
+    io.StringIO has no ``reconfigure``, so sys.stdin.reconfigure(utf-8) is
+    exercised only by the real child process (C5 v9). Here the reconfigure
+    block must not break the stdin loop even when streams lack the method.
+    """
+    lines = _stats_line() + "\n" + encode(IPCEnvelope(type="shutdown")) + "\n"
+
+    assert main(io.StringIO(lines)) == 0
+    assert "Анна" in capsys.readouterr().out
