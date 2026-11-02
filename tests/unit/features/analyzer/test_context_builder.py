@@ -12,6 +12,8 @@ import pytest
 from jinja2 import DictLoader
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     DeathEvent,
     DeathPayload,
     MessageEvent,
@@ -371,6 +373,32 @@ def test_recent_messages_are_chronological(registry: RoleRegistry) -> None:
     ]
 
 
+def test_build_context_includes_role_count(registry: RoleRegistry) -> None:
+    """role_count из GameState попадает в LLMContext."""
+    state = make_game_state(registry=registry)
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=1,
+            payload=AliveListPayload(
+                alive_player_names=["Вася"],
+                role_count={"Мафия": 5},
+                total_players=10,
+            ),
+        )
+    )
+    context = build_context(game_state=state, registry=registry)
+    assert context.role_count == {"Мафия": 5}
+    assert context.total_players == 10
+
+
+def test_build_context_role_count_none_if_not_set(registry: RoleRegistry) -> None:
+    """Без AliveListEvent composition-поля контекста — None (back-compat)."""
+    context = build_context(game_state=make_game_state(registry=registry), registry=registry)
+    assert context.role_count is None
+    assert context.total_players is None
+
+
 # --- to_llm_messages ------------------------------------------------------
 
 
@@ -435,6 +463,32 @@ def test_to_llm_messages_marks_known_role(
     messages = to_llm_messages(context, registry=registry, jinja_env=jinja_env)
 
     assert f"известная роль: {role.name_ru}" in messages[1]["content"]
+
+
+def test_to_llm_messages_includes_role_count(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """Рендер analyze содержит состав партии из GameState."""
+    state = make_game_state(registry=registry)
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=1,
+            payload=AliveListPayload(
+                alive_player_names=["Вася", "Петя"],
+                role_count={"Мафия": 5, "Мирный Житель": 5},
+                total_players=10,
+            ),
+        )
+    )
+    context = build_context(game_state=state, registry=registry)
+
+    messages = to_llm_messages(context, registry=registry, jinja_env=jinja_env)
+
+    user_content = messages[1]["content"]
+    assert "Мафия" in user_content
+    assert "5" in user_content
+    assert "{{" not in user_content
 
 
 def test_to_llm_messages_renders_predictions_and_hints(

@@ -8,6 +8,8 @@ from datetime import UTC, datetime
 import pytest
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     AnyEvent,
     DeathEvent,
     DeathPayload,
@@ -126,6 +128,29 @@ def test_phase_change_stores_phase_and_day_number(conn: sqlite3.Connection) -> N
     assert repository.list_events(game_id)[0].model_dump() == event.model_dump()
 
 
+def test_insert_and_list_alive_list_event(conn: sqlite3.Connection) -> None:
+    """AliveListEvent persists and round-trips with every payload field."""
+    game_id = create_game(conn)
+    repository = EventsRepository(conn)
+    event = AliveListEvent(
+        ts=timestamp(),
+        game_id=game_id,
+        payload=AliveListPayload(
+            alive_player_names=["A", "B"],
+            role_count={"Мафия": 5},
+            total_players=10,
+        ),
+    )
+    repository.insert_event(event)
+    restored = repository.list_events(game_id)
+    assert len(restored) == 1
+    assert isinstance(restored[0], AliveListEvent)
+    assert restored[0].model_dump() == event.model_dump()
+    assert restored[0].payload.alive_player_names == ["A", "B"]
+    assert restored[0].payload.role_count == {"Мафия": 5}
+    assert restored[0].payload.total_players == 10
+
+
 def test_count_by_kind_groups_event_rows(conn: sqlite3.Connection) -> None:
     """Counts are returned for each persisted event kind."""
     game_id = create_game(conn)
@@ -177,12 +202,12 @@ def test_event_insert_preserves_foreign_key_errors(conn: sqlite3.Connection) -> 
         EventsRepository(conn).insert_event(event)
 
 
-def test_unknown_persisted_kind_raises_config_error(conn: sqlite3.Connection) -> None:
+def test_list_events_unknown_kind_raises(conn: sqlite3.Connection) -> None:
     """Unknown row kinds are not silently decoded as domain events."""
     game_id = create_game(conn)
     conn.execute(
         "INSERT INTO events(game_id, kind, payload_json) VALUES (?, ?, ?)",
-        (game_id, "future_kind", "{}"),
+        (game_id, "unknown_bogus", "{}"),
     )
-    with pytest.raises(ConfigError, match="unknown event kind: future_kind"):
+    with pytest.raises(ConfigError, match="unknown event kind: unknown_bogus"):
         EventsRepository(conn).list_events(game_id)

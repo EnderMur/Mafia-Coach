@@ -125,7 +125,18 @@ class GameState:
             self._players[updated_player.player_id] = updated_player
         if isinstance(event, PhaseChangeEvent):
             self._phase = event.payload.to_phase
-            self._day_number = event.payload.day_number
+            if event.payload.day_number > 0:
+                # Явный номер дня из бота (например, "День 2").
+                self._day_number = event.payload.day_number
+            else:
+                # Бот не указал номер — инкрементим на каждый переход в новую
+                # фазу (DAY/NIGHT/VOTE). REGISTRATION/END — не инкрементят.
+                if event.payload.to_phase in (
+                    Phase.DAY,
+                    Phase.NIGHT,
+                    Phase.VOTE,
+                ):
+                    self._day_number += 1
         self._events.append(event)
 
     def player(self, player_id: int) -> Player:

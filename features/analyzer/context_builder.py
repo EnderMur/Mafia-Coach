@@ -98,6 +98,10 @@ class LLMContext(BaseModel):
     previous_predictions: list[PredictionSnapshot] = []
     truncated_messages: int = Field(ge=0)
     total_messages_seen: int = Field(ge=0)
+    #: Bot-reported role composition (name_ru → count), or None.
+    role_count: dict[str, int] | None = None
+    #: Bot-reported total alive headcount, or None.
+    total_players: int | None = None
 
 
 def build_context(
@@ -186,6 +190,8 @@ def build_context(
         previous_predictions=list(previous_predictions or []),
         truncated_messages=max(0, total_messages - max_messages),
         total_messages_seen=total_messages,
+        role_count=game_state.role_count,
+        total_players=game_state.total_players,
     )
 
 
@@ -239,6 +245,8 @@ def to_llm_messages(
         previous_predictions=[
             _prediction_payload(prediction) for prediction in context.previous_predictions
         ],
+        role_count=context.role_count,
+        total_players=context.total_players,
         club_notes_summary=club_notes_summary,
     )
 
