@@ -186,9 +186,22 @@ class GameAnalyzer:
             )
 
         reasoning_full = "".join(reasoning_buffer)
-        reasoning_truncated = _truncate_reasoning(reasoning_full, self._reasoning_max_chars)
+        reasoning_source = "stream"
+        if not reasoning_full and response.reasoning:
+            # Non-thinking models may return reasoning only in the JSON response.
+            reasoning_full = response.reasoning
+            reasoning_source = "json"
+
+        reasoning_truncated = reasoning_full[: self._reasoning_max_chars]
+        if len(reasoning_full) > self._reasoning_max_chars:
+            reasoning_truncated += f"\n[truncated, total {len(reasoning_full)} chars]"
         if reasoning_truncated:
-            logger.bind(channel="reasoning").info(reasoning_truncated)
+            logger.bind(channel="reasoning").info(
+                "reasoning ({}) [{}]: {}",
+                reasoning_source,
+                len(reasoning_full),
+                reasoning_truncated[:200],
+            )
 
         warnings: list[str] = []
         if persist:

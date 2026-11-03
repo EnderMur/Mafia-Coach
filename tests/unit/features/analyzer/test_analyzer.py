@@ -430,6 +430,91 @@ async def test_analyze_persistence_failure_adds_warning(
     assert connection.execute("SELECT count(*) FROM predictions_history").fetchone()[0] == 0
 
 
+async def test_non_thinking_uses_json_reasoning_as_fallback(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """A response without streamed chunks displays and counts JSON reasoning."""
+    _, repository = memory_database
+    response = make_response([]).model_copy(update={"reasoning": "My COT"})
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(response)
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+    captured = io.StringIO()
+    sink = logger.add(captured, level="INFO", format="{message}", filter=is_reasoning_log)
+    try:
+        result = await analyzer.analyze(make_game_state(registry), persist=False)
+    finally:
+        logger.remove(sink)
+
+    assert result.success
+    assert result.reasoning_text == "My COT"
+    assert result.reasoning_chars == len("My COT")
+    assert captured.getvalue().rstrip("\n") == "reasoning (json) [6]: My COT"
+
+
+async def test_thinking_uses_streaming_not_json(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """A nonempty reasoning stream always takes precedence over JSON."""
+    _, repository = memory_database
+    response = make_response([]).model_copy(update={"reasoning": "json COT"})
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(response, reasoning="stream COT")
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+    captured = io.StringIO()
+    sink = logger.add(captured, level="INFO", format="{message}", filter=is_reasoning_log)
+    try:
+        result = await analyzer.analyze(make_game_state(registry), persist=False)
+    finally:
+        logger.remove(sink)
+
+    assert result.success
+    assert result.reasoning_text == "stream COT"
+    assert result.reasoning_chars == len("stream COT")
+    assert captured.getvalue().rstrip("\n") == "reasoning (stream) [10]: stream COT"
+
+
+async def test_json_reasoning_fallback_is_truncated_and_counted(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """JSON fallback obeys the configured limit and retains the full character count."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]).model_copy(update={"reasoning": "z" * 500}))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, reasoning_max_chars=80)
+
+    result = await analyzer.analyze(make_game_state(registry), persist=False)
+
+    assert result.success
+    assert result.reasoning_text == "z" * 80 + "\n[truncated, total 500 chars]"
+    assert result.reasoning_chars == 500
+
+
+async def test_failed_analysis_preserves_partial_stream(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """An LLM failure has no JSON fallback but still preserves partial streamed text."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_error(LLMConnectionError("offline"))
+    fake_llm._next_reasoning = "p" * 150
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, reasoning_max_chars=100)
+
+    result = await analyzer.analyze(make_game_state(registry), persist=False)
+
+    assert not result.success
+    assert result.reasoning_chars == 150
+    assert result.reasoning_text == "p" * 100 + "\n[truncated, total 150]"
+
+
 async def test_analyze_reasoning_truncated(
     registry: RoleRegistry,
     jinja_env: jinja2.Environment,
@@ -460,11 +545,9 @@ async def test_analyze_reasoning_truncated(
         logger.remove(sink_id)
 
     logged_reasoning = captured.getvalue().rstrip("\n")
-    assert len(logged_reasoning) <= 1050
-    assert "[truncated, total 5000]" in logged_reasoning
+    assert logged_reasoning == f"reasoning (stream) [5000]: {'x' * 200}"
     assert result.reasoning_chars == 5000
-    assert result.reasoning_text.startswith("x" * 1000)
-    assert "[truncated, total 5000]" in result.reasoning_text
+    assert result.reasoning_text == "x" * 1000 + "\n[truncated, total 5000 chars]"
 
 
 async def test_analyze_reasoning_not_truncated_when_short(
@@ -472,7 +555,7 @@ async def test_analyze_reasoning_not_truncated_when_short(
     jinja_env: jinja2.Environment,
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
-    """Short reasoning is logged unchanged and its full length is reported."""
+    """Short reasoning is logged with its source and full length."""
     _, repository = memory_database
     reasoning = "r" * 100
     fake_llm = FakeLLMClient()
@@ -496,8 +579,9 @@ async def test_analyze_reasoning_not_truncated_when_short(
     finally:
         logger.remove(sink_id)
 
-    assert captured.getvalue().rstrip("\n") == reasoning
+    assert captured.getvalue().rstrip("\n") == f"reasoning (stream) [100]: {reasoning}"
     assert result.reasoning_chars == 100
+    assert result.reasoning_text == reasoning
 
 
 async def test_analyze_passes_hints_to_context(

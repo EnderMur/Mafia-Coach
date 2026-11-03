@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
+import httpx
 import jinja2
 import pytest
 
-from domain.events import MessageEvent, MessagePayload
+from domain.events import MessageEvent, MessagePayload, VoteEvent, VotePayload
 from domain.game_state import GameState
 from domain.roles import RoleRegistry, load_roles
 from features.analyzer.analyzer import GameAnalyzer
@@ -19,7 +22,7 @@ from infra.db.migrations.runner import apply_migrations
 from infra.db.repositories.games import GamesRepository
 from infra.db.repositories.players import PlayersRepository
 from infra.db.repositories.predictions import PredictionsRepository
-from infra.llm.client import LLMClient, ReasoningSink
+from infra.llm.client import LLMClient, LMStudioClient, ReasoningSink
 from infra.llm.schemas import AnalysisResponse, PlayerPrediction
 
 ROLES_PATH = Path(__file__).resolve().parents[2] / "configs" / "roles.yaml"
@@ -164,6 +167,87 @@ async def test_e2e_analyze_and_persist_in_memory(
     assert predictions[0]["player_id"] == 100
     assert predictions[0]["predicted_role"] == role_name
     assert predictions[0]["confidence"] == pytest.approx(0.75)
+
+
+async def test_e2e_non_thinking_sse_json_reasoning_and_honesty(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    in_memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Real SSE parsing, context enrichment, honesty filtering, and JSON fallback cooperate."""
+    connection, predictions_repository = in_memory_database
+    game_id, game_state = make_game(connection, registry)
+    game_state.apply(
+        VoteEvent(
+            ts=BASE_TS + timedelta(seconds=10),
+            game_id=game_id,
+            payload=VotePayload(
+                voter_id=101,
+                voter_name="Player 101",
+                target_id=100,
+                target_name="Player 100",
+            ),
+        )
+    )
+    role_name = registry.all_roles()[0].name_ru
+    raw_json = json.dumps(
+        {
+            "analysis": [
+                {
+                    "player_id": 100,
+                    "player_name": "Player 100",
+                    "suspected_role": role_name,
+                    "confidence": 0.8,
+                    "reasons": ["нет данных"],
+                },
+                {
+                    "player_id": 101,
+                    "player_name": "Player 101",
+                    "suspected_role": role_name,
+                    "confidence": 0.7,
+                    "reasons": ["голосовал против Player 100"],
+                },
+            ],
+            "game_read": "Партия продолжается.",
+            "reasoning": "My COT",
+        }
+    )
+    events = [
+        {"choices": [{"delta": {"content": raw_json[:60]}}]},
+        {"choices": [{"delta": {"content": raw_json[60:]}}]},
+    ]
+    sse = "".join(f"data: {json.dumps(event)}\n\n" for event in events) + "data: [DONE]\n\n"
+    sent_payloads: list[dict[str, Any]] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        sent_payloads.append(json.loads(request.content))
+        return httpx.Response(200, text=sse, headers={"content-type": "text/event-stream"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+        llm_client = LMStudioClient(base_url="http://model.test/v1", model="fake", client=transport)
+        analyzer = GameAnalyzer(
+            llm_client=llm_client,
+            predictions_repo=predictions_repository,
+            registry=registry,
+            jinja_env=jinja_env,
+            club_patterns="SYNTHETIC CLUB PATTERN",
+        )
+        try:
+            result = await analyzer.analyze(game_state)
+        finally:
+            await llm_client.aclose()
+
+    assert result.success and result.response is not None
+    assert result.reasoning_text == "My COT"
+    assert result.reasoning_chars == 6
+    assert [prediction.player_id for prediction in result.response.analysis] == [101]
+    assert [row["player_id"] for row in predictions_repository.list_predictions(game_id)] == [101]
+    assert sent_payloads[0]["stream"] is True
+    prompt = sent_payloads[0]["messages"][1]["content"]
+    assert "Player 101 → Player 100" in prompt
+    assert "Тонкости ролей" in prompt
+    assert "SYNTHETIC CLUB PATTERN" in prompt
+    assert "Честность predictions" in prompt
 
 
 async def test_e2e_analyze_persist_full_cycle_with_retro_stub(

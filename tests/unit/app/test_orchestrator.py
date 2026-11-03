@@ -807,6 +807,36 @@ async def test_orchestrator_sends_reasoning_after_scanner_flush(tmp_path: Path) 
     await orchestrator.shutdown()
 
 
+async def test_non_thinking_json_reasoning_reaches_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JSON fallback flows from the analyzer through a real scanner flush to the UI."""
+    result, _telegram, llm = await make_result(tmp_path)
+    response = AnalysisResponse(analysis=[], game_read="Партия продолжается.", reasoning="My COT")
+    analyze_stream = AsyncMock(return_value=response)
+    monkeypatch.setattr(llm, "analyze_stream", analyze_stream)
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        scanner = orchestrator._default_scanner(GAME_CHAT_ID)
+        result.game_state.apply(
+            PhaseChangeEvent(
+                ts=EVENT_TS,
+                game_id=result.game_state.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
+
+        await scanner._flush()
+
+        analyze_stream.assert_awaited_once()
+        assert ui.reasoning == [ReasoningMessage(text="My COT", truncated=False, total_chars=6)]
+    finally:
+        await orchestrator.shutdown()
+
+
 async def test_orchestrator_ui_disabled_is_noop(tmp_path: Path) -> None:
     """Explicit headless mode has no host and skips UI notifications."""
     result, _telegram, _llm = await make_result(tmp_path)
