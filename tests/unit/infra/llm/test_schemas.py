@@ -12,6 +12,7 @@ from infra.llm.schemas import (
     AlternativePrediction,
     AnalysisResponse,
     PlayerPrediction,
+    _has_strong_signal,
     validate_response,
 )
 
@@ -279,12 +280,20 @@ def test_context_validation_clamps_alternative_confidence() -> None:
 def test_context_validation_clamps_out_of_range_confidence() -> None:
     """Context parsing clamps numeric confidence and reports the adjustment."""
     result, warnings = validate_response(
-        response_json([valid_prediction(confidence=1.5, alternative=None)]),
+        response_json(
+            [
+                valid_prediction(
+                    confidence=1.5,
+                    alternative=None,
+                    reasons=["голосовал против раскрытого дона"],
+                )
+            ]
+        ),
         known_player_ids=frozenset({100}),
         role_names_ru=frozenset({"Role A", "Role B"}),
     )
     assert result.analysis[0].confidence == 1.0
-    assert any("clamped" in warning for warning in warnings)
+    assert any("clamped to [0, 1]" in warning for warning in warnings)
 
 
 def test_context_validation_normalizes_overfull_pair() -> None:
@@ -341,3 +350,43 @@ def test_keep_real_reasons(reasons: list[str]) -> None:
     assert len(result.analysis) == 1
     assert result.analysis[0].reasons == reasons
     assert warnings == []
+
+
+def test_clamp_confidence_without_strong_signal() -> None:
+    """B3. A confident role backed only by "молчит" is clamped to 0.5."""
+    result, warnings = validate_response(
+        response_json([valid_prediction(confidence=0.95, alternative=None, reasons=["молчит"])]),
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis[0].confidence == 0.5
+    assert any(
+        "clamped confidence for player 100" in warning and "no strong signal" in warning
+        for warning in warnings
+    )
+
+
+def test_keep_strong_signal_confidence() -> None:
+    """B3. A concrete argument keeps the model's confidence untouched."""
+    result, warnings = validate_response(
+        response_json(
+            [
+                valid_prediction(
+                    confidence=0.9,
+                    alternative=None,
+                    reasons=["голосовал против раскрытого дона трижды"],
+                )
+            ]
+        ),
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis[0].confidence == 0.9
+    assert warnings == []
+
+
+def test_has_strong_signal_classifies_reasons() -> None:
+    """B3. Only a detailed reason counts as evidence."""
+    assert not _has_strong_signal(["молчит"])
+    assert not _has_strong_signal(["молчит", "пассивен", "нет данных"])
+    assert _has_strong_signal(["голосовал против раскрытого дона"])
