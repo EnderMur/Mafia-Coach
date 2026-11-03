@@ -1,6 +1,6 @@
 # Mafia Coach
 
-**Статус:** experimental · **Код полностью сгенерирован ИИ** · **Telegram: только чтение**
+**Статус:** MVP (v1) — functional, ожидает dogfooding · **Код полностью сгенерирован ИИ** · **Telegram: только чтение**
 
 Локальный ассистент-тренер для мафии в Telegram. Читает чат как userbot (Telethon),
 распознаёт фазы и события и через локальную LLM (LM Studio) выдаёт вероятностную
@@ -11,7 +11,8 @@
 
 **Готовые файлы в комплекте:** `configs/settings.example.yaml`, `configs/roles.yaml`
 (21 роль), `scripts/make_session.py`, `pyproject.toml`, `requirements.txt`, `LICENSE`
-(MIT), `docs/llm_contract.md`, `.gitignore`.
+(MIT), `docs/architecture.md`, `docs/parser_spec.md`, `docs/llm_contract.md`,
+`scripts/audit_pii.py`, `.gitignore`.
 
 - Продуктовые требования: [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)
 - Правила разработки и контракты: [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md)
@@ -438,39 +439,52 @@ Get-Content logs\reasoning.log -Tail 50
 
 ### 7.1 Stats Window (обновляется по событиям через IPC)
 
+Формат — как в `features/ui/stats_window.py` (rich Table, заголовок
+«Stats — партия #N, `<phase>`, день D»). Пример на основе прогона C5 v13
+(партия #12), имена обезличены:
+
 ```
-┌──────────── Stats — партия #12, день 2, ночь 3 ────────────┐
-│ Игрок          Роль (наиболее вероятная)   Уверенность     │
-├────────────────────────────────────────────────────────────┤
-│ Вася           Мафия                        68%  ▲         │
-│ Петя           Мирный житель                81%            │
-│ Лена           Дон                          44%  ▲         │
-│ Игорь          Комиссар Каттани             37%  ▼         │
-│ Света          — (недостаточно данных)      —              │
-└────────────────────────────────────────────────────────────┘
- │ (Управление через основное окно: /attach /status /quit)   │
+┌──── Stats — партия #12, night, день 3 ─────┐
+│ Игрок      Роль             Уверенность   │
+├────────────────────────────────────────────┤
+│ player_1   Мафия            90%           │
+│ player_2   Мирный житель    85%           │
+│ player_3   Дон              75%           │
+│ player_4   —                —             │
+└────────────────────────────────────────────┘
 ```
+
+- Строки — предсказания из SQLite, отсортированные по уверенности (не более 20),
+  ниже порога `analysis.min_confidence_to_display` не показываются.
+- Игроки без предсказаний в реальном окне не отображаются: строка `player_4`
+  приведена только для наглядности («данных нет»).
+- Управление — через основное окно: `/attach`, `/status`, `/reset`, `/retro`, `/quit`.
 
 ### 7.2 Reasoning Window (стриминг, русский)
 
+Фактический вывод для non-thinking модели (канал `delta.reasoning_content` /
+`delta.reasoning` пуст — это ожидаемое поведение, не ошибка):
+
 ```
-[08:41:55] событие: роль раскрыта — «Игорь был Мафией»
-Проверяю: Вася голосовал против Игоря ещё до раскрытия роли — это аргумент в
-пользу мирной игры. Но в речи он дважды уходил от конкретики, когда его просили
-назвать проверку. Лена защищала Игоря в день 1 фразой «не трогайте новичка» —
-классический паттерн мафии, защищающей своего.
-Пока обновляю: Вася — подозрение на мафию 0.60, Лена — Дон 0.44.
-Оговорка: выборка мала (2 дня), уверенность низкая.
+(streaming reasoning unavailable — non-thinking model)
 ```
 
+У thinking-модели здесь идёт поток рассуждений на русском: он пишется в
+`logs/reasoning.log` (обрезка до `llm.reasoning_max_chars`) и передаётся в окно
+IPC-кадром до 4096 символов. Итоговый JSON (§7.3) собирается из `delta.content`
+и в окно рассуждений не попадает.
+
 ### 7.3 Ответ модели (JSON, тип `AnalysisResponse`)
+
+Схема не менялась (см. [§8](#8-контракт-с-llm-json) и `docs/llm_contract.md`);
+имена обезличены:
 
 ```json
 {
   "analysis": [
     {
       "player_id": 123456789,
-      "player_name": "Вася",
+      "player_name": "player_1",
       "suspected_role": "Мафия",
       "confidence": 0.68,
       "alternative": { "role": "Мирный житель", "confidence": 0.22 },
@@ -478,7 +492,7 @@ Get-Content logs\reasoning.log -Tail 50
     },
     {
       "player_id": 987654321,
-      "player_name": "Лена",
+      "player_name": "player_2",
       "suspected_role": "Дон",
       "confidence": 0.44,
       "alternative": { "role": "Мирный житель", "confidence": 0.31 },
@@ -490,9 +504,30 @@ Get-Content logs\reasoning.log -Tail 50
 }
 ```
 
-> ⚠️ Примеры выше — **иллюстрация ожидаемого формата**, а не проверенный вывод
-> программы: код сгенерирован ИИ и не проходил приёмочное тестирование.
-> Реальные числа зависят от модели и промптов.
+### 7.4 Реальная статистика
+
+После C5 v13 (game 12, 23 predictions):
+
+```
+retro: total=23 correct=3 wrong=11 unknown=9 (3/14 = 21% accuracy).
+```
+
+Низкая accuracy ожидаема для thinking-модели на 10 игроках в ранней партии.
+Для dogfooding нужна модель получше (`qwen2.5-7b-instruct`) и 20–30 игроков.
+
+Дополнительные наблюдения по прогонам C5 (строки из логов как есть):
+
+- v17: `flush ok: 5–11 predictions, 15–30s` — один цикл анализа занимает
+  15–30 с, число предсказаний за цикл — 5–11.
+- v20: `game 4: total=14, positive=11, negative=3, final_role=7`.
+
+`unknown` в retro — предсказания, для которых не нашлось `final_role`
+(игрок не попал в `game_players` или роль не распознана); механика —
+`docs/architecture.md` §3.
+
+> ⚠️ Примеры §7.1–§7.3 основаны на реальных прогонах C5 и обезличены
+> (`player_N`, без реальных имён и id). Числа зависят от модели и промптов;
+> код сгенерирован ИИ и не проходил приёмочное тестирование.
 
 ---
 
@@ -583,9 +618,12 @@ mafia-coach/
 ├── rules/Mafia_rules.txt    официальные правила (read-only)
 ├── scripts/
 │   ├── make_session.py         одноразовое создание Telethon-сессии (читает settings.yaml)
+│   ├── dump_chat.py            read-only выгрузка истории чата в data/dumps/
+│   ├── make_fixture.py         анонимизированный тестовый fixture из дампа
 │   ├── export_dataset.py       выгрузка JSONL для fine-tune
+│   ├── audit_pii.py            аудит git history/index/fixtures на PII перед Public
 │   └── run_windows.py          запуск двух консолей вручную
-├── data/                   sessions/, db/, datasets/ — всё в .gitignore
+├── data/                   sessions/, db/, datasets/, dumps/, tmp/ — всё в .gitignore
 ├── logs/                   app.log, reasoning.log — в .gitignore
 ├── tests/                  unit/, integration/, fixtures/
 ├── docs/                   architecture.md, parser_spec.md, llm_contract.md
@@ -659,7 +697,8 @@ mafia-coach/
   с реальным поведением.
 - Поведение кода **не гарантировано**: возможны ошибки в деталях Telethon, LM Studio,
   SQLite, `asyncio` и в граничных случаях парсера.
-- Примеры вывода в §7 иллюстративные, а не снятые с работающей программы.
+- Примеры вывода в §7 основаны на реальных прогонах C5, но обезличены
+  (`player_N`); числа зависят от модели и промптов.
 - `PROJECT_CONTEXT.md` и `AI_INSTRUCTIONS.md` тоже созданы при участии ИИ и содержат
   допущения (помечены как «уточнить»/«предположение»). Источник истины по
   требованиям — подтверждение владельца.
@@ -691,6 +730,27 @@ mafia-coach/
   партий и тренировка. Публикация подсказок живым игрокам во время партии
   нарушает правила клуба.
 
+### Перед переходом Private → Public
+
+Репозиторий сейчас **Private**; перед публикацией пройти чек-лист (шаг 12b):
+
+1. `python scripts/audit_pii.py` — exit 0 (clean). Скрипт read-only: проверяет
+   git history (все ветки), текущий index и `tests/fixtures/` на реальные имена
+   из `data/dumps/`. Если exit 1 — найти и удалить: `git filter-repo` или новый
+   repo (одного удаления из последнего коммита недостаточно — PII остаётся
+   в истории).
+2. `git log --all --oneline | Select-String "leak|pii|secret"` — пусто
+   (PowerShell; в bash: `git log --all --oneline | grep -iE "leak|pii|secret"`).
+3. `tests/fixtures/telegram/real_game.json` — синтетический, без реальных имён
+   (уже так с 7b).
+4. `README.md` §7 — примеры иллюстративные/обезличенные (`player_1`, не реальные
+   имена).
+5. `configs/settings.example.yaml` — `api_id: null`, `api_hash: null`,
+   `chat_id: null` (уже так).
+6. `LICENSE` — MIT, `Copyright (c) 2026 EnderMur` (уже).
+7. GitHub repo Settings → Danger Zone → Change visibility → Public.
+
 ---
 
 _Дата составления: 2026-10-31_
+_Обновлено: 2026-11-03 (шаг 12b: документация MVP + Private→Public checklist)_
