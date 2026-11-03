@@ -28,7 +28,11 @@
 
 1. END_GAME — «Игра окончена!» + Победители/Другие пользователи/Игра длилась.
 2. LAST_WORDS — «Кто-то из жителей слышал, как X кричал перед смертью:…».
-3. ALIVE_LIST — «Живые игроки:» + «N. name» + «Из них:» + «Всего: N».
+3. ALIVE_LIST — «Живые игроки:» / «Живые:» + «N. name» + «Из них:» + «Всего: N».
+   Роли из «Из них:» приводятся к каноническим `name_ru` из `roles.yaml`
+   (регистр и пробелы не важны); счётчики summed, сумма слотов и число разных
+   ролей считает `context_builder`, а не парсер. Поддерживаются `N.` / `N)` /
+   `N:` / `N\.` и «Живые: user_1, user_2» в одну строку.
 4. REGISTRATION — «Регистрация открыта», «набор в игру».
 5. GAME_START — «Город ветров начинает игру».
 6. DEATH — «Кто-то был убит», «Сегодня повешен X».
@@ -80,7 +84,7 @@
 | VOTE | votes [(voter, target)], voter_name, target_name | VoteEvent × N |
 | LAST_WORDS | player_name, last_words | MessageEvent |
 | GIFT | player_name, target_name | [] |
-| ALIVE_LIST | alive_player_names, role_count, total_players | AliveListEvent |
+| ALIVE_LIST | alive_player_names, role_count (канонические `name_ru`), total_players | AliveListEvent |
 | PROTECTION_USED | — | [] |
 | VOTE_ABSTAIN | player_name | [] |
 | SYSTEM | — | [] |
@@ -134,8 +138,15 @@
 - Multi-line vote: несколько пар `X голосовал за Y`.
 - Multi-line `Из них:` (бот переносит строку) — переносы схлопываются, счётчики
   «Роль - N» суммируются.
-- Имена с декорациями: «🇷🇺ℹ | name | 💋» → первый осмысленный сегмент;
-  максимум 3 токена имени, stop-слова («и», «был», «с», …) обрезают захват.
+- Имена с декорациями: «🇷🇺ℹ | name | 💋» → сегмент с максимумом «настоящих»
+  букв/цифр (модификаторы вроде `ᵗᵏ` в клубном теге не считаются); максимум
+  3 токена имени, stop-слова («и», «был», «с», …) обрезают захват.
+- В `ALIVE_LIST` имена сохраняются как написал бот (`"| Дмитрий"`,
+  `"🕷️ᵗᵏ| Shinichiro🌝🖤"`); сопоставление с Telegram-никами делает
+  `domain/names.py::name_match_keys` (NFKC, снятие маркеров/декораций,
+  casefold). Это же сравнение используется в `GameState.apply`, резолвере
+  событий и whitelist Stats Window. Placeholder-id намеренно остаются в
+  `LLMContext.players`, чтобы все живые получили слот роли.
 - «Кто-то», «убит», «повешен» и прочие служебные слова не считаются именами
   игроков (`_NOISE_NAME_TOKENS`, `_NON_ROLE_WORDS`).
 

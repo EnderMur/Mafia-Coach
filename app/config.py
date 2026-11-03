@@ -55,7 +55,11 @@ class LLMSection(BaseModel):
     stream_reasoning: bool = True
     context_window_messages: int = Field(ge=1, default=200)
     summarize_after_messages: int = Field(ge=1, default=300)
-    trigger_mode: Literal["every_message", "queue", "batch_debounce"] = "queue"
+    #: ``batch_debounce`` is the live-game default: phase events and the bot's
+    #: alive-list snapshot flush at once, ordinary chat is debounced. ``queue``
+    #: only analyses after ``batch_max_messages`` events (or a backfill) and
+    #: often looks like the model "ignores" the bot message.
+    trigger_mode: Literal["every_message", "queue", "batch_debounce"] = "batch_debounce"
     batch_debounce_sec: float = Field(ge=0.0, default=3.0)
     batch_max_messages: int = Field(ge=1, default=10)
     reasoning_max_chars: int = Field(ge=100, default=4096)

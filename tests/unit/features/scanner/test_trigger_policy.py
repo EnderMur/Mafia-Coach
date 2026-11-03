@@ -13,6 +13,8 @@ import pytest
 from pydantic import ValidationError
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     AnyEvent,
     DeathEvent,
     DeathPayload,
@@ -82,6 +84,19 @@ def _role_reveal_event() -> RoleRevealEvent:
     )
 
 
+def _alive_list_event() -> AliveListEvent:
+    """A bot snapshot with alive nicknames and role composition."""
+    return AliveListEvent(
+        ts=TS,
+        game_id=GAME_ID,
+        payload=AliveListPayload(
+            alive_player_names=["Вася", "Петя"],
+            role_count={"Мафия": 1, "Мирный житель": 1},
+            total_players=2,
+        ),
+    )
+
+
 def _policy(mode: TriggerMode, **kwargs: Any) -> TriggerPolicy:
     """Build a policy for one mode with optional field overrides."""
     return TriggerPolicy(mode=mode, **kwargs)
@@ -115,6 +130,7 @@ def test_queue_never_forces() -> None:
     assert policy.should_force_now(_phase_event()) is False
     assert policy.should_force_now(_vote_event()) is False
     assert policy.should_force_now(_role_reveal_event()) is False
+    assert policy.should_force_now(_alive_list_event()) is False
     assert policy.should_force_now(_msg_event()) is False
 
 
@@ -143,17 +159,25 @@ def test_batch_debounce_forces_on_role_reveal() -> None:
     assert _policy(TriggerMode.BATCH_DEBOUNCE).should_force_now(_role_reveal_event()) is True
 
 
+def test_batch_debounce_forces_on_alive_list() -> None:
+    """8a. The bot's alive/role snapshot must not wait for the debounce timer."""
+    policy = _policy(TriggerMode.BATCH_DEBOUNCE)
+    assert policy.should_force_now(_alive_list_event()) is True
+    assert _policy(TriggerMode.QUEUE).should_force_now(_alive_list_event()) is False
+
+
 def test_force_flush_covers_all_event_kinds() -> None:
     """8b. Every non-message kind forces a flush; a message never does."""
     policy = _policy(TriggerMode.BATCH_DEBOUNCE)
-    phase_events: list[AnyEvent] = [
+    game_state_events: list[AnyEvent] = [
+        _alive_list_event(),
         _death_event(),
         _vote_event(),
         _phase_event(),
         _role_reveal_event(),
     ]
 
-    assert all(policy.should_force_now(event) is True for event in phase_events)
+    assert all(policy.should_force_now(event) is True for event in game_state_events)
     assert policy.should_force_now(_msg_event()) is False
 
 

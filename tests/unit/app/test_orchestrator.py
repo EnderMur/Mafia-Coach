@@ -1423,3 +1423,24 @@ async def test_send_stats_whitelist_matches_username(tmp_path: Path) -> None:
         assert len(ui.stats[-1].rows) == 2
     finally:
         await orchestrator.shutdown()
+
+
+async def test_send_stats_shows_whitelisted_placeholder(tmp_path: Path) -> None:
+    """Silent players from ALIVE_LIST get a row once the bot confirms them."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    game_state = result.game_state
+    game_state.register_player(PLAYER_ID, "A")
+    game_state.apply(
+        AliveListEvent(
+            ts=EVENT_TS,
+            game_id=game_state.game_id,
+            payload=AliveListPayload(alive_player_names=["A", "| user_4"], total_players=2),
+        )
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert {row.player_name for row in ui.stats[-1].rows} == {"A", "| user_4"}
+    finally:
+        await orchestrator.shutdown()

@@ -680,3 +680,23 @@ def test_last_alive_list_names_reset_on_new_game(game: GameState) -> None:
     )
 
     assert game.last_alive_list_names == frozenset()
+
+
+def test_alive_list_matches_decorated_nicknames(game: GameState) -> None:
+    """Club markers/emoji must not create duplicate placeholders or kill a player."""
+    game.register_player(1, "Дмитрий")
+    game.register_player(2, "Shinichiro")
+    game.register_player(3, "Петя")
+
+    game.apply(
+        make_alive_list(
+            ["| Дмитрий", "🕷️ᵗᵏ| Shinichiro🌝🖤"],
+            total_players=2,
+        )
+    )
+
+    assert len(game.players()) == 3
+    assert game.player(1).alive is True
+    assert game.player(2).alive is True
+    assert game.player(3).alive is False
+    assert game.last_alive_list_names == frozenset({"| Дмитрий", "🕷️ᵗᵏ| Shinichiro🌝🖤"})

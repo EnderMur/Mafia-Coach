@@ -55,6 +55,7 @@ from domain.events import (
     VotePayload,
 )
 from domain.exceptions import UnknownRoleError
+from domain.names import name_match_keys
 from domain.phases import Phase
 from domain.roles import Role, RoleRegistry
 from features.parser.bot_messages import (
@@ -169,6 +170,14 @@ def _resolve_player(
             player_id = name_to_id.get(stripped)
             if player_id is not None:
                 return player_id, stripped
+        # Bot nicknames often carry club markers/emoji that Telegram's
+        # first_name does not have ("| Дмитрий" → "Дмитрий"). Fall back to
+        # normalised keys before giving up on a death/vote/reveal.
+        keys = name_match_keys(name)
+        if keys:
+            for known_name, known_id in name_to_id.items():
+                if keys & name_match_keys(known_name):
+                    return known_id, known_name
     return player_id, name
 
 

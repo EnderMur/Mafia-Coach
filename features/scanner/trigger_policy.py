@@ -9,8 +9,8 @@ Modes (``configs/settings.yaml`` → ``llm.trigger_mode``)
 -------------------------------------------------------
 ``every_message``    — analyze on every single event.
 ``queue``            — the orchestrator drains the queue manually.
-``batch_debounce``   — accumulate messages, but phase events (deaths,
-                       phase changes, votes, role reveals) flush at once.
+``batch_debounce``   — accumulate messages, but phase events and the bot's
+                       alive-list/role-composition snapshot flush at once.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ class TriggerMode(str, Enum):
 #: ``batch_debounce`` mode (AI_INSTRUCTIONS.md §13.1 п.6).
 _FORCE_FLUSH_KINDS: Final[frozenset[str]] = frozenset(
     {
+        "alive_list",
         "death",
         "phase_change",
         "vote",
@@ -64,9 +65,9 @@ class TriggerPolicy(BaseModel):
             - ``every_message`` — ``True`` for every event;
             - ``queue`` — ``False`` always (the orchestrator manages the
               queue manually);
-            - ``batch_debounce`` — ``True`` only for phase events
-              (``death``, ``phase_change``, ``vote``, ``role_reveal``) and
-              ``False`` for plain messages.
+            - ``batch_debounce`` — ``True`` only for game-state events
+              (``alive_list``, ``death``, ``phase_change``, ``vote``,
+              ``role_reveal``) and ``False`` for plain messages.
         """
         if self.mode is TriggerMode.EVERY_MESSAGE:
             return True

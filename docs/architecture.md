@@ -91,11 +91,18 @@ debounce-таймером и маппингом `name_to_id`. Оркестрат
    REGISTRATION/END? skip (буфер очищается). Иначе `GameAnalyzer.analyze(persist=True)`.
 5. `GameAnalyzer.analyze`:
    - `build_context` (8a): `LLMContext` (players, recent_messages, recent_deaths,
-     role_count, total_players). Placeholder-игроки (`player_id <= 0`) в контекст
-     не попадают.
+     role_count, total_players, role_slots, role_kinds, alive_list_names,
+     placeholder_player_names, previous_predictions). `role_count` приводится к
+     каноническим `name_ru`; слоты и число разных ролей считаются явно. В
+     `players` попадают ВСЕ игроки последнего ALIVE_LIST, включая placeholder'ы
+     (`player_id <= 0`): иначе 16 живых не могут получить 16 ролевых слотов.
    - `compute_hints` (8a): правила клуба (`domain/rules.py`), сейчас один hint —
      `early_lynch_no_argument` (weight −0.5).
-   - `to_llm_messages`: `system.jinja` + `analyze.jinja`.
+   - `to_llm_messages`: `system.jinja` + `analyze.jinja` (явные квоты, полное
+     распределение, блок «Прошлые предсказания (якорь)»).
+   - `GameAnalyzer._postprocess_response`: держит прежнюю роль при смене без
+     нового аргумента и `_enforce_composition` дополняет/исправляет ответ до
+     точного числа слотов; обе коррекции попадают в `AnalysisResult.warnings`.
    - `LLMClient.analyze_stream`: общий бюджет HTTP-запросов `max_retries ≤ 3`;
      `_TransientEOF` — один повтор с увеличенным `max_tokens`; при отказе сервера
      от `json_schema` — fallback на `response_format=text` в том же бюджете.
@@ -145,13 +152,15 @@ debounce-таймером и маппингом `name_to_id`. Оркестрат
 
 ## 6. Триггеры
 
-- `batch_debounce` — основной режим для живой игры: flush через
-  `batch_debounce_sec` после последнего сообщения. Phase events (death,
-  phase_change, vote, role_reveal) — force flush немедленно.
+- `batch_debounce` — основной режим для живой игры и значение по умолчанию в
+  `configs/settings.example.yaml` и `app/config.py`: flush через
+  `batch_debounce_sec` после последнего сообщения. Game-state events
+  (`alive_list`, `death`, `phase_change`, `vote`, `role_reveal`) — force flush
+  немедленно. ALIVE_LIST в фазе `REGISTRATION` не отбрасывается.
 - `every_message`: flush каждое сообщение.
 - `queue`: flush по размеру буфера (`batch_max_messages`; MVP-поведение,
-  настоящий queue-worker — v2). Это значение по умолчанию в
-  `configs/settings.example.yaml` и `app/config.py`.
+  настоящий queue-worker — v2). В этом режиме одно сообщение бота может не
+  вызвать анализ сразу.
 
 ## 7. Жизненный цикл партии (game_id)
 

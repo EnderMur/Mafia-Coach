@@ -315,6 +315,10 @@ async def test_e2e_backfill_full_cycle(
     assert llm_client.calls == 1
     assert scanner.buffer_size == 0
     predictions = predictions_repo.list_predictions(game_id)
-    assert len(predictions) == 1
-    assert predictions[0]["player_id"] == VASYA
-    assert predictions[0]["predicted_role"] == "Мафия"
+    # The bot reported exactly 3 slots (Мафия ×1, Мирный житель ×2), so the
+    # analyzer fills the two players the fake LLM skipped.
+    assert len(predictions) == 3
+    roles_by_player = {int(row["player_id"]): str(row["predicted_role"]) for row in predictions}
+    assert roles_by_player[VASYA] == "Мафия"
+    assert roles_by_player[PETYA] == "Мирный житель"
+    assert roles_by_player[LENA] == "Мирный житель"

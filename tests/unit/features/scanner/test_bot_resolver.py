@@ -836,3 +836,23 @@ def test_strip_role_prefix_strips_parens() -> None:
 def test_strip_role_prefix_plain_name_unchanged() -> None:
     assert _strip_role_prefix("Вася", REGISTRY) == "Вася"
     assert _strip_role_prefix("Вася Петров", REGISTRY) == "Вася Петров"
+
+
+def test_death_resolves_decorated_nickname() -> None:
+    """A club-marker prefix in a bot death message still finds the Telegram name."""
+    parse = _parse(
+        BotMessageKind.DEATH,
+        player_name="| Дмитрий",
+        death_cause="lynch",
+    )
+
+    events = _resolve(
+        parse,
+        name_to_id={"Дмитрий": 1, "Shinichiro": 2},
+        current_phase=Phase.DAY,
+    )
+
+    assert len(events) == 1
+    assert isinstance(events[0], DeathEvent)
+    assert events[0].payload.victim_id == 1
+    assert events[0].payload.victim_name == "Дмитрий"

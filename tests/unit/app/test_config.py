@@ -105,3 +105,13 @@ def test_nested_invalid_type_raises_config_error(tmp_path: Path) -> None:
 
     with pytest.raises(ConfigError, match="chat_id"):
         load_config(config_path)
+
+
+def test_config_defaults_to_batch_debounce(tmp_path: Path) -> None:
+    """Omitting trigger_mode must not silently restore the 'queue' MVP behaviour."""
+    config_path = create_settings_file(tmp_path)
+    settings = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del settings["llm"]["trigger_mode"]
+    config_path.write_text(yaml.safe_dump(settings, allow_unicode=True), encoding="utf-8")
+
+    assert load_config(config_path).llm.trigger_mode == "batch_debounce"

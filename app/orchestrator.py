@@ -15,6 +15,7 @@ from app.bootstrap import BootstrapResult, shutdown_result
 from domain.events import AnyEvent, EndGameEvent
 from domain.exceptions import ConfigError
 from domain.game_state import GameState
+from domain.names import names_match
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
 from features.ui.window_host import WindowHost
@@ -603,12 +604,18 @@ class Orchestrator:
             all_players = game_state.players()
             rows: list[StatsRow] = []
             for player in all_players:
-                if player.player_id <= 0:  # placeholder
+                whitelisted = not whitelist or (
+                    any(names_match(player.display_name, listed) for listed in whitelist)
+                    or (
+                        player.username is not None
+                        and any(names_match(player.username, listed) for listed in whitelist)
+                    )
+                )
+                # Placeholders are shown only after an ALIVE_LIST confirms the
+                # nickname: before that they are just unmatched bot noise.
+                if player.player_id <= 0 and not (whitelist and whitelisted):
                     continue
-                if whitelist and not (
-                    player.display_name in whitelist
-                    or (player.username is not None and player.username in whitelist)
-                ):
+                if not whitelisted:
                     continue
                 if not show_dead and not player.alive:
                     continue

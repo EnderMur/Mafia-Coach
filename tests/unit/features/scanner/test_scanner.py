@@ -1723,3 +1723,23 @@ async def test_alive_list_calls_on_player_registered(game_state, registry):
     await scanner._on_event(bot_event("Живые игроки:\n1. Never Wrote\nВсего: 1"))
     callback.assert_awaited_once_with(_placeholder_player_id("Never Wrote"), "Never Wrote")
     assert scanner._name_to_id["Never Wrote"] == _placeholder_player_id("Never Wrote")
+
+
+async def test_flush_allows_alive_list_in_registration_phase(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    """A bot snapshot during REGISTRATION is a full game state, not noise."""
+    scanner, analyzer, _ = build_scanner(game_state=game_state, registry=registry)
+    await scanner._on_event(
+        bot_event(
+            "Живые игроки:\n1. user_1\n2. user_2\n\n"
+            "Из них: 🤵🏼 Мафия - 1, 👨🏼 Мирный житель - 1\n\nВсего: 2"
+        )
+    )
+    assert scanner.buffer_size > 0
+    assert game_state.current_phase() is Phase.REGISTRATION
+
+    await scanner._flush()
+
+    assert analyzer.calls == 1
+    assert scanner.buffer_size == 0

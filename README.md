@@ -148,7 +148,7 @@ llm:
   reasoning_max_chars: 1024
   context_window_messages: 100                # сколько последних сообщений в промпте
   summarize_after_messages: 300               # после этого старая часть суммаризуется
-  trigger_mode: "queue"              # Режимы: every_message | queue | batch_debounce
+  trigger_mode: "batch_debounce"     # Режимы: every_message | queue | batch_debounce; для живой игры — batch_debounce
   batch_debounce_sec: 3                       # задержка накопления пачки сообщений для batch_debounce
   batch_max_messages: 10                      # макс. число сообщений в пачке перед отправкой в LLM
 
@@ -677,6 +677,11 @@ mafia-coach/
 | Stats Window пуст, Reasoning Window работает | Партия не распознана (нет регистрации/фаз) | Проверить `chat_id`; посмотреть `parser_spec.md`; включить `logging.level: DEBUG` |
 | В таблице нет ролей, только `—` | Модель вернула пустой `analysis` или `min_confidence_to_display` слишком высок | Понизить порог до 0.05; проверить длину контекста |
 | Роли не размечаются после партии (`final_role` пуст) | `bot_aliases` не совпали с текстом бота | Дополнить `bot_aliases` в `roles.yaml`; посмотреть реальные сообщения бота |
+| Модель «не видит» «Живые игроки… Из них… Всего: N» | Сырой текст бота не попадал в `recent_messages`, а состав выводился как Python-`dict` без суммы слотов | Промпт теперь показывает «Всего ролевых слотов», «Разных ролей», список «Роль — N», живых от бота и требует полного распределения |
+| Модель называет лишние роли или «Мирный житель» всем подряд | Была захардкожена фраза «Мирный житель — 1 из 30 игроков» и не было квот | Состав канонизирован до `name_ru`, квоты проверяются после ответа, ложная фраза убрана |
+| В таблице/ответе меньше игроков, чем «Всего: N» | Placeholder-игроки (`player_id <= 0`) ранее не попадали в LLM-контекст | Теперь все живые из ALIVE_LIST получают валидный ID в контексте (в т.ч. синтетический) и отображаются в Stats Window |
+| Анализ не запускается после сообщения бота | `queue` не вызывает LLM на каждое событие; `REGISTRATION` раньше всегда пропускал flush | По умолчанию `batch_debounce`, `alive_list` — принудительный триггер, snapshot в `REGISTRATION` разрешён |
+| Модель сначала назвала «Мирный житель», потом заменила на «Мафию» без причины | Прошлые предсказания не передавались в промпт и молча перезаписывались `upsert_prediction` | Последние предсказания читаются из БД, показываются якорем; смена роли без нового аргумента откатывается к прежней роли с warning |
 | `ModuleNotFoundError: telethon` | Не активировано venv / не установлены зависимости | `.\.venv\Scripts\Activate.ps1`; `pip install -e ".[dev]"` |
 | `py` не найден | Нет Python Launcher | Использовать `python -m venv .venv` или установить Python из python.org с галочкой *py launcher* |
 | `Activate.ps1 cannot be loaded` | Политика выполнения PowerShell | `Set-ExecutionPolicy -Scope Process RemoteSigned` |
