@@ -18,6 +18,8 @@ if TYPE_CHECKING:
     from loguru import Record
 
 from domain.events import (
+    AliveListEvent,
+    AliveListPayload,
     DeathEvent,
     DeathPayload,
     PhaseChangeEvent,
@@ -796,8 +798,8 @@ async def test_analyze_persist_runs_in_thread(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Both writes are called via asyncio.to_thread,
-    not blocking the event loop."""
+    """All repository calls are offloaded via asyncio.to_thread,
+    not blocking the event loop (including the previous-predictions read)."""
     import asyncio as _asyncio
 
     connection, repository = memory_database
@@ -836,7 +838,7 @@ async def test_analyze_persist_runs_in_thread(
         persist=True,
     )
     assert result.success
-    assert calls == ["upsert_prediction", "insert_history"]
+    assert calls == ["list_predictions", "upsert_prediction", "insert_history"]
 
 
 async def test_analyzer_uses_upsert_and_history(
@@ -890,3 +892,106 @@ async def test_history_failure_is_warning(
     )
     assert result.success and result.warnings == ("history_failed: history unavailable",)
     assert len(repository.list_predictions(game_id)) == 1
+
+
+# ===================================================================
+# Role continuity + exact bot composition
+# ===================================================================
+
+
+async def test_analyzer_preserves_previous_role_without_new_evidence(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """'Мирный житель' must not silently become 'Мафия' on the next flush."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    fake_llm = FakeLLMClient()
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
+
+    fake_llm.set_response(
+        make_response(
+            [
+                make_prediction(
+                    100,
+                    "Мирный житель",
+                    confidence=0.42,
+                    reasons=["распределение состава бота: слот «Мирный житель»"],
+                )
+            ]
+        )
+    )
+    first = await analyzer.analyze(
+        make_game_state(registry, game_id=game_id, player_ids=(100,)), persist=True
+    )
+    assert first.success
+    assert len(repository.list_predictions(game_id)) == 1
+
+    fake_llm.set_response(
+        make_response([make_prediction(100, "Мафия", confidence=0.8, reasons=["молчит"])])
+    )
+    second = await analyzer.analyze(
+        make_game_state(registry, game_id=game_id, player_ids=(100,)), persist=True
+    )
+
+    assert second.success and second.response is not None
+    kept = second.response.analysis[0]
+    assert kept.suspected_role == "Мирный житель"
+    assert kept.confidence <= 0.5
+    assert any("role_change_without_reason" in warning for warning in second.warnings)
+    # The second prompt explicitly carried the earlier decision.
+    second_prompt = fake_llm.calls[1]["messages"][1]["content"]
+    assert "Прошлые предсказания (якорь)" in second_prompt
+    assert "ID 100: Мирный житель" in second_prompt
+    assert "НЕ меняй роль игрока без НОВОГО аргумента" in second_prompt
+    assert repository.list_predictions(game_id)[0]["predicted_role"] == "Мирный житель"
+
+
+async def test_analyzer_fills_full_composition_and_caps_quotas(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """3 bot slots → exactly 3 predictions; 'Мафия' is used only once."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100, 101, 102])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100, 101, 102))
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=game_id,
+            payload=AliveListPayload(
+                alive_player_names=["Player 100", "Player 101", "Player 102"],
+                role_count={"Мафия": 1, "Мирный Житель": 2},
+                total_players=3,
+            ),
+        )
+    )
+
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(
+        make_response(
+            [
+                make_prediction(100, "Мафия", reasons=["активно давит в первый день"]),
+                make_prediction(101, "Мафия", reasons=["тоже подозрительно молчит"]),
+            ]
+        )
+    )
+    result = await make_analyzer(fake_llm, repository, registry, jinja_env).analyze(
+        state, persist=True
+    )
+
+    assert result.success and result.response is not None
+    roles = {p.player_id: p.suspected_role for p in result.response.analysis}
+    assert len(roles) == 3
+    assert roles[100] == "Мафия"
+    assert roles[101] == "Мирный житель"
+    assert roles[102] == "Мирный житель"
+    assert any("role_quota_exceeded" in warning for warning in result.warnings)
+    assert sum("composition_slot_filled" in warning for warning in result.warnings) == 2
+    persisted = {
+        int(row["player_id"]): str(row["predicted_role"])
+        for row in repository.list_predictions(game_id)
+    }
+    assert persisted == roles

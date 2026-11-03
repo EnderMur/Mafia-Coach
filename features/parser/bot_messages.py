@@ -29,6 +29,7 @@ Bot templates overlap heavily, so the order of the branches in
 from __future__ import annotations
 
 import re
+import unicodedata
 from enum import Enum
 from typing import Final
 
@@ -401,16 +402,20 @@ _RE_GAME_START: Final[re.Pattern[str]] = re.compile(
 
 # --- alive list -----------------------------------------------------------
 
+#: ``"Живые игроки:"`` / ``"Живые:"`` / ``"Живые игроки (16):"`` with optional
+#: leading decoration (emoji, quotes, MarkdownV2 escapes). The bot sometimes
+#: prefixes the heading with a status emoji, so leading non-word characters are
+#: tolerated.
 _RE_ALIVE_LIST: Final[re.Pattern[str]] = re.compile(
-    r"^\s*Живые(?:\s+игроки)?\s*(?:\([^)]*\))?\s*:",
-    re.IGNORECASE,
+    r"^\s*[\W_]*?Живые(?:\s+игроки)?\s*(?:\([^)]*\))?\s*:",
+    re.IGNORECASE | re.UNICODE,
 )
 
 #: One ``"N. display_name"`` line of the "Живые игроки:" block. Names may
 #: contain Cyrillic letters, emoji and spaces — everything after ``N. `` is
-#: kept verbatim.
+#: kept verbatim. ``N)`` / ``N:`` and MarkdownV2-escaped ``N\.`` are accepted.
 _ALIVE_LINE_RE: Final[re.Pattern[str]] = re.compile(
-    r"^\s*\d+\.\s+(.+?)\s*$",
+    r"^\s*\d+\\?\s*[.):]\s*(.+?)\s*$",
     re.MULTILINE,
 )
 
@@ -583,19 +588,40 @@ def _strip_leading_emoji(text: str) -> str:
     return result
 
 
-def _strip_marker_prefix(text: str) -> str:
-    """Drop chat-marker prefixes like ``"🇷🇺ℹ | name | 💋"``.
+def _name_segment_score(text: str) -> int:
+    """Count real name characters in a ``|``-separated club-marker segment.
 
-    Returns the first ``|``-separated segment that contains a word
-    character; falls back to the original text when there is no ``|``.
+    Modifier letters (``ᵗ``, ``ᵏ``), emoji and symbols do not count: a tag like
+    ``"🕷️ᵗᵏ"`` must never win over the actual nickname ``"Shinichiro🌝🖤"``.
+    NFKC is deliberately *not* applied here — ``ℹ`` is a symbol in the raw
+    string and must not become a letter ``i``.
+    """
+    score = 0
+    for char in text:
+        category = unicodedata.category(char)
+        if category.startswith("N") or category in {"Lu", "Ll", "Lt", "Lo"}:
+            score += 1
+    return score
+
+
+def _strip_marker_prefix(text: str) -> str:
+    r"""Drop chat-marker prefixes like ``"🇷🇺ℹ | name | 💋"``.
+
+    Returns the ``|``-separated segment with the most real name characters,
+    not simply the first one containing ``\w``: club tags often use modifier
+    letters (``"🕷️ᵗᵏ| Shinichiro🌝🖤"``) that would otherwise be mistaken for
+    the nickname. Falls back to the original text when there is no ``|``.
     """
     if "|" not in text:
         return text
+    best = ""
+    best_score = 0
     for segment in (part.strip() for part in text.split("|")):
         cleaned = _strip_leading_emoji(segment).strip()
-        if cleaned and re.search(r"\w", cleaned):
-            return cleaned
-    return text
+        score = _name_segment_score(cleaned)
+        if score > best_score:
+            best, best_score = cleaned, score
+    return best or text
 
 
 def _first_non_empty_line(text: str) -> str:
@@ -843,49 +869,85 @@ def _parse_game_start(text: str) -> BotMessageParse | None:
     return None
 
 
-def _parse_alive_list(text: str) -> BotMessageParse | None:
+def _canonical_role_count_name(name: str, registry: RoleRegistry) -> str:
+    """Map one bot-spelled role name onto the registry's canonical ``name_ru``.
+
+    The bot capitalises inconsistently (``"Мирный Житель"`` vs
+    ``"Мирный житель"``) and decorates names with punctuation. Canonical keys
+    matter because the LLM is only allowed to output configured role names.
+    Unrecognised names are kept as written (the analyzer flags them instead of
+    silently dropping a role slot).
+    """
+    candidate = " ".join(name.split()).strip(" .,;:!?«»\"'()[]{}")
+    if not candidate:
+        return name.strip()
+    role = registry.resolve_alias(candidate)
+    if role is not None:
+        return role.name_ru
+    role = _try_role_by_name(candidate, registry)
+    return role.name_ru if role is not None else candidate
+
+
+def _parse_alive_list(text: str, *, registry: RoleRegistry) -> BotMessageParse | None:
     """Parse the bot's ``Живые игроки … Из них … Всего: N`` snapshot.
 
     Names stay as ``display_name`` strings (no id resolution here — A2-1 is
     applied later by :meth:`domain.game_state.GameState.apply`). ``role_count``
-    is keyed by the Russian role names exactly as the bot wrote them; mapping
-    them onto ``RoleRegistry`` entries belongs to the analyzer (step 10c-fix-9).
+    is keyed by canonical ``name_ru`` values from the registry; counting the
+    slots and rendering them for the LLM belongs to the analyzer.
     """
     first_line = _first_non_empty_line(text)
     if not first_line or not _RE_ALIVE_LIST.match(first_line):
         return None
 
     # Section "Живые игроки:" — "N. name" lines up to "Из них:"/"Всего:".
+    # Only the heading is required; the body may use blank lines between rows.
     alive_names: list[str] = []
     head_match = re.search(
-        r"Живые\s+игроки:?\s*\n(.*?)(?=\n\s*(?:Из\s+них:|Всего:)|$)",
+        r"Живые(?:\s+игроки)?\s*(?:\([^)]*\))?\s*:\s*\n(.*?)"
+        r"(?=\n\s*(?:Из\s+них:|Всего:)|\Z)",
         text,
-        re.DOTALL,
+        re.DOTALL | re.IGNORECASE,
     )
     if head_match:
         for match in _ALIVE_LINE_RE.finditer(head_match.group(1)):
             name = match.group(1).strip()
             if name and name not in alive_names:
                 alive_names.append(name)
+    if not alive_names:
+        # Short form: "Живые: user_1, user_2, user_3" on one line.
+        inline = re.search(
+            r"Живые(?:\s+игроки)?\s*(?:\([^)]*\))?\s*:\s*([^\n]+)",
+            text,
+            re.IGNORECASE,
+        )
+        if inline and "Из" not in inline.group(1):
+            for name in inline.group(1).split(","):
+                cleaned = name.strip()
+                if cleaned and cleaned not in alive_names:
+                    alive_names.append(cleaned)
 
-    # Section "Из них:" — role composition. A trailing " - N" is the count;
-    # without it the role occurs once. Duplicate names are accumulated.
+    # Section "Из них:" — role composition. A trailing " - N" / ": N" is the
+    # count; without it the role occurs once. Duplicate names are accumulated.
+    # The bot may separate roles by commas OR put each role on its own line.
     role_count: dict[str, int] = {}
     roles_match = re.search(
         r"Из\s+них:\s*(.+?)(?=\n\s*Всего:|\Z)",
         text,
-        re.DOTALL,
+        re.DOTALL | re.IGNORECASE,
     )
     if roles_match:
-        for chunk in roles_match.group(1).split(","):
+        section = roles_match.group(1)
+        chunks = section.split(",") if "," in section else section.splitlines()
+        for raw_chunk in chunks:
             # Collapse line breaks introduced by the bot's soft wrapping.
-            chunk = " ".join(chunk.split())
+            chunk = " ".join(raw_chunk.split())
             if not chunk:
                 continue
             # Strip the leading emoji (incl. ZWJ sequences and skin tones).
-            chunk_clean = _strip_leading_emoji(chunk)
-            parts = re.split(r"\s*-\s*", chunk_clean, maxsplit=1)
-            name = parts[0].strip()
+            chunk_clean = _strip_leading_emoji(chunk).strip()
+            parts = re.split(r"\s*[-–—:]\s*", chunk_clean, maxsplit=1)
+            name = parts[0].strip(" .,;:!?«»\"'()[]{}")
             count = 1
             if len(parts) == 2:
                 try:
@@ -893,11 +955,12 @@ def _parse_alive_list(text: str) -> BotMessageParse | None:
                 except ValueError:
                     count = 1
             if name:
-                role_count[name] = role_count.get(name, 0) + count
+                canonical = _canonical_role_count_name(name, registry)
+                role_count[canonical] = role_count.get(canonical, 0) + count
 
     # Section "Всего: N" — bot-reported headcount of alive players.
     total: int | None = None
-    total_match = re.search(r"Всего:\s*(\d+)", text)
+    total_match = re.search(r"Всего:\s*(\d+)", text, re.IGNORECASE)
     if total_match:
         total = int(total_match.group(1))
 
@@ -1257,7 +1320,7 @@ def parse_bot_message(
 
     # 4. Alive list: "Живые игроки:" wraps a multi-line body that
     #    contains role emoji (would otherwise look like role reveals).
-    result = _parse_alive_list(stripped)
+    result = _parse_alive_list(stripped, registry=registry)
     if result is not None:
         return result
 

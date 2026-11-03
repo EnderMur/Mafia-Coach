@@ -1085,3 +1085,86 @@ class TestEndGame:
         assert result is not None
         assert result.kind is BotMessageKind.END_GAME
         assert result.winners == [("user_01", "Камикадзе")]
+
+
+# ===================================================================
+# Real-club ALIVE_LIST with decorated nicknames (16 players / 16 slots)
+# ===================================================================
+
+
+CLUB_ALIVE_LIST_TEXT = """Живые игроки:
+
+1. | user_1
+
+3. user_2🏹
+
+4. user_3'
+
+5. 🇦🇪
+
+8. user_4
+
+9. user_5🍒
+
+10. user_6
+
+11. moon
+
+14. 𝖁𝖊𝖑𝖑𝖆𝖓𝖊 ᥫ᭡
+
+15. user_7
+
+16. н 🐮
+
+17. Е А
+
+18. 🕷️ᵗᵏ| user_8🌝🖤
+
+19. mzhaaaa
+
+20. ♯𝅃𝐫᪶⃕𝐚᪶͡𝐲᪶𝆬𝐚᪶𝆬 ✟
+
+21. M•
+
+Из них:  👨🏼‍💼 Адвокат, 🧟 Поджигатель, 👨🏼 Мирный Житель, 🕵🏼 Комиссар Каттани, 🤵🏻 Дон, 🧙🏼 Бомж, 💣 Камикадзе, 🤞🏼 Счастливчик, 🤵🏼 Мафия - 3, 🧙‍ Маг, 💃 Любовница, 👮🏼 Сержант, 🤦🏼 Самоубийца, 🐺 Оборотень
+
+Всего: 16
+"""
+
+
+class TestClubAliveListComposition:
+    """The exact bot snapshot shape from a real club must survive parsing."""
+
+    def test_kind_names_and_total(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message(CLUB_ALIVE_LIST_TEXT, registry=registry)
+        assert r is not None
+        assert r.kind is BotMessageKind.ALIVE_LIST
+        assert r.confidence == 1.0
+        assert r.alive_player_names is not None
+        assert len(r.alive_player_names) == 16
+        assert r.alive_player_names[0] == "| user_1"
+        assert r.alive_player_names[12] == "🕷️ᵗᵏ| user_8🌝🖤"
+        assert r.total_players == 16
+
+    def test_role_count_is_canonical_and_sums_to_total(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message(CLUB_ALIVE_LIST_TEXT, registry=registry)
+        assert r is not None
+        assert r.role_count is not None
+        assert len(r.role_count) == 14
+        assert sum(r.role_count.values()) == 16
+        assert r.role_count["Мафия"] == 3
+        assert r.role_count["Мирный житель"] == 1
+        assert r.role_count["Комиссар Каттани"] == 1
+        assert r.role_count["Поджигатель"] == 1
+        assert r.role_count["Маг"] == 1
+        # Bot capitalisation must not leak into the LLM prompt.
+        assert "Мирный Житель" not in r.role_count
+
+    def test_emoji_zwnj_and_skin_tones_are_stripped(self, registry: RoleRegistry) -> None:
+        r = parse_bot_message(CLUB_ALIVE_LIST_TEXT, registry=registry)
+        assert r is not None
+        assert r.role_count is not None
+        for name in r.role_count:
+            assert not name.startswith(
+                ("👨", "🧟", "🕵", "🤵", "🧙", "💣", "🤞", "💃", "👮", "🤦", "🐺")
+            )

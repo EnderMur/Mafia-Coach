@@ -20,6 +20,7 @@ from domain.events import (
     VoteEvent,
 )
 from domain.exceptions import ConfigError, UnknownRoleError
+from domain.names import name_match_keys, names_match
 from domain.phases import Phase
 from domain.roles import Role, RoleRegistry
 
@@ -83,7 +84,7 @@ class GameState:
             placeholder_ids = [
                 pid
                 for pid, p in self._players.items()
-                if pid < 0 and p.display_name == display_name
+                if pid < 0 and names_match(p.display_name, display_name)
             ]
             for pid in placeholder_ids:
                 placeholder = self._players.pop(pid)
@@ -168,7 +169,16 @@ class GameState:
                     f"but current phase is {self._phase.value}"
                 )
         elif isinstance(event, AliveListEvent):
-            known_usernames = {p.username for p in self._players.values() if p.username is not None}
+            # Bot nicknames may carry club markers/emoji ("| Дмитрий",
+            # "🕷️ᵗᵏ| Shinichiro🌝🖤"), while Telegram stores the plain
+            # first_name. Compare normalised keys instead of raw strings.
+            alive_keys: set[str] = set()
+            for name in event.payload.alive_player_names:
+                alive_keys.update(name_match_keys(name))
+
+            def matches_snapshot(name: str) -> bool:
+                return bool(name_match_keys(name) & alive_keys)
+
             for name in event.payload.alive_player_names:
                 pid = _placeholder_player_id(name)
                 if pid in self._players:
@@ -176,39 +186,31 @@ class GameState:
                     # previously from ALIVE_LIST). Don't overwrite
                     # display_name, just refresh alive.
                     continue
-                # A real (positive) id already known by this name (or by this
+                # A real (positive) id already known by THIS name (or by this
                 # username) must never get a second, placeholder identity.
+                # Compare against this name only — the whole snapshot would
+                # wrongly suppress placeholders for every other alive player.
+                name_keys = name_match_keys(name)
                 if any(
-                    p.player_id > 0 and (p.display_name == name or p.username == name)
+                    p.player_id > 0
+                    and (
+                        name_match_keys(p.display_name) & name_keys
+                        or (p.username is not None and name_match_keys(p.username) & name_keys)
+                    )
                     for p in self._players.values()
                 ):
-                    continue
-                if name in known_usernames:
                     continue
                 self.register_player(pid, name, username=None)
-            alive_names = set(event.payload.alive_player_names)
-            for name in event.payload.alive_player_names:
-                # ALIVE_LIST names are display names, but a name that resolves
-                # to a registered username must keep that player alive as well.
-                pid = _placeholder_player_id(name)
-                placeholder = self._players.get(pid)
-                if placeholder is not None:
-                    alive_names.add(placeholder.display_name)
-                alive_names.update(
-                    p.display_name
-                    for p in self._players.values()
-                    if p.username is not None and p.username == name
-                )
+
             updated: dict[int, Player] = {}
             for pid, player in self._players.items():
-                if player.display_name in alive_names or (
-                    player.username is not None and player.username in alive_names
-                ):
+                is_alive = matches_snapshot(player.display_name) or (
+                    player.username is not None and matches_snapshot(player.username)
+                )
+                if is_alive or not player.alive:
                     updated[pid] = player
-                elif player.alive:
-                    updated[pid] = player.model_copy(update={"alive": False})
                 else:
-                    updated[pid] = player
+                    updated[pid] = player.model_copy(update={"alive": False})
             self._players = updated
             self._role_count = (
                 dict(event.payload.role_count) if event.payload.role_count is not None else None

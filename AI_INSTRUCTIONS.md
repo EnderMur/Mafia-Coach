@@ -314,7 +314,7 @@ repos:
 3. **Управление и выбор чата:** ввод команд (`/attach`, `/status`, `/quit`) — строго через основное консольное окно оркестратора (`main.py`). Окна `Stats Window` и `Reasoning Window` — `output-only` по лёгкому IPC.
 4. **Формат датасета для fine-tune:** ChatML/SFT.
 5. **Лимит контекста LLM:** `context_window_messages: 200`, суммаризация после 300 сообщений.
-6. **Режим триггера LLM:** настраиваемый `trigger_mode` (`batch_debounce` / `every_message` / `queue`). При `batch_debounce` фазовые события (смерти, фазы, голосования, раскрытия) вызывают LLM немедленно.
+6. **Режим триггера LLM:** настраиваемый `trigger_mode` (`batch_debounce` / `every_message` / `queue`), по умолчанию `batch_debounce`. При `batch_debounce` game-state события (`alive_list`, смерти, фазы, голосования, раскрытия) вызывают LLM немедленно; ALIVE_LIST в фазе `REGISTRATION` не отбрасывается. JSON-схема `AnalysisResponse`, схема БД и имена ролей не меняются; состав бота и прошлые предсказания — часть промпта/постобработки.
 7. **Игровой бот:** указывается пользователем через `telegram.bot_username` или `telegram.bot_id`. Бот не редактирует сообщения (парсер слушает только `events.NewMessage`).
 8. **База данных:** чистый `sqlite3` (без SQLAlchemy). Сырые события (`events`) сохраняются в SQLite сразу по мере получения; `predictions` — по готовности ответа LLM.
 9. **Конфигурация логов:** централизована внутри `configs/settings.yaml` (отдельный файл `logging.yaml` упразднён).

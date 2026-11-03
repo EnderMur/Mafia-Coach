@@ -756,3 +756,87 @@ def test_analyze_jinja_renders_revealed(
     assert "Не меняй их на" in content
     # Блок стоит до списка игроков — модель видит его первым.
     assert content.index("Раскрытые роли") < content.index("Игроки")
+
+
+# ===================================================================
+# Bot composition → explicit slots, all alive players, full distribution
+# ===================================================================
+
+
+def _apply_club_snapshot(state: GameState, names: list[str]) -> None:
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=state.game_id,
+            payload=AliveListPayload(
+                alive_player_names=names,
+                role_count={"Мафия": 1, "Мирный Житель": 2},
+                total_players=3,
+            ),
+        )
+    )
+
+
+def test_build_context_exposes_exact_role_slots(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """14 counters are not enough: the model needs an explicit sum."""
+    state = make_game_state(3, registry=registry)
+    _apply_club_snapshot(state, ["Вася", "Петя", "| user_4"])
+
+    context = build_context(game_state=state, registry=registry)
+
+    assert context.role_count == {"Мафия": 1, "Мирный житель": 2}
+    assert context.role_slots == 3
+    assert context.role_kinds == 2
+    assert context.total_players == 3
+    assert context.composition_matches_total is True
+    assert context.alive_list_names == ["Вася", "Петя", "| user_4"]
+    # Placeholder for a silent player is addressable by the LLM too.
+    assert len(context.players) == 4
+    assert any(player.is_placeholder for player in context.players)
+    assert context.placeholder_player_names == ["| user_4"]
+
+    content = to_llm_messages(context, registry=registry, jinja_env=jinja_env)[1]["content"]
+    assert "Всего ролевых слотов (сумма счётчиков): 3" in content
+    assert "Разных ролей: 2" in content
+    assert "- Мафия — 1" in content
+    assert "- Мирный житель — 2" in content
+    assert "Живые игроки из сообщения бота (3)" in content
+    assert "РОВНО 3 записей" in content
+    assert "синтетический ID" in content
+    assert "1 из 30" not in content
+    assert "пропусти игрока" not in content.lower()
+
+
+def test_role_notes_are_limited_to_composition(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """Notes for absent roles must not bury the composition for a 9B model."""
+    state = make_game_state(3, registry=registry)
+    _apply_club_snapshot(state, ["Вася", "Петя", "Маша"])
+
+    context = build_context(game_state=state, registry=registry)
+    content = to_llm_messages(context, registry=registry, jinja_env=jinja_env)[1]["content"]
+
+    assert "Тонкости ролей" in content
+    assert "Мафия: Базовой ночной активности нет" in content
+    assert "Комиссар Каттани: Стреляет" not in content
+
+
+def test_previous_predictions_render_as_anchor(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """Earlier roles are shown with an explicit no-flip-without-reason rule."""
+    context = build_context(
+        game_state=make_game_state(1, registry=registry),
+        registry=registry,
+        previous_predictions=[
+            PredictionSnapshot(player_id=100, suspected_role="Мирный житель", confidence=0.42)
+        ],
+    )
+    content = to_llm_messages(context, registry=registry, jinja_env=jinja_env)[1]["content"]
+
+    assert "Прошлые предсказания (якорь)" in content
+    assert "ID 100: Мирный житель" in content
+    assert "НЕ меняй роль игрока без НОВОГО аргумента" in content

@@ -697,11 +697,16 @@ class MessageScanner:
         Successful analysis notifies reasoning first, then flush completion, so
         stats are refreshed only after the analyzer has persisted predictions.
         Callback failures are logged without interrupting the scanner.
+
+        A bot ALIVE_LIST often arrives while the phase is still REGISTRATION;
+        it is itself a full game snapshot, so it is allowed through instead of
+        being silently dropped with the buffer.
         """
         if self._flushing:
             return
         phase = self._game_state.current_phase()
-        if phase == Phase.REGISTRATION:
+        has_alive_list = any(isinstance(event, AliveListEvent) for event in self._buffer)
+        if phase == Phase.REGISTRATION and not has_alive_list:
             logger.bind(channel=_LOGGER_CHANNEL).debug(
                 "flush skipped: phase=registration (game not started)",
             )

@@ -20,13 +20,16 @@ from typing import Final
 import jinja2
 from pydantic import BaseModel, ConfigDict, Field
 
-from domain.events import DeathEvent, MessageEvent, VoteEvent
+from domain.events import AliveListEvent, DeathEvent, MessageEvent, VoteEvent
 from domain.game_state import GameState
+from domain.names import name_match_keys, names_match
 from domain.phases import Phase
 from domain.roles import RoleRegistry
 
 DEFAULT_MAX_MESSAGES: Final[int] = 200
 """How many incoming messages are kept in the LLM context window."""
+
+_ROLE_NAME_TRIM: Final[str] = " .,;:!?«»\"'()[]{}"
 
 SYSTEM_TEMPLATE_NAME: Final[str] = "system.jinja"
 ANALYZE_TEMPLATE_NAME: Final[str] = "analyze.jinja"
@@ -44,6 +47,8 @@ class PlayerInfo(BaseModel):
     display_name: str = Field(min_length=1)
     alive: bool
     known_role_name_ru: str | None = None
+    #: ``True`` for deterministic placeholder ids (player never wrote in chat).
+    is_placeholder: bool = False
 
 
 class MessageInfo(BaseModel):
@@ -121,15 +126,65 @@ class LLMContext(BaseModel):
     recent_messages: list[MessageInfo]
     recent_deaths: list[DeathInfo]
     recent_votes: list[VoteInfo] = Field(default_factory=list)
-    previous_predictions: list[PredictionSnapshot] = []
+    previous_predictions: list[PredictionSnapshot] = Field(default_factory=list)
     truncated_messages: int = Field(ge=0)
     total_messages_seen: int = Field(ge=0)
-    #: Bot-reported role composition (name_ru → count), or None.
+    #: Bot-reported role composition (canonical name_ru → count), or None.
     role_count: dict[str, int] | None = None
     #: Bot-reported total alive headcount, or None.
     total_players: int | None = None
+    #: Sum of ``role_count`` values: exact number of role slots to distribute.
+    role_slots: int = 0
+    #: Number of distinct roles in the bot's composition.
+    role_kinds: int = 0
+    #: ``role_slots == total_players``, or ``None`` when either value is absent.
+    composition_matches_total: bool | None = None
+    #: Role names from the bot that do not resolve to the registry.
+    unknown_role_names: list[str] = Field(default_factory=list)
+    #: Alive nicknames exactly as the last bot snapshot listed them.
+    alive_list_names: list[str] = Field(default_factory=list)
+    #: Bot-listed nicknames backed by synthetic (negative) player ids.
+    placeholder_player_names: list[str] = Field(default_factory=list)
     #: Roles confirmed by the bot (mid-game reveal or final report).
-    revealed_roles: list[RevealedPlayer] = []
+    revealed_roles: list[RevealedPlayer] = Field(default_factory=list)
+
+
+def _canonical_role_count(
+    role_count: dict[str, int] | None,
+    registry: RoleRegistry,
+) -> tuple[dict[str, int] | None, list[str]]:
+    """Map bot-spelled role names onto canonical ``name_ru`` values.
+
+    Older events in SQLite may still contain the raw bot spelling (e.g.
+    ``"Мирный Житель"``). Canonicalising here — as well as in the parser —
+    guarantees the prompt never shows a role name that the response validator
+    would reject. Duplicate keys after canonicalisation are summed.
+
+    Args:
+        role_count: composition as stored in ``GameState``.
+        registry: configured role catalogue.
+
+    Returns:
+        ``(canonical_counts, unknown_names)``. ``canonical_counts`` is ``None``
+        when the input was ``None`` or contained no usable names.
+    """
+    if role_count is None:
+        return None, []
+    canonical: dict[str, int] = {}
+    unknown: list[str] = []
+    for raw_name, count in role_count.items():
+        candidate = " ".join(raw_name.split()).strip(_ROLE_NAME_TRIM)
+        if not candidate:
+            continue
+        role = registry.resolve_alias(candidate)
+        if role is None:
+            key = candidate
+            if key not in unknown:
+                unknown.append(key)
+        else:
+            key = role.name_ru
+        canonical[key] = canonical.get(key, 0) + count
+    return canonical or None, unknown
 
 
 def build_context(
@@ -146,8 +201,9 @@ def build_context(
     - ``recent_deaths`` — all :class:`DeathEvent` objects (usually fewer than 15
       per game);
     - ``recent_votes`` — the last 20 :class:`VoteEvent` objects in append order;
-    - ``players`` — alive and dead players, with ``known_role_name_ru`` filled in
-      when the role was publicly revealed and resolved by the registry;
+    - ``players`` — alive and dead players (real ids and whitelisted
+      placeholders), with ``known_role_name_ru`` filled in when the role was
+      publicly revealed and resolved by the registry;
     - ``previous_predictions`` — carried over from the previous analysis cycle;
     - ``truncated_messages`` — ``max(0, total_messages_seen - max_messages)``.
 
@@ -207,6 +263,10 @@ def build_context(
         for event in vote_events[-20:]
     ]
 
+    # ALL players of the snapshot reach the LLM, including deterministic
+    # placeholders for players who never wrote in chat. Otherwise a 16-player
+    # alive list can produce only e.g. 5 addressable ids and a full role
+    # distribution is impossible.
     players = [
         PlayerInfo(
             player_id=player.player_id,
@@ -217,9 +277,9 @@ def build_context(
                 if player.revealed and player.known_role is not None
                 else None
             ),
+            is_placeholder=player.player_id <= 0,
         )
         for player in game_state.players()
-        if player.player_id > 0
     ]
 
     # Roles confirmed by the bot are ground truth: they are rendered as their
@@ -228,7 +288,7 @@ def build_context(
     revealed: list[RevealedPlayer] = []
     for p in game_state.players():
         confirmed_role = p.final_role or p.known_role
-        if p.player_id <= 0 or not p.revealed or confirmed_role is None:
+        if not p.revealed or confirmed_role is None:
             continue
         revealed.append(
             RevealedPlayer(
@@ -238,6 +298,34 @@ def build_context(
                 is_winner=p.is_winner,
             )
         )
+
+    alive_events = [
+        event
+        for event in game_state.events_by_kind("alive_list")
+        if isinstance(event, AliveListEvent)
+    ]
+    alive_list_names = list(alive_events[-1].payload.alive_player_names) if alive_events else []
+    alive_keys: set[str] = set()
+    for name in alive_list_names:
+        alive_keys.update(name_match_keys(name))
+    placeholder_player_names = [
+        info.display_name
+        for info in players
+        if info.is_placeholder
+        and (
+            not alive_list_names
+            or any(names_match(info.display_name, listed) for listed in alive_list_names)
+            or bool(name_match_keys(info.display_name) & alive_keys)
+        )
+    ]
+
+    canonical_roles, unknown_role_names = _canonical_role_count(game_state.role_count, registry)
+    role_slots = sum(canonical_roles.values()) if canonical_roles else 0
+    role_kinds = len(canonical_roles) if canonical_roles else 0
+    total_players = game_state.total_players
+    composition_matches_total: bool | None = None
+    if canonical_roles is not None and total_players is not None:
+        composition_matches_total = role_slots == total_players
 
     return LLMContext(
         game_id=_game_id(game_state),
@@ -252,8 +340,14 @@ def build_context(
         previous_predictions=list(previous_predictions or []),
         truncated_messages=max(0, total_messages - max_messages),
         total_messages_seen=total_messages,
-        role_count=game_state.role_count,
-        total_players=game_state.total_players,
+        role_count=canonical_roles,
+        total_players=total_players,
+        role_slots=role_slots,
+        role_kinds=role_kinds,
+        composition_matches_total=composition_matches_total,
+        unknown_role_names=unknown_role_names,
+        alive_list_names=alive_list_names,
+        placeholder_player_names=placeholder_player_names,
         revealed_roles=revealed,
     )
 
@@ -312,10 +406,16 @@ def to_llm_messages(
         ],
         role_count=context.role_count,
         total_players=context.total_players,
+        role_slots=context.role_slots,
+        role_kinds=context.role_kinds,
+        composition_matches_total=context.composition_matches_total,
+        unknown_role_names=context.unknown_role_names,
+        alive_list_names=context.alive_list_names,
+        placeholder_player_names=context.placeholder_player_names,
         revealed_roles=[_revealed_payload(player) for player in context.revealed_roles],
         club_notes_summary=club_notes_summary,
         recent_votes=context.recent_votes,
-        role_notes=_render_role_notes(registry),
+        role_notes=_render_role_notes(registry, context.role_count),
         club_patterns=club_patterns,
     )
 
@@ -327,10 +427,19 @@ def to_llm_messages(
     return messages
 
 
-def _render_role_notes(registry: RoleRegistry) -> str:
-    """Render nonempty role notes for the club heuristics prompt."""
+def _render_role_notes(registry: RoleRegistry, role_count: dict[str, int] | None = None) -> str:
+    """Render nonempty role notes for the club heuristics prompt.
+
+    When the bot already reported the exact composition, notes for roles that
+    are not in the game only dilute a small local model's attention. Keep the
+    full catalogue when composition is unknown; otherwise render only present
+    roles.
+    """
     lines = []
+    wanted = set(role_count) if role_count else None
     for role in registry.all_roles():
+        if wanted is not None and role.name_ru not in wanted:
+            continue
         notes = (role.notes or "").strip()
         if notes:
             lines.append(f"- {role.name_ru}: {notes}")
@@ -359,6 +468,7 @@ def _player_payload(player: PlayerInfo) -> dict[str, object]:
         "display_name": player.display_name,
         "alive": player.alive,
         "known_role": player.known_role_name_ru,
+        "is_placeholder": player.is_placeholder,
     }
 
 

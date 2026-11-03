@@ -64,9 +64,22 @@ Schema. It establishes the analysis task, requires Russian-language output, and
 requires the response to conform to `AnalysisResponse`.
 
 `analyze.jinja` receives game and phase identifiers, player snapshots, recent
-messages, earlier predictions, and an optional summary of club heuristics. The
-template presents those values in labeled context sections and contains no
-hard-coded role catalogue.
+messages, earlier predictions, and an optional summary of club heuristics. When
+the bot sent an ALIVE_LIST, it also renders an explicit composition section:
+`role_count` (canonical `name_ru` → count), `role_slots` (sum), `role_kinds`
+(distinct roles), `total_players`, a mismatch warning, the bot's alive nicknames
+and the subset backed by synthetic negative ids. The model is told to return
+exactly `role_slots` predictions — one per alive player — and never exceed a
+role counter. The «Прошлые предсказания (якорь)» block forbids changing a role
+without a new argument. The template contains no hard-coded role catalogue and
+no hard-coded «Мирный житель — 1 из 30» claim.
+
+Role notes are filtered to roles actually present in the composition, so a small
+local model is not distracted by 21 role descriptions when only 14 roles are in
+the game. `GameAnalyzer` additionally loads the previous predictions from
+SQLite, reverts unjustified role flips and fills missing composition slots;
+corrections are exposed as `AnalysisResult.warnings`. The response JSON schema
+(`AnalysisResponse`) is unchanged.
 
 ## Reasoning channel
 
