@@ -11,6 +11,20 @@ from typing import Any, TypeGuard
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
+_PLACEHOLDER_REASONS: frozenset[str] = frozenset(
+    {
+        "",
+        "нет данных",
+        "неизвестно",
+        "не знаю",
+        "непонятно",
+        "нет аргументов",
+        "недостаточно данных",
+        "n/a",
+        "none",
+    }
+)
+
 
 class AlternativePrediction(BaseModel):
     """An alternative role hypothesis with a confidence score."""
@@ -123,7 +137,16 @@ def validate_response(
 
         validated_predictions.append(updated)
 
-    return response.model_copy(update={"analysis": validated_predictions}), warnings
+    filtered_predictions: list[PlayerPrediction] = []
+    for prediction in validated_predictions:
+        if all(reason.strip().lower() in _PLACEHOLDER_REASONS for reason in prediction.reasons):
+            warnings.append(
+                f"dropped prediction for player {prediction.player_id}: placeholder reasons"
+            )
+            continue
+        filtered_predictions.append(prediction)
+
+    return response.model_copy(update={"analysis": filtered_predictions}), warnings
 
 
 def _resolve_role(

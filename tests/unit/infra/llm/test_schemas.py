@@ -305,3 +305,39 @@ def test_context_validation_normalizes_overfull_pair() -> None:
     assert prediction.alternative is not None
     assert prediction.confidence + prediction.alternative.confidence == pytest.approx(1.0)
     assert any("normalized" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize(
+    "reasons",
+    [
+        ["нет данных"],
+        ["  НЕТ ДАННЫХ  ", " N/A ", "None"],
+        ["неизвестно", "не знаю", "непонятно"],
+        ["нет аргументов", "недостаточно данных"],
+        ["   "],
+    ],
+)
+def test_drop_placeholder_reasons(reasons: list[str]) -> None:
+    """Predictions with no genuine reason are removed and reported."""
+    result, warnings = validate_response(
+        response_json([valid_prediction(reasons=reasons)]),
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis == []
+    assert warnings == ["dropped prediction for player 100: placeholder reasons"]
+
+
+@pytest.mark.parametrize(
+    "reasons", [["голосовал против комиссара"], ["нет данных", "голосовал против комиссара"]]
+)
+def test_keep_real_reasons(reasons: list[str]) -> None:
+    """A substantive reason preserves the prediction, including a mixed list."""
+    result, warnings = validate_response(
+        response_json([valid_prediction(reasons=reasons)]),
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert len(result.analysis) == 1
+    assert result.analysis[0].reasons == reasons
+    assert warnings == []
