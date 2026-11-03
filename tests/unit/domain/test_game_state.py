@@ -133,6 +133,36 @@ def test_register_player_updates_existing_player_without_duplicate(
     assert updated.username == "new"
 
 
+def test_register_real_replaces_placeholder(game: GameState, registry: RoleRegistry) -> None:
+    """A real id collapses the same-named placeholder and inherits its ground truth."""
+    placeholder_id = _placeholder_player_id("Вася")
+    assert placeholder_id < 0
+    game.register_player(placeholder_id, "Вася")
+    game.apply(make_end_game(winners=[("Вася", "Комиссар Каттани")]))
+    placeholder = game.player(placeholder_id)
+    assert placeholder.final_role is not None
+    assert placeholder.is_winner is True
+
+    real = game.register_player(456, "Вася")
+
+    assert [player.player_id for player in game.players()] == [456]
+    assert real.display_name == "Вася"
+    assert real.final_role == registry.resolve_alias("Комиссар Каттани")
+    assert real.final_role is not None
+    assert real.revealed is True
+    assert real.is_winner is True
+
+
+def test_register_real_no_placeholder_unchanged(game: GameState) -> None:
+    """Without a placeholder the real registration is a plain single player."""
+    real = game.register_player(456, "Вася")
+
+    assert game.players() == (real,)
+    assert real.player_id == 456
+    assert real.known_role is None
+    assert real.is_winner is None
+
+
 def test_register_player_preserves_existing_game_state(game: GameState) -> None:
     """Refreshing a player does not restore a dead player or erase a reveal."""
     game.register_player(1, "Player")

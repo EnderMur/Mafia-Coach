@@ -42,3 +42,10 @@ class PlayersRepository:
         cursor = self._conn.execute("UPDATE players SET notes = ? WHERE id = ?", (notes, player_id))
         if cursor.rowcount == 0:
             raise ConfigError(f"player {player_id} not found")
+
+    def delete_player(self, *, player_id: int) -> None:
+        """Remove placeholder from players (merge cleanup)."""
+        self._conn.execute(
+            "DELETE FROM players WHERE id = ? AND id < 0",  # только placeholder
+            (player_id,),
+        )

@@ -28,6 +28,7 @@ from domain.events import (
     PhaseChangeEvent,
     PhaseChangePayload,
 )
+from domain.game_state import _placeholder_player_id
 from domain.phases import Phase
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
@@ -958,6 +959,94 @@ async def test_run_retro_persists_all_players(tmp_path: Path) -> None:
     rows = result.repos.game_players.list_game_players(game_id)
     assert {row["player_id"] for row in rows} == {PLAYER_ID, -1, -2}
     await orchestrator.shutdown()
+
+
+async def test_run_retro_merges_placeholder(tmp_path: Path) -> None:
+    """A placeholder and its real twin are merged before retro (one row each)."""
+
+    class RecordingGamePlayers:
+        """Delegating proxy that records participation deletes."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+            self.deleted: list[int] = []
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def delete_player(self, *, game_id: int, player_id: int) -> None:
+            self.deleted.append(player_id)
+            self._inner.delete_player(game_id=game_id, player_id=player_id)
+
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+
+    game_state = result.game_state
+    game_id = game_state.game_id
+    placeholder_id = _placeholder_player_id("Вася")
+    game_state.register_player(456, "Вася")
+    game_state.register_player(placeholder_id, "Вася")
+    game_state.register_player(457, "Петя")
+
+    # SQLite foreign keys require players rows even for negative ids (they are
+    # exactly what _persist_player writes for ALIVE_LIST placeholders).
+    for player in game_state.players():
+        result.repos.players.upsert_player(
+            player_id=player.player_id,
+            username=None,
+            display_name=player.display_name,
+        )
+    repo = RecordingGamePlayers(result.repos.game_players)
+    result.repos.game_players = repo  # type: ignore[assignment]
+    for player in game_state.players():
+        await orchestrator._persist_player(player.player_id, player.display_name)
+    result.repos.predictions.upsert_prediction(
+        game_id=game_id,
+        player_id=placeholder_id,
+        predicted_role="Мафия",
+        confidence=0.8,
+        reasoning="голосовал против дона",
+    )
+
+    await orchestrator._run_retro()
+
+    predictions = result.repos.predictions.list_predictions(game_id)
+    assert [int(row["player_id"]) for row in predictions] == [456]
+    assert repo.deleted == [placeholder_id]
+    remaining = {
+        int(row["player_id"]) for row in result.repos.game_players.list_game_players(game_id)
+    }
+    assert placeholder_id not in remaining
+    assert {456, 457} <= remaining
+    assert result.repos.players.get_player(placeholder_id) is None
+    assert result.repos.players.get_player(456) is not None
+    await orchestrator.shutdown()
+
+
+async def test_merge_predictions_db(tmp_path: Path) -> None:
+    """merge_player keeps the real row and repoints the placeholder row."""
+    result, _, _ = await make_result(tmp_path)
+    game_id = result.game_state.game_id
+    repo = result.repos.predictions
+    result.repos.players.upsert_player(player_id=-7, username=None, display_name="Плейсхолдер")
+    result.repos.players.upsert_player(player_id=-8, username=None, display_name="Второй")
+    result.repos.players.upsert_player(player_id=456, username=None, display_name="Реальный")
+    repo.upsert_prediction(
+        game_id=game_id, player_id=-7, predicted_role="Мафия", confidence=0.7, reasoning="дубль"
+    )
+
+    # real id has no prediction yet → the placeholder row moves over.
+    repo.merge_player(from_player_id=-7, to_player_id=456, game_id=game_id)
+    rows = repo.list_predictions(game_id)
+    assert [(int(row["player_id"]), row["predicted_role"]) for row in rows] == [(456, "Мафия")]
+
+    # both rows exist → the real prediction wins, the duplicate is deleted.
+    repo.upsert_prediction(
+        game_id=game_id, player_id=-8, predicted_role="Мирный житель", confidence=0.3, reasoning="x"
+    )
+    repo.merge_player(from_player_id=-8, to_player_id=456, game_id=game_id)
+    rows = repo.list_predictions(game_id)
+    assert [(int(row["player_id"]), row["predicted_role"]) for row in rows] == [(456, "Мафия")]
 
 
 async def test_handle_status_uses_total_players(

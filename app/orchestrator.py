@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 import threading
 from collections.abc import Callable
@@ -393,6 +394,63 @@ class Orchestrator:
         finally:
             self._pending_retro = False
 
+    async def _merge_placeholder_players(self, game_state: GameState) -> None:
+        """Collapse ``placeholder + real`` pairs that share a ``display_name``.
+
+        ``ALIVE_LIST`` registers every name with a synthetic negative id before
+        speech reveals the real Telegram id, so one person can exist twice in
+        ``game_state``, ``players`` and ``game_players``. The real id keeps the
+        row: predictions and participation move over, the placeholder rows are
+        deleted (``players.delete_player`` refuses positive ids).
+
+        Best-effort: a failed pair is logged and the remaining pairs still run,
+        because retro must not be blocked by cleanup.
+        """
+        by_display: dict[str, list[int]] = {}
+        for p in game_state.players():
+            by_display.setdefault(p.display_name, []).append(p.player_id)
+
+        for display_name, pids in by_display.items():
+            if len(pids) <= 1:
+                continue
+            real = [pid for pid in pids if pid > 0]
+            placeholders = [pid for pid in pids if pid < 0]
+            if not real or not placeholders:
+                continue
+            keeper = real[0]
+            for ph in placeholders:
+                try:
+                    async with self._db_lock:
+                        await asyncio.to_thread(
+                            self._result.repos.predictions.merge_player,
+                            from_player_id=ph,
+                            to_player_id=keeper,
+                            game_id=game_state.game_id,
+                        )
+                        await asyncio.to_thread(
+                            self._result.repos.game_players.delete_player,
+                            game_id=game_state.game_id,
+                            player_id=ph,
+                        )
+                        await asyncio.to_thread(
+                            self._result.repos.players.delete_player,
+                            player_id=ph,
+                        )
+                except Exception as e:  # noqa: BLE001 — merge is best-effort
+                    logger.bind(channel=_LOGGER_CHANNEL).warning(
+                        "merge placeholder {} → {} ({}) failed: {}: {}",
+                        ph,
+                        keeper,
+                        display_name,
+                        type(e).__name__,
+                        str(e),
+                    )
+                else:
+                    # Keep the dropped id marked as persisted: ``_run_retro``
+                    # persists every missing player afterwards, and re-inserting
+                    # the placeholder would undo this merge (dangling rows).
+                    self._registered_player_ids.add(ph)
+
     async def _persist_final_roles(self, game_state: GameState, game_id: int) -> None:
         """Write every known final role into ``game_players``.
 
@@ -416,7 +474,10 @@ class Orchestrator:
                     survived=player.alive,
                     is_winner=player.is_winner,
                 )
-            except ConfigError as error:
+            except (ConfigError, sqlite3.IntegrityError) as error:
+                # IntegrityError: the participation row still points at a
+                # placeholder that the merge cleanup could not delete — skip
+                # this player instead of aborting the whole retro.
                 logger.bind(channel=_LOGGER_CHANNEL).warning(
                     "final_role skipped for {} (not in game_players): {}",
                     player.player_id,
@@ -446,6 +507,12 @@ class Orchestrator:
         game_id = game_state.game_id
         if game_id == 0:
             return
+
+        # Merge placeholder + real с одним display_name в game_players /
+        # players: real приоритетнее, placeholder удаляется. Иначе один и тот
+        # же человек висит в таблице дважды, а final_role достаётся случайной
+        # (первой по порядку регистрации) записи.
+        await self._merge_placeholder_players(game_state)
 
         # Persist ALL players (including END_GAME placeholders) to
         # game_players before retro. Without this, placeholders

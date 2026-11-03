@@ -89,3 +89,26 @@ class PredictionsRepository:
         )
         if cursor.rowcount == 0:
             raise ConfigError(f"prediction {prediction_id} not found")
+
+    def merge_player(
+        self,
+        *,
+        from_player_id: int,
+        to_player_id: int,
+        game_id: int,
+    ) -> None:
+        """Move predictions from placeholder to real id (one game).
+
+        Real id may already have predictions → delete duplicate
+        (predictions_history не трогаем, там история).
+        """
+        self._conn.execute(
+            "DELETE FROM predictions WHERE game_id=? AND player_id=? "
+            "AND EXISTS (SELECT 1 FROM predictions p2 "
+            "  WHERE p2.game_id=? AND p2.player_id=?)",
+            (game_id, from_player_id, game_id, to_player_id),
+        )
+        self._conn.execute(
+            "UPDATE predictions SET player_id=? WHERE game_id=? AND player_id=?",
+            (to_player_id, game_id, from_player_id),
+        )

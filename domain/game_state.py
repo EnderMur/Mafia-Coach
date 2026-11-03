@@ -63,8 +63,34 @@ class GameState:
     def register_player(
         self, player_id: int, display_name: str, username: str | None = None
     ) -> Player:
-        """Register a player or refresh their display details."""
+        """Register a player or refresh their display details.
+
+        A real (positive) id collapses the placeholder that the earlier
+        ``ALIVE_LIST`` registered for the same display name: the placeholder is
+        dropped and any ground truth it already carries (``known_role``,
+        ``final_role``, ``is_winner``) moves to the real player. Without this
+        merge the same person exists twice in the game and ``END_GAME``
+        matching by display name writes the final role into the placeholder,
+        leaving the real id labeled "unknown" in retro.
+        """
         existing = self._players.get(player_id)
+        if player_id > 0:
+            # Real id arrives: drop any placeholder with the same
+            # display_name (registered from ALIVE_LIST before speech).
+            placeholder_ids = [
+                pid
+                for pid, p in self._players.items()
+                if pid < 0 and p.display_name == display_name
+            ]
+            for pid in placeholder_ids:
+                placeholder = self._players.pop(pid)
+                # Transfer any known_role/final_role from placeholder
+                if existing is None and (
+                    placeholder.known_role
+                    or placeholder.final_role
+                    or placeholder.is_winner is not None
+                ):
+                    existing = placeholder
         if existing is None:
             player = Player(
                 player_id=player_id,
@@ -138,21 +164,18 @@ class GameState:
                     f"but current phase is {self._phase.value}"
                 )
         elif isinstance(event, AliveListEvent):
-            existing_names = {p.display_name for p in self._players.values()}
             for name in event.payload.alive_player_names:
                 pid = _placeholder_player_id(name)
                 if pid in self._players:
                     # Player registered earlier (real id from speech or
                     # previously from ALIVE_LIST). Don't overwrite
                     # display_name, just refresh alive.
-                    existing = self._players[pid]
-                    if existing.display_name not in existing_names:
-                        existing_names.add(existing.display_name)
                     continue
-                if name in existing_names:
+                # A real (positive) id already known by this name must never
+                # get a second, placeholder identity.
+                if any(p.player_id > 0 and p.display_name == name for p in self._players.values()):
                     continue
                 self.register_player(pid, name, username=None)
-                existing_names.add(name)
             alive_names = set(event.payload.alive_player_names)
             for name in event.payload.alive_player_names:
                 pid = _placeholder_player_id(name)
