@@ -5,8 +5,8 @@ Read-only. Checks:
 - Forbidden files in git history (any branch): ``*.session``, ``*.db``,
   ``configs/settings.yaml``, ``data/``, ``logs/``.
 - Forbidden files in current index (``git ls-files``).
-- ``tests/fixtures/`` — grep for real names from ``data/dumps/`` (if dumps
-  are available locally).
+- ``tests/fixtures/`` — grep for real names from non-anonymized ``data/dumps/``
+  (if dumps are available locally); ignore ``user_N`` placeholders.
 
 Empty ``.gitkeep`` directory placeholders under ``data/`` and ``logs/`` are
 allowed: they are tracked on purpose and carry no data.
@@ -18,6 +18,7 @@ switching the repo Private → Public (README §13): ``python scripts/audit_pii.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from pathlib import Path
 from typing import Any, Final
@@ -102,9 +103,13 @@ def _check_fixtures() -> list[str]:
             data: dict[str, Any] = json.loads(dump.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if data.get("anonymized") is True:
+            continue
         for m in data.get("messages", []):
             n = m.get("sender_name")
             if n and isinstance(n, str) and len(n) >= 4:
+                if re.fullmatch(r"user_\d+", n):
+                    continue  # An anonymization placeholder is not a real name.
                 names.add(n)
     if not names:
         return []
