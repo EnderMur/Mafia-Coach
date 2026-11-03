@@ -6,7 +6,7 @@ import asyncio
 import json
 from abc import ABC, abstractmethod
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Any, Final, Protocol
 
 import httpx
 from loguru import logger
@@ -62,6 +62,27 @@ class LLMClient(ABC):
     @abstractmethod
     async def aclose(self) -> None:
         """Close any transport resources owned by the implementation."""
+
+
+#: How many stream attempts may end in truncated JSON before the client gives
+#: up. Each attempt costs the full token budget, so two is the latency cap.
+_EOF_MAX_ATTEMPTS: Final[int] = 2
+#: Token limit used by the single EOF retry (4096 keeps the retry bounded).
+_EOF_RETRY_MAX_TOKENS: Final[int] = 4096
+
+
+def empty_analysis_response() -> AnalysisResponse:
+    """Return a valid response with no predictions (truncated-JSON fallback).
+
+    An empty prediction list is a legitimate outcome: the analyzer persists
+    nothing and the stats window simply keeps its dashes, which is far better
+    than blocking the scanner for another full token budget.
+    """
+    return AnalysisResponse(
+        analysis=[],
+        game_read="Модель вернула обрезанный JSON; предсказаний в этом цикле нет.",
+        reasoning="Ответ модели не был завершён (EOF), повторные попытки отключены.",
+    )
 
 
 class _TransientEOF(Exception):
@@ -294,7 +315,10 @@ class LMStudioClient(LLMClient):
         self._ensure_open()
         budget = self._max_retries
         token_limit = self.max_tokens
-        eof_retried = False
+        # Truncated JSON (EOF) is the expensive failure: each attempt spends the
+        # whole token budget (4096 × 3 ≈ 100 s). One retry is enough — a third
+        # identical run almost never recovers, it only stalls the table.
+        eof_attempts = 0
         use_schema = True
         last_exc: Exception | None = None
 
@@ -320,10 +344,18 @@ class LMStudioClient(LLMClient):
                 raise LLMConnectionError(f"LM Studio недоступен: {error}") from error
             except _TransientEOF as error:
                 last_exc = error
-                if eof_retried or budget == 0:
+                eof_attempts += 1
+                # Cap the token limit once; never escalate twice.
+                token_limit = min(_EOF_RETRY_MAX_TOKENS, token_limit * 2)
+                if eof_attempts >= _EOF_MAX_ATTEMPTS:
+                    logger.bind(channel="llm").warning(
+                        "stream: {} truncated-JSON attempt(s) — giving up "
+                        "instead of retrying (latency cap)",
+                        eof_attempts,
+                    )
+                    return empty_analysis_response()
+                if budget == 0:
                     break
-                eof_retried = True
-                token_limit = min(4096, max(2048, token_limit * 2))
                 await self._sleep_before_retry(budget)
             except _SchemaRejectedHTTP as error:
                 if budget == 0:
