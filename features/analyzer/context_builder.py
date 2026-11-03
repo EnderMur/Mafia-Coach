@@ -85,6 +85,21 @@ class PhaseInfo(BaseModel):
     current_day: int = Field(ge=0)
 
 
+class RevealedPlayer(BaseModel):
+    """Игрок с подтверждённой (раскрытой ботом) ролью.
+
+    ``ground truth`` для модели: такую роль нельзя пересматривать, поэтому она
+    вынесена в отдельный блок промпта, а не только в строку ``players``.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    player_id: int
+    player_name: str = Field(min_length=1)
+    role_name_ru: str = Field(min_length=1)
+    is_winner: bool | None = None
+
+
 class PredictionSnapshot(BaseModel):
     """Previous prediction (для контекста модели)."""
 
@@ -113,6 +128,8 @@ class LLMContext(BaseModel):
     role_count: dict[str, int] | None = None
     #: Bot-reported total alive headcount, or None.
     total_players: int | None = None
+    #: Roles confirmed by the bot (mid-game reveal or final report).
+    revealed_roles: list[RevealedPlayer] = []
 
 
 def build_context(
@@ -205,6 +222,23 @@ def build_context(
         if player.player_id > 0
     ]
 
+    # Roles confirmed by the bot are ground truth: they are rendered as their
+    # own block before the player list, so the model does not "re-discover"
+    # them as "Мирный житель".
+    revealed: list[RevealedPlayer] = []
+    for p in game_state.players():
+        confirmed_role = p.final_role or p.known_role
+        if p.player_id <= 0 or not p.revealed or confirmed_role is None:
+            continue
+        revealed.append(
+            RevealedPlayer(
+                player_id=p.player_id,
+                player_name=p.display_name,
+                role_name_ru=confirmed_role.name_ru,
+                is_winner=p.is_winner,
+            )
+        )
+
     return LLMContext(
         game_id=_game_id(game_state),
         phase=PhaseInfo(
@@ -220,6 +254,7 @@ def build_context(
         total_messages_seen=total_messages,
         role_count=game_state.role_count,
         total_players=game_state.total_players,
+        revealed_roles=revealed,
     )
 
 
@@ -277,6 +312,7 @@ def to_llm_messages(
         ],
         role_count=context.role_count,
         total_players=context.total_players,
+        revealed_roles=[_revealed_payload(player) for player in context.revealed_roles],
         club_notes_summary=club_notes_summary,
         recent_votes=context.recent_votes,
         role_notes=_render_role_notes(registry),
@@ -323,6 +359,16 @@ def _player_payload(player: PlayerInfo) -> dict[str, object]:
         "display_name": player.display_name,
         "alive": player.alive,
         "known_role": player.known_role_name_ru,
+    }
+
+
+def _revealed_payload(player: RevealedPlayer) -> dict[str, object]:
+    """Flatten a confirmed role for the ``analyze.jinja`` template."""
+    return {
+        "player_id": player.player_id,
+        "player_name": player.player_name,
+        "role_name_ru": player.role_name_ru,
+        "is_winner": player.is_winner,
     }
 
 

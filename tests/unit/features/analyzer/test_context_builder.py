@@ -695,3 +695,64 @@ def test_default_response_schema_matches_contract() -> None:
     from infra.llm.schemas import AnalysisResponse
 
     assert json.loads(DEFAULT_RESPONSE_SCHEMA_JSON) == AnalysisResponse.model_json_schema()
+
+
+# --- revealed_roles (Part C) ----------------------------------------------
+
+
+def test_build_context_revealed_roles(registry: RoleRegistry) -> None:
+    """C. Только раскрытые роли попадают в revealed_roles и сохраняют порядок."""
+    state = make_game_state(2, registry=registry)
+    revealed_role = registry.all_roles()[0]
+    state.apply(
+        RoleRevealEvent(
+            ts=BASE_TS,
+            game_id=1,
+            payload=RoleRevealPayload(
+                player_id=player_id(0),
+                player_name=player_name(0),
+                role_name_ru=revealed_role.name_ru,
+            ),
+        )
+    )
+
+    context = build_context(game_state=state, registry=registry)
+
+    assert len(context.revealed_roles) == 1
+    revealed = context.revealed_roles[0]
+    assert revealed.player_id == player_id(0)
+    assert revealed.player_name == player_name(0)
+    assert revealed.role_name_ru == revealed_role.name_ru
+    assert revealed.is_winner is None
+    # Оба игрока остаются в players: блок раскрытых ролей его не заменяет.
+    assert len(context.players) == 2
+
+
+def test_analyze_jinja_renders_revealed(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """C. Рендер analyze содержит блок раскрытых ролей перед списком игроков."""
+    state = make_game_state(2, registry=registry)
+    role = registry.all_roles()[0]
+    state.apply(
+        RoleRevealEvent(
+            ts=BASE_TS,
+            game_id=1,
+            payload=RoleRevealPayload(
+                player_id=player_id(0),
+                player_name=player_name(0),
+                role_name_ru=role.name_ru,
+            ),
+        )
+    )
+    context = build_context(game_state=state, registry=registry)
+
+    messages = to_llm_messages(context, registry=registry, jinja_env=jinja_env)
+    content = messages[1]["content"]
+
+    assert "Раскрытые роли" in content
+    assert "ground truth" in content
+    assert f"player_id={player_id(0)} ({player_name(0)}): {role.name_ru}" in content
+    assert "Не меняй их на" in content
+    # Блок стоит до списка игроков — модель видит его первым.
+    assert content.index("Раскрытые роли") < content.index("Игроки")

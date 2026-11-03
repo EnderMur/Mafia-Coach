@@ -18,7 +18,7 @@ if TYPE_CHECKING:
     from loguru import Record
 
 from domain.exceptions import LLMConnectionError, LLMError
-from infra.llm.client import LMStudioClient, _snip
+from infra.llm.client import LMStudioClient, _snip, empty_analysis_response
 from infra.llm.schemas import AnalysisResponse
 from infra.logging.setup import setup_logging
 
@@ -893,3 +893,50 @@ async def test_eof_retry(client: LMStudioClient, respx_mock: respx.MockRouter) -
     assert json.loads(route.calls[0].request.content)["max_tokens"] == 4096
     assert json.loads(route.calls[1].request.content)["max_tokens"] == 4096
     assert client.max_tokens == 4096
+
+
+async def test_eof_stops_after_two_attempts(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """F1. Второй обрезанный ответ не тратит третий полный токен-бюджет."""
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        side_effect=[
+            sse_response({"choices": [{"delta": {"content": '{"analysis": ['}}]}, "[DONE]"),
+            sse_response({"choices": [{"delta": {"content": '{"analysis": [{"'}}]}, "[DONE]"),
+            stream_response(),
+        ]
+    )
+
+    result = await run_stream(client)
+
+    # Пустой, но валидный ответ вместо LLMError после трёх полных попыток.
+    assert result.analysis == []
+    assert result.game_read
+    assert route.call_count == 2
+    assert json.loads(route.calls[1].request.content)["max_tokens"] == 4096
+
+
+async def test_eof_single_retry_succeeds(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """F1. Один retry после EOF по-прежнему спасает анализ."""
+    route = respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        side_effect=[
+            sse_response({"choices": [{"delta": {"content": '{"analysis": ['}}]}, "[DONE]"),
+            sse_response({"choices": [{"delta": {"content": VALID_CONTENT}}]}, "[DONE]"),
+        ]
+    )
+
+    result = await run_stream(client)
+
+    assert result.analysis[0].player_id == 100
+    assert route.call_count == 2
+
+
+async def test_empty_analysis_response_is_valid_contract() -> None:
+    """F2. Пустой ответ (EOF-фоллбэк) валиден: 0 predictions — это OK."""
+    response = empty_analysis_response()
+
+    assert response.analysis == []
+    assert response.game_read
+    assert response.reasoning

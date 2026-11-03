@@ -54,6 +54,9 @@ class GameState:
         self._day_number = 0
         self._role_count: dict[str, int] | None = None
         self._total_players: int | None = None
+        #: Names from the last ``ALIVE_LIST`` — the whitelist of real players
+        #: (utility bots writing in the game chat are not in it).
+        self._last_alive_list_names: frozenset[str] = frozenset()
 
     @property
     def game_id(self) -> int:
@@ -63,8 +66,34 @@ class GameState:
     def register_player(
         self, player_id: int, display_name: str, username: str | None = None
     ) -> Player:
-        """Register a player or refresh their display details."""
+        """Register a player or refresh their display details.
+
+        A real (positive) id collapses the placeholder that the earlier
+        ``ALIVE_LIST`` registered for the same display name: the placeholder is
+        dropped and any ground truth it already carries (``known_role``,
+        ``final_role``, ``is_winner``) moves to the real player. Without this
+        merge the same person exists twice in the game and ``END_GAME``
+        matching by display name writes the final role into the placeholder,
+        leaving the real id labeled "unknown" in retro.
+        """
         existing = self._players.get(player_id)
+        if player_id > 0:
+            # Real id arrives: drop any placeholder with the same
+            # display_name (registered from ALIVE_LIST before speech).
+            placeholder_ids = [
+                pid
+                for pid, p in self._players.items()
+                if pid < 0 and p.display_name == display_name
+            ]
+            for pid in placeholder_ids:
+                placeholder = self._players.pop(pid)
+                # Transfer any known_role/final_role from placeholder
+                if existing is None and (
+                    placeholder.known_role
+                    or placeholder.final_role
+                    or placeholder.is_winner is not None
+                ):
+                    existing = placeholder
         if existing is None:
             player = Player(
                 player_id=player_id,
@@ -120,6 +149,7 @@ class GameState:
                 self._players = {}
                 self._role_count = None
                 self._total_players = None
+                self._last_alive_list_names = frozenset()
                 self._events.append(event)
                 return
 
@@ -138,29 +168,42 @@ class GameState:
                     f"but current phase is {self._phase.value}"
                 )
         elif isinstance(event, AliveListEvent):
-            existing_names = {p.display_name for p in self._players.values()}
+            known_usernames = {p.username for p in self._players.values() if p.username is not None}
             for name in event.payload.alive_player_names:
                 pid = _placeholder_player_id(name)
                 if pid in self._players:
                     # Player registered earlier (real id from speech or
                     # previously from ALIVE_LIST). Don't overwrite
                     # display_name, just refresh alive.
-                    existing = self._players[pid]
-                    if existing.display_name not in existing_names:
-                        existing_names.add(existing.display_name)
                     continue
-                if name in existing_names:
+                # A real (positive) id already known by this name (or by this
+                # username) must never get a second, placeholder identity.
+                if any(
+                    p.player_id > 0 and (p.display_name == name or p.username == name)
+                    for p in self._players.values()
+                ):
+                    continue
+                if name in known_usernames:
                     continue
                 self.register_player(pid, name, username=None)
-                existing_names.add(name)
             alive_names = set(event.payload.alive_player_names)
             for name in event.payload.alive_player_names:
+                # ALIVE_LIST names are display names, but a name that resolves
+                # to a registered username must keep that player alive as well.
                 pid = _placeholder_player_id(name)
-                if pid in self._players:
-                    alive_names.add(self._players[pid].display_name)
+                placeholder = self._players.get(pid)
+                if placeholder is not None:
+                    alive_names.add(placeholder.display_name)
+                alive_names.update(
+                    p.display_name
+                    for p in self._players.values()
+                    if p.username is not None and p.username == name
+                )
             updated: dict[int, Player] = {}
             for pid, player in self._players.items():
-                if player.display_name in alive_names:
+                if player.display_name in alive_names or (
+                    player.username is not None and player.username in alive_names
+                ):
                     updated[pid] = player
                 elif player.alive:
                     updated[pid] = player.model_copy(update={"alive": False})
@@ -171,6 +214,7 @@ class GameState:
                 dict(event.payload.role_count) if event.payload.role_count is not None else None
             )
             self._total_players = event.payload.total_players
+            self._last_alive_list_names = frozenset(event.payload.alive_player_names)
         elif isinstance(event, (MessageEvent, VoteEvent)):
             pass
         elif isinstance(event, EndGameEvent):
@@ -296,6 +340,11 @@ class GameState:
     def total_players(self) -> int | None:
         """Bot-reported total alive count, or None."""
         return self._total_players
+
+    @property
+    def last_alive_list_names(self) -> frozenset[str]:
+        """Names from the last ALIVE_LIST (empty before the first one)."""
+        return self._last_alive_list_names
 
     def events(self) -> tuple[AnyEvent, ...]:
         """Return successfully applied events in append order."""

@@ -125,6 +125,13 @@ class GamePlayersRepository:
         ).fetchone()
         return cast(sqlite3.Row | None, row)
 
+    def delete_player(self, *, game_id: int, player_id: int) -> None:
+        """Remove placeholder from game_players (merge cleanup)."""
+        self._conn.execute(
+            "DELETE FROM game_players WHERE game_id = ? AND player_id = ?",
+            (game_id, player_id),
+        )
+
     def list_game_players(self, game_id: int) -> list[sqlite3.Row]:
         """Return all participation rows of a game ordered by id."""
         cursor = self._conn.execute(

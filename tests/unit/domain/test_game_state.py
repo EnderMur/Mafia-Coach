@@ -133,6 +133,36 @@ def test_register_player_updates_existing_player_without_duplicate(
     assert updated.username == "new"
 
 
+def test_register_real_replaces_placeholder(game: GameState, registry: RoleRegistry) -> None:
+    """A real id collapses the same-named placeholder and inherits its ground truth."""
+    placeholder_id = _placeholder_player_id("Вася")
+    assert placeholder_id < 0
+    game.register_player(placeholder_id, "Вася")
+    game.apply(make_end_game(winners=[("Вася", "Комиссар Каттани")]))
+    placeholder = game.player(placeholder_id)
+    assert placeholder.final_role is not None
+    assert placeholder.is_winner is True
+
+    real = game.register_player(456, "Вася")
+
+    assert [player.player_id for player in game.players()] == [456]
+    assert real.display_name == "Вася"
+    assert real.final_role == registry.resolve_alias("Комиссар Каттани")
+    assert real.final_role is not None
+    assert real.revealed is True
+    assert real.is_winner is True
+
+
+def test_register_real_no_placeholder_unchanged(game: GameState) -> None:
+    """Without a placeholder the real registration is a plain single player."""
+    real = game.register_player(456, "Вася")
+
+    assert game.players() == (real,)
+    assert real.player_id == 456
+    assert real.known_role is None
+    assert real.is_winner is None
+
+
 def test_register_player_preserves_existing_game_state(game: GameState) -> None:
     """Refreshing a player does not restore a dead player or erase a reveal."""
     game.register_player(1, "Player")
@@ -623,3 +653,30 @@ def test_placeholder_id_is_stable_negative_int64() -> None:
     assert -(2**63) < pid < 0
     assert pid == _placeholder_player_id("Never Wrote")
     assert pid != _placeholder_player_id("Another Player")
+
+
+def test_last_alive_list_names_whitelist(game: GameState) -> None:
+    """E. Последний ALIVE_LIST задаёт whitelist реальных игроков."""
+    assert game.last_alive_list_names == frozenset()
+
+    game.apply(make_alive_list(["A", "B"]))
+
+    assert game.last_alive_list_names == frozenset({"A", "B"})
+
+
+def test_last_alive_list_names_reset_on_new_game(game: GameState) -> None:
+    """E. Новый GAME_START очищает whitelist вместе с остальным состоянием."""
+    game.apply(make_alive_list(["A", "B"]))
+    game.apply(
+        PhaseChangeEvent(
+            ts=event_time(),
+            game_id=1,
+            payload=PhaseChangePayload(
+                from_phase=Phase.END,
+                to_phase=Phase.REGISTRATION,
+                day_number=0,
+            ),
+        )
+    )
+
+    assert game.last_alive_list_names == frozenset()

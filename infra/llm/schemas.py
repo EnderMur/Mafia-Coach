@@ -146,7 +146,46 @@ def validate_response(
             continue
         filtered_predictions.append(prediction)
 
-    return response.model_copy(update={"analysis": filtered_predictions}), warnings
+    # Soft cap: a confident role without a concrete argument is a guess. The
+    # model defaults to "Мирный житель" for players it knows nothing about
+    # (28 predictions → 21 unknown after dogfooding), so confidence > 0.6
+    # needs at least one reason beyond "молчит"/"нет данных".
+    clamped_predictions: list[PlayerPrediction] = []
+    for prediction in filtered_predictions:
+        if prediction.confidence > 0.6 and not _has_strong_signal(prediction.reasons):
+            warnings.append(
+                f"clamped confidence for player {prediction.player_id}: "
+                f"no strong signal (was {prediction.confidence:.2f}, now 0.5)"
+            )
+            prediction = prediction.model_copy(update={"confidence": 0.5})
+        clamped_predictions.append(prediction)
+
+    return response.model_copy(update={"analysis": clamped_predictions}), warnings
+
+
+_WEAK_REASONS: frozenset[str] = frozenset(
+    {
+        "молчит",
+        "не участвует",
+        "не пишет",
+        "нет данных",
+        "пассивен",
+        "не активен",
+        "не ясно",
+    }
+)
+"""Reasons that carry no evidence (behavioural emptiness, not an argument)."""
+
+
+def _has_strong_signal(reasons: list[str]) -> bool:
+    """Reasons, кроме placeholder, есть конкретика."""
+    for r in reasons:
+        r_lower = r.strip().lower()
+        if r_lower in _WEAK_REASONS:
+            continue
+        if len(r_lower) >= 15:  # развёрнутый аргумент
+            return True
+    return False
 
 
 def _resolve_role(

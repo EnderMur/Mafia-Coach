@@ -28,6 +28,7 @@ from domain.events import (
     PhaseChangeEvent,
     PhaseChangePayload,
 )
+from domain.game_state import _placeholder_player_id
 from domain.phases import Phase
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
@@ -960,6 +961,94 @@ async def test_run_retro_persists_all_players(tmp_path: Path) -> None:
     await orchestrator.shutdown()
 
 
+async def test_run_retro_merges_placeholder(tmp_path: Path) -> None:
+    """A placeholder and its real twin are merged before retro (one row each)."""
+
+    class RecordingGamePlayers:
+        """Delegating proxy that records participation deletes."""
+
+        def __init__(self, inner: Any) -> None:
+            self._inner = inner
+            self.deleted: list[int] = []
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._inner, name)
+
+        def delete_player(self, *, game_id: int, player_id: int) -> None:
+            self.deleted.append(player_id)
+            self._inner.delete_player(game_id=game_id, player_id=player_id)
+
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+
+    game_state = result.game_state
+    game_id = game_state.game_id
+    placeholder_id = _placeholder_player_id("Вася")
+    game_state.register_player(456, "Вася")
+    game_state.register_player(placeholder_id, "Вася")
+    game_state.register_player(457, "Петя")
+
+    # SQLite foreign keys require players rows even for negative ids (they are
+    # exactly what _persist_player writes for ALIVE_LIST placeholders).
+    for player in game_state.players():
+        result.repos.players.upsert_player(
+            player_id=player.player_id,
+            username=None,
+            display_name=player.display_name,
+        )
+    repo = RecordingGamePlayers(result.repos.game_players)
+    result.repos.game_players = repo  # type: ignore[assignment]
+    for player in game_state.players():
+        await orchestrator._persist_player(player.player_id, player.display_name)
+    result.repos.predictions.upsert_prediction(
+        game_id=game_id,
+        player_id=placeholder_id,
+        predicted_role="Мафия",
+        confidence=0.8,
+        reasoning="голосовал против дона",
+    )
+
+    await orchestrator._run_retro()
+
+    predictions = result.repos.predictions.list_predictions(game_id)
+    assert [int(row["player_id"]) for row in predictions] == [456]
+    assert repo.deleted == [placeholder_id]
+    remaining = {
+        int(row["player_id"]) for row in result.repos.game_players.list_game_players(game_id)
+    }
+    assert placeholder_id not in remaining
+    assert {456, 457} <= remaining
+    assert result.repos.players.get_player(placeholder_id) is None
+    assert result.repos.players.get_player(456) is not None
+    await orchestrator.shutdown()
+
+
+async def test_merge_predictions_db(tmp_path: Path) -> None:
+    """merge_player keeps the real row and repoints the placeholder row."""
+    result, _, _ = await make_result(tmp_path)
+    game_id = result.game_state.game_id
+    repo = result.repos.predictions
+    result.repos.players.upsert_player(player_id=-7, username=None, display_name="Плейсхолдер")
+    result.repos.players.upsert_player(player_id=-8, username=None, display_name="Второй")
+    result.repos.players.upsert_player(player_id=456, username=None, display_name="Реальный")
+    repo.upsert_prediction(
+        game_id=game_id, player_id=-7, predicted_role="Мафия", confidence=0.7, reasoning="дубль"
+    )
+
+    # real id has no prediction yet → the placeholder row moves over.
+    repo.merge_player(from_player_id=-7, to_player_id=456, game_id=game_id)
+    rows = repo.list_predictions(game_id)
+    assert [(int(row["player_id"]), row["predicted_role"]) for row in rows] == [(456, "Мафия")]
+
+    # both rows exist → the real prediction wins, the duplicate is deleted.
+    repo.upsert_prediction(
+        game_id=game_id, player_id=-8, predicted_role="Мирный житель", confidence=0.3, reasoning="x"
+    )
+    repo.merge_player(from_player_id=-8, to_player_id=456, game_id=game_id)
+    rows = repo.list_predictions(game_id)
+    assert [(int(row["player_id"]), row["predicted_role"]) for row in rows] == [(456, "Мафия")]
+
+
 async def test_handle_status_uses_total_players(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -987,10 +1076,10 @@ async def test_handle_status_uses_total_players(
     await orchestrator.shutdown()
 
 
-async def test_handle_status_falls_back_to_len_players(
+async def test_handle_status_falls_back_to_alive_count(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """_handle_status falls back to len(players()) when total_players is None."""
+    """_handle_status falls back to alive count when total_players is None."""
     result, _telegram, _llm = await make_result(tmp_path)
     for idx in range(1, 4):
         result.game_state.register_player(PLAYER_ID + idx, f"Игрок {idx}")
@@ -1011,7 +1100,9 @@ async def test_handle_status_falls_back_to_len_players(
     await orchestrator._handle_status()
     output = capsys.readouterr().out
 
-    assert "alive=2/3" in output
+    # Дубли и placeholder-и не раздувают total: без данных бота это живые.
+    assert "alive=2/2" in output
+    assert "alive=2/3" not in output
     await orchestrator.shutdown()
 
 
@@ -1152,3 +1243,183 @@ async def test_handle_retro(tmp_path: Path, capsys: pytest.CaptureFixture[str]) 
     await orchestrator._handle_command("/retro")
     assert "Retro failed: broken" in capsys.readouterr().out
     await orchestrator.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Part D: show_dead + status total via bot
+# ---------------------------------------------------------------------------
+
+
+async def test_send_stats_skips_dead_by_default(tmp_path: Path) -> None:
+    """D. Мёртвые игроки не попадают в таблицу по умолчанию."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    game_state = result.game_state
+    alive_ids = (100, 101, 102)
+    dead_ids = (103, 104)
+    for player_id in alive_ids + dead_ids:
+        game_state.register_player(player_id, f"Игрок {player_id}")
+    for player_id in dead_ids:
+        game_state.apply(
+            DeathEvent(
+                ts=EVENT_TS,
+                game_id=game_state.game_id,
+                payload=DeathPayload(
+                    victim_id=player_id,
+                    victim_name=f"Игрок {player_id}",
+                    cause="lynch",
+                ),
+            )
+        )
+    assert result.config.analysis.show_dead is False
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert len(ui.stats[-1].rows) == 3
+        assert {row.player_name for row in ui.stats[-1].rows} == {
+            f"Игрок {player_id}" for player_id in alive_ids
+        }
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_send_stats_show_dead(tmp_path: Path) -> None:
+    """D. show_dead=true показывает всех и помечает мёртвых."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    result.config = result.config.model_copy(
+        update={"analysis": result.config.analysis.model_copy(update={"show_dead": True})}
+    )
+    game_state = result.game_state
+    for player_id in (100, 101, 102, 103, 104):
+        game_state.register_player(player_id, f"Игрок {player_id}")
+    for player_id in (103, 104):
+        game_state.apply(
+            DeathEvent(
+                ts=EVENT_TS,
+                game_id=game_state.game_id,
+                payload=DeathPayload(
+                    victim_id=player_id,
+                    victim_name=f"Игрок {player_id}",
+                    cause="lynch",
+                ),
+            )
+        )
+    result.repos.players.upsert_player(player_id=103, username=None, display_name="Игрок 103")
+    result.repos.predictions.upsert_prediction(
+        game_id=game_state.game_id,
+        player_id=103,
+        predicted_role="Мафия",
+        confidence=0.8,
+        reasoning="голосовал против дона",
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        rows = ui.stats[-1].rows
+        assert len(rows) == 5
+        by_name = {row.player_name: row.role for row in rows}
+        assert by_name["Игрок 103"] == "[мёртв] Мафия"
+        assert by_name["Игрок 104"] == "[мёртв] —"
+        assert by_name["Игрок 100"] == "—"
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_status_total_uses_bot_when_consistent(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """D. total берётся у бота, пока он не меньше числа живых; иначе — живые."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    game_state = result.game_state
+    names = [f"Игрок {index}" for index in range(1, 8)]
+    for index, name in enumerate(names, start=1):
+        game_state.register_player(PLAYER_ID + index, name)
+    game_state.apply(
+        AliveListEvent(
+            ts=EVENT_TS,
+            game_id=game_state.game_id,
+            payload=AliveListPayload(alive_player_names=names, total_players=10),
+        )
+    )
+    orchestrator = Orchestrator(bootstrap_result=result)
+    try:
+        await orchestrator._handle_status()
+        assert "alive=7/10" in capsys.readouterr().out
+
+        game_state.apply(
+            AliveListEvent(
+                ts=EVENT_TS,
+                game_id=game_state.game_id,
+                payload=AliveListPayload(alive_player_names=names, total_players=4),
+            )
+        )
+        await orchestrator._handle_status()
+        assert "alive=7/7" in capsys.readouterr().out
+    finally:
+        await orchestrator.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# Part E: bots whitelist via ALIVE_LIST
+# ---------------------------------------------------------------------------
+
+
+async def test_send_stats_whitelist(tmp_path: Path) -> None:
+    """E. Utility-бот вне ALIVE_LIST не попадает в таблицу."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    game_state = result.game_state
+    for player_id, name in ((100, "A"), (101, "B"), (102, "EzzProd")):
+        game_state.register_player(player_id, name)
+    game_state.apply(
+        AliveListEvent(
+            ts=EVENT_TS,
+            game_id=game_state.game_id,
+            payload=AliveListPayload(alive_player_names=["A", "B"], total_players=2),
+        )
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert {row.player_name for row in ui.stats[-1].rows} == {"A", "B"}
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_send_stats_no_whitelist(tmp_path: Path) -> None:
+    """E. Пока ALIVE_LIST не приходил, показываются все real-игроки."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    game_state = result.game_state
+    for player_id, name in ((100, "A"), (101, "B"), (102, "C")):
+        game_state.register_player(player_id, name)
+    assert game_state.last_alive_list_names == frozenset()
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert {row.player_name for row in ui.stats[-1].rows} == {"A", "B", "C"}
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_send_stats_whitelist_matches_username(tmp_path: Path) -> None:
+    """E. ALIVE_LIST приходит display-именами; username тоже принимается."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    game_state = result.game_state
+    game_state.register_player(100, "Вася", username="vasya")
+    game_state.register_player(101, "Петя", username="petya")
+    game_state.apply(
+        AliveListEvent(
+            ts=EVENT_TS,
+            game_id=game_state.game_id,
+            payload=AliveListPayload(alive_player_names=["vasya", "Петя"], total_players=2),
+        )
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert len(ui.stats[-1].rows) == 2
+    finally:
+        await orchestrator.shutdown()

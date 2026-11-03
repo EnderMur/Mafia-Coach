@@ -76,6 +76,8 @@ class AnalysisSection(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     min_confidence_to_display: float = Field(ge=0.0, le=1.0, default=0.15)
+    #: Показывать в таблице мёртвых игроков (по умолчанию — только живые).
+    show_dead: bool = False
 
 
 class UISection(BaseModel):

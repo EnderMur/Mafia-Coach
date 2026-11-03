@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import sys
 import threading
 from collections.abc import Callable
@@ -393,6 +394,63 @@ class Orchestrator:
         finally:
             self._pending_retro = False
 
+    async def _merge_placeholder_players(self, game_state: GameState) -> None:
+        """Collapse ``placeholder + real`` pairs that share a ``display_name``.
+
+        ``ALIVE_LIST`` registers every name with a synthetic negative id before
+        speech reveals the real Telegram id, so one person can exist twice in
+        ``game_state``, ``players`` and ``game_players``. The real id keeps the
+        row: predictions and participation move over, the placeholder rows are
+        deleted (``players.delete_player`` refuses positive ids).
+
+        Best-effort: a failed pair is logged and the remaining pairs still run,
+        because retro must not be blocked by cleanup.
+        """
+        by_display: dict[str, list[int]] = {}
+        for p in game_state.players():
+            by_display.setdefault(p.display_name, []).append(p.player_id)
+
+        for display_name, pids in by_display.items():
+            if len(pids) <= 1:
+                continue
+            real = [pid for pid in pids if pid > 0]
+            placeholders = [pid for pid in pids if pid < 0]
+            if not real or not placeholders:
+                continue
+            keeper = real[0]
+            for ph in placeholders:
+                try:
+                    async with self._db_lock:
+                        await asyncio.to_thread(
+                            self._result.repos.predictions.merge_player,
+                            from_player_id=ph,
+                            to_player_id=keeper,
+                            game_id=game_state.game_id,
+                        )
+                        await asyncio.to_thread(
+                            self._result.repos.game_players.delete_player,
+                            game_id=game_state.game_id,
+                            player_id=ph,
+                        )
+                        await asyncio.to_thread(
+                            self._result.repos.players.delete_player,
+                            player_id=ph,
+                        )
+                except Exception as e:  # noqa: BLE001 — merge is best-effort
+                    logger.bind(channel=_LOGGER_CHANNEL).warning(
+                        "merge placeholder {} → {} ({}) failed: {}: {}",
+                        ph,
+                        keeper,
+                        display_name,
+                        type(e).__name__,
+                        str(e),
+                    )
+                else:
+                    # Keep the dropped id marked as persisted: ``_run_retro``
+                    # persists every missing player afterwards, and re-inserting
+                    # the placeholder would undo this merge (dangling rows).
+                    self._registered_player_ids.add(ph)
+
     async def _persist_final_roles(self, game_state: GameState, game_id: int) -> None:
         """Write every known final role into ``game_players``.
 
@@ -416,7 +474,10 @@ class Orchestrator:
                     survived=player.alive,
                     is_winner=player.is_winner,
                 )
-            except ConfigError as error:
+            except (ConfigError, sqlite3.IntegrityError) as error:
+                # IntegrityError: the participation row still points at a
+                # placeholder that the merge cleanup could not delete — skip
+                # this player instead of aborting the whole retro.
                 logger.bind(channel=_LOGGER_CHANNEL).warning(
                     "final_role skipped for {} (not in game_players): {}",
                     player.player_id,
@@ -446,6 +507,12 @@ class Orchestrator:
         game_id = game_state.game_id
         if game_id == 0:
             return
+
+        # Merge placeholder + real с одним display_name в game_players /
+        # players: real приоритетнее, placeholder удаляется. Иначе один и тот
+        # же человек висит в таблице дважды, а final_role достаётся случайной
+        # (первой по порядку регистрации) записи.
+        await self._merge_placeholder_players(game_state)
 
         # Persist ALL players (including END_GAME placeholders) to
         # game_players before retro. Without this, placeholders
@@ -519,6 +586,7 @@ class Orchestrator:
                     game_state.game_id,
                 )
             min_confidence = self._result.config.analysis.min_confidence_to_display
+            show_dead = self._result.config.analysis.show_dead
             sorted_predictions = sorted(
                 predictions,
                 key=lambda row: float(row["confidence"]),
@@ -527,21 +595,40 @@ class Orchestrator:
             predictions_by_player = {
                 int(prediction["player_id"]): prediction for prediction in sorted_predictions
             }
+            # ALIVE_LIST whitelist: utility bots that post in the game chat
+            # (EzzProd & co.) are not players and must not get a table row.
+            # An empty set means the bot has not sent ALIVE_LIST yet — show all
+            # real players rather than nothing.
+            whitelist = game_state.last_alive_list_names
+            all_players = game_state.players()
             rows: list[StatsRow] = []
-            for player in game_state.players():
-                if player.player_id <= 0:
-                    continue  # skip placeholders
+            for player in all_players:
+                if player.player_id <= 0:  # placeholder
+                    continue
+                if whitelist and not (
+                    player.display_name in whitelist
+                    or (player.username is not None and player.username in whitelist)
+                ):
+                    continue
+                if not show_dead and not player.alive:
+                    continue
                 prediction = predictions_by_player.get(player.player_id)
                 if prediction is not None and float(prediction["confidence"]) >= min_confidence:
+                    role_str = str(prediction["predicted_role"])
+                    if not player.alive:
+                        role_str = f"[мёртв] {role_str}"
                     rows.append(
                         StatsRow(
                             player_name=player.display_name,
-                            role=str(prediction["predicted_role"]),
+                            role=role_str,
                             confidence=float(prediction["confidence"]),
                         )
                     )
                 else:
-                    rows.append(StatsRow(player_name=player.display_name, role="—", confidence=0.0))
+                    role_dash = "—" if player.alive else "[мёртв] —"
+                    rows.append(
+                        StatsRow(player_name=player.display_name, role=role_dash, confidence=0.0)
+                    )
             rows.sort(key=lambda row: (-row.confidence, row.player_name))
             logger.bind(channel=_LOGGER_CHANNEL).debug(
                 "send_stats: {} rows",
@@ -818,16 +905,17 @@ class Orchestrator:
     async def _handle_status(self) -> None:
         """Print the current game snapshot and the five strongest predictions."""
         game_state = self._result.game_state
-        players = game_state.players()
         alive = game_state.alive_players()
-        total = game_state.total_players
-        known = len(players)
-        # If bot total known and consistent — use it; otherwise use
-        # registered count (bot might be stale).
-        if total is not None and total >= len(alive):
-            display_total = total
+        alive_count = len(alive)
+        bot_total = game_state.total_players
+        # NEVER len(players()): placeholders and already-merged duplicates
+        # inflate it (35 players for a 30-player game). The bot's headcount is
+        # authoritative while it is consistent; otherwise it is stale (e.g. it
+        # still reports 4 when 7 players are alive) and alive_count is used.
+        if bot_total is not None and bot_total >= alive_count >= 1:
+            display_total = bot_total
         else:
-            display_total = known
+            display_total = alive_count
         print(
             f"Game #{game_state.game_id}, "
             f"phase={game_state.current_phase().value}, "
