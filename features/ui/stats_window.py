@@ -10,11 +10,12 @@ from typing import TextIO
 from pydantic import ValidationError
 from rich.console import Console
 from rich.table import Table
+from rich.text import Text
 
-from features.ui.protocol import IPCEnvelope, StatsMessage, decode
+from features.ui.protocol import IPCEnvelope, StatsMessage, StatsRow, decode
 
 _HEADER = "Stats"
-_MAX_ROWS = 30
+_MAX_ROWS = 50
 _WINDOW_NAME = "stats_window"
 
 
@@ -58,6 +59,13 @@ def _safe_clear(console: Console) -> None:
             console.print("", highlight=False)
 
 
+def _format_confidence(row: StatsRow) -> str:
+    """Show a dash instead of an apparent percentage for unknown confidence."""
+    if row.role == "—" or row.confidence <= 0.0:
+        return "—"
+    return f"{int(row.confidence * 100)}%"
+
+
 def render_table(console: Console, msg: StatsMessage) -> None:
     """Render one stats frame."""
     _safe_clear(console)
@@ -66,10 +74,15 @@ def render_table(console: Console, msg: StatsMessage) -> None:
         show_lines=False,
     )
     table.add_column("Игрок", style="cyan", no_wrap=True)
-    table.add_column("Роль", style="magenta")
-    table.add_column("Уверенность", justify="right", style="green")
+    table.add_column("Роль")
+    table.add_column("Уверенность", justify="right")
     for row in msg.rows[:_MAX_ROWS]:
-        table.add_row(row.player_name, row.role, f"{int(row.confidence * 100)}%")
+        confidence = _format_confidence(row)
+        table.add_row(
+            row.player_name,
+            Text(row.role, style="dim" if row.role == "—" else "magenta"),
+            Text(confidence, style="dim" if confidence == "—" else "green"),
+        )
     console.print(table)
 
 

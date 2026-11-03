@@ -37,6 +37,8 @@ from features.analyzer.context_builder import (
     PhaseInfo,
     PlayerInfo,
     PredictionSnapshot,
+    VoteInfo,
+    _render_role_notes,
     build_context,
     to_llm_messages,
 )
@@ -180,6 +182,7 @@ def test_empty_game_state_builds_empty_context(registry: RoleRegistry) -> None:
     assert context.players == []
     assert context.recent_messages == []
     assert context.recent_deaths == []
+    assert context.recent_votes == []
     assert context.previous_predictions == []
     assert context.truncated_messages == 0
     assert context.total_messages_seen == 0
@@ -338,6 +341,76 @@ def test_votes_are_not_messages(registry: RoleRegistry) -> None:
     assert len(context.recent_messages) == 1
     assert context.recent_messages[0].author_name == "Вася"
     assert context.total_messages_seen == 1
+
+
+def test_build_context_includes_recent_votes(registry: RoleRegistry) -> None:
+    """Votes retain their timestamp, names, order, and optional target."""
+    state = make_game_state(2, registry=registry)
+    for index, target_name in enumerate(("Петя", None, "Вася")):
+        state.apply(
+            VoteEvent(
+                ts=BASE_TS + timedelta(seconds=index),
+                game_id=1,
+                payload=VotePayload(
+                    voter_id=100,
+                    voter_name=f"Избиратель {index}",
+                    target_id=101 if target_name else None,
+                    target_name=target_name,
+                ),
+            )
+        )
+
+    context = build_context(game_state=state, registry=registry)
+
+    assert context.recent_votes == [
+        VoteInfo(ts=BASE_TS, voter_name="Избиратель 0", target_name="Петя"),
+        VoteInfo(ts=BASE_TS + timedelta(seconds=1), voter_name="Избиратель 1", target_name=None),
+        VoteInfo(ts=BASE_TS + timedelta(seconds=2), voter_name="Избиратель 2", target_name="Вася"),
+    ]
+    assert context.recent_messages == []
+
+
+def test_recent_votes_limit_20(registry: RoleRegistry) -> None:
+    """Only the newest twenty applied votes are retained, in their original order."""
+    state = make_game_state(2, registry=registry)
+    for index in range(25):
+        state.apply(
+            VoteEvent(
+                ts=BASE_TS + timedelta(seconds=index),
+                game_id=1,
+                payload=VotePayload(
+                    voter_id=100,
+                    voter_name=f"Избиратель {index}",
+                    target_id=101,
+                    target_name="Петя",
+                ),
+            )
+        )
+
+    context = build_context(game_state=state, registry=registry)
+
+    assert len(context.recent_votes) == 20
+    assert [vote.voter_name for vote in context.recent_votes] == [
+        f"Избиратель {index}" for index in range(5, 25)
+    ]
+    assert context.recent_votes[0].ts == BASE_TS + timedelta(seconds=5)
+    assert context.recent_votes[-1].ts == BASE_TS + timedelta(seconds=24)
+
+
+def test_render_role_notes(registry: RoleRegistry) -> None:
+    """Real role notes are rendered; blank notes are ignored and whitespace stripped."""
+    notes = _render_role_notes(registry)
+    assert "Комиссар" in notes
+    assert "Стреляет после проверки" in notes
+
+    first, second = registry.all_roles()[:2]
+    trimmed_registry = RoleRegistry(
+        [
+            first.model_copy(update={"notes": "  проверить голос  "}),
+            second.model_copy(update={"notes": "  "}),
+        ]
+    )
+    assert _render_role_notes(trimmed_registry) == f"- {first.name_ru}: проверить голос"
 
 
 def test_previous_predictions_are_preserved(registry: RoleRegistry) -> None:
@@ -515,6 +588,58 @@ def test_to_llm_messages_renders_predictions_and_hints(
     assert "Мафия" in user_content
     assert "Сводка эвристик" in user_content
     assert "early_lynch_no_argument" in user_content
+
+
+def test_to_llm_messages_with_club_patterns(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """Custom club patterns reach the user prompt without changing the system message."""
+    context = build_context(game_state=make_game_state(registry=registry), registry=registry)
+
+    messages = to_llm_messages(
+        context, registry=registry, jinja_env=jinja_env, club_patterns="TEST"
+    )
+    empty_messages = to_llm_messages(context, registry=registry, jinja_env=jinja_env)
+
+    assert "Паттерны этого клуба" in messages[1]["content"]
+    assert "TEST" in messages[1]["content"]
+    assert "TEST" not in messages[0]["content"]
+    assert "Паттерны этого клуба" not in empty_messages[1]["content"]
+    assert "Голосования (последние" not in empty_messages[1]["content"]
+
+
+def test_analyze_jinja_renders_votes_and_patterns(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """All three club sections are present when their data is available."""
+    state = make_game_state(2, registry=registry)
+    for index, target_name in enumerate(("Петя", None)):
+        state.apply(
+            VoteEvent(
+                ts=BASE_TS + timedelta(seconds=index),
+                game_id=1,
+                payload=VotePayload(
+                    voter_id=100,
+                    voter_name="Вася",
+                    target_id=101 if target_name else None,
+                    target_name=target_name,
+                ),
+            )
+        )
+    context = build_context(game_state=state, registry=registry)
+
+    messages = to_llm_messages(
+        context, registry=registry, jinja_env=jinja_env, club_patterns="Иллюстративный паттерн"
+    )
+
+    prompt = messages[1]["content"]
+    assert "Голосования (последние 2)" in prompt
+    assert "Вася → Петя" in prompt
+    assert "Вася → (воздержался)" in prompt
+    assert "Тонкости ролей" in prompt
+    assert "Стреляет после проверки" in prompt
+    assert "Паттерны этого клуба" in prompt
+    assert "Иллюстративный паттерн" in prompt
 
 
 def test_to_llm_messages_accepts_explicit_schema(

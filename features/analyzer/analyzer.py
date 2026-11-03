@@ -97,6 +97,7 @@ class GameAnalyzer:
         jinja_env: Environment,
         max_messages: int = 200,
         reasoning_max_chars: int = DEFAULT_REASONING_MAX_CHARS,
+        club_patterns: str = "",
     ) -> None:
         """Retain the dependencies and context/reasoning limits for analysis."""
         self._llm_client = llm_client
@@ -105,6 +106,7 @@ class GameAnalyzer:
         self._jinja_env = jinja_env
         self._max_messages = max_messages
         self._reasoning_max_chars = reasoning_max_chars
+        self._club_patterns = club_patterns
 
     async def analyze(
         self,
@@ -133,6 +135,7 @@ class GameAnalyzer:
             registry=self._registry,
             jinja_env=self._jinja_env,
             club_notes_summary=self._render_hints(hints),
+            club_patterns=self._club_patterns,
         )
 
         reasoning_buffer: list[str] = []
@@ -183,9 +186,22 @@ class GameAnalyzer:
             )
 
         reasoning_full = "".join(reasoning_buffer)
-        reasoning_truncated = _truncate_reasoning(reasoning_full, self._reasoning_max_chars)
+        reasoning_source = "stream"
+        if not reasoning_full and response.reasoning:
+            # Non-thinking models may return reasoning only in the JSON response.
+            reasoning_full = response.reasoning
+            reasoning_source = "json"
+
+        reasoning_truncated = reasoning_full[: self._reasoning_max_chars]
+        if len(reasoning_full) > self._reasoning_max_chars:
+            reasoning_truncated += f"\n[truncated, total {len(reasoning_full)} chars]"
         if reasoning_truncated:
-            logger.bind(channel="reasoning").info(reasoning_truncated)
+            logger.bind(channel="reasoning").info(
+                "reasoning ({}) [{}]: {}",
+                reasoning_source,
+                len(reasoning_full),
+                reasoning_truncated[:200],
+            )
 
         warnings: list[str] = []
         if persist:

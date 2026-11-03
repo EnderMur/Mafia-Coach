@@ -22,6 +22,27 @@ def test_load_valid_config(tmp_path: Path) -> None:
     assert config.telegram.bot_id == 42
     assert config.llm.trigger_mode == "queue"
     assert config.db.path == str(tmp_path / "mafia.db")
+    assert config.club_patterns_file == str(tmp_path / "patterns.txt")
+
+
+def test_config_defaults_club_patterns_file(tmp_path: Path) -> None:
+    """Older settings without the new key use the standard private path."""
+    config_path = create_settings_file(tmp_path)
+    settings = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    del settings["club_patterns_file"]
+    config_path.write_text(yaml.safe_dump(settings, allow_unicode=True), encoding="utf-8")
+
+    assert load_config(config_path).club_patterns_file == "configs/club_patterns.txt"
+
+
+def test_config_accepts_custom_club_patterns_path(tmp_path: Path) -> None:
+    """A custom path can be supplied without changing the default configuration."""
+    config_path = create_settings_file(tmp_path)
+    settings = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    settings["club_patterns_file"] = str(tmp_path / "custom.txt")
+    config_path.write_text(yaml.safe_dump(settings, allow_unicode=True), encoding="utf-8")
+
+    assert load_config(config_path).club_patterns_file == str(tmp_path / "custom.txt")
 
 
 def test_missing_file_raises_config_error_with_path(tmp_path: Path) -> None:

@@ -506,7 +506,7 @@ class Orchestrator:
             )
 
     async def _send_stats(self) -> None:
-        """Send persisted predictions after a flush, or empty rows to clear stale stats."""
+        """Send all real players with their current predictions, if confident enough."""
         if self._ui is None:
             return
         game_state = self._result.game_state
@@ -523,33 +523,31 @@ class Orchestrator:
                 predictions,
                 key=lambda row: float(row["confidence"]),
                 reverse=True,
-            )[:20]
-            players = game_state.players()
+            )
+            predictions_by_player = {
+                int(prediction["player_id"]): prediction for prediction in sorted_predictions
+            }
             rows: list[StatsRow] = []
-            for prediction in sorted_predictions:
-                confidence = float(prediction["confidence"])
-                if confidence < min_confidence:
-                    continue
-                player = next(
-                    (item for item in players if item.player_id == prediction["player_id"]),
-                    None,
-                )
-                if player is None:
-                    continue
+            for player in game_state.players():
                 if player.player_id <= 0:
-                    continue  # skip placeholder in Stats Window
-                rows.append(
-                    StatsRow(
-                        player_name=player.display_name,
-                        role=str(prediction["predicted_role"]),
-                        confidence=confidence,
+                    continue  # skip placeholders
+                prediction = predictions_by_player.get(player.player_id)
+                if prediction is not None and float(prediction["confidence"]) >= min_confidence:
+                    rows.append(
+                        StatsRow(
+                            player_name=player.display_name,
+                            role=str(prediction["predicted_role"]),
+                            confidence=float(prediction["confidence"]),
+                        )
                     )
-                )
+                else:
+                    rows.append(StatsRow(player_name=player.display_name, role="—", confidence=0.0))
+            rows.sort(key=lambda row: (-row.confidence, row.player_name))
             logger.bind(channel=_LOGGER_CHANNEL).debug(
                 "send_stats: {} rows",
                 len(rows),
             )
-            # Empty predictions still send a frame so the UI clears stale rows.
+            # Send even an empty frame so the UI clears stale rows.
             message = StatsMessage(
                 game_id=game_state.game_id,
                 phase=game_state.current_phase().value,

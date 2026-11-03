@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import builtins
 import io
+import re
 import sys
 from typing import Any
 
@@ -12,7 +13,7 @@ from rich.console import Console
 
 from features.ui import stats_window as stats_window_module
 from features.ui.protocol import IPCEnvelope, StatsMessage, StatsRow, encode
-from features.ui.stats_window import main, render_table
+from features.ui.stats_window import _format_confidence, main, render_table
 
 # The autouse conftest fixture stubs this out on Windows; the CONOUT$ tests
 # need the real implementation, so keep a reference captured at import time.
@@ -67,7 +68,40 @@ def test_render_table_shows_players_phase_day_and_confidence() -> None:
         assert expected in rendered
 
 
-def test_max_rows_30() -> None:
+@pytest.mark.parametrize(
+    ("role", "confidence", "expected"),
+    [("—", 0.75, "—"), ("Мафия", 0.0, "—"), ("Мафия", 0.75, "75%")],
+)
+def test_format_confidence_dash(role: str, confidence: float, expected: str) -> None:
+    """Unknown roles and zero confidence are not represented as 0%."""
+    row = StatsRow(player_name="Анна", role=role, confidence=confidence)
+    assert _format_confidence(row) == expected
+
+
+def test_render_table_dims_unknown_roles_and_confidence() -> None:
+    """Both unknown cells are dimmed while real roles remain magenta."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, color_system="standard", width=120)
+    message = StatsMessage(
+        game_id=1,
+        phase="day",
+        day=1,
+        rows=[
+            StatsRow(player_name="Анна", role="—", confidence=0.0),
+            StatsRow(player_name="Борис", role="Мафия", confidence=0.75),
+        ],
+    )
+
+    render_table(console, message)
+
+    rendered = output.getvalue()
+    assert len(re.findall(r"\x1b\[2m\s*—\s*\x1b\[0m", rendered)) == 2
+    assert "\x1b[35mМафия\x1b[0m" in rendered
+    assert "75%" in rendered
+    assert "0%" not in rendered
+
+
+def test_max_rows_50() -> None:
     """Large frames are truncated at the visible-row cap."""
     output = io.StringIO()
     message = StatsMessage(
@@ -76,14 +110,14 @@ def test_max_rows_30() -> None:
         day=1,
         rows=[
             StatsRow(player_name=f"Игрок {index}", role="Мафия", confidence=0.5)
-            for index in range(35)
+            for index in range(55)
         ],
     )
 
     render_table(Console(file=output, force_terminal=False), message)
 
-    assert "Игрок 29" in output.getvalue()
-    assert "Игрок 30" not in output.getvalue()
+    assert "Игрок 49" in output.getvalue()
+    assert "Игрок 50" not in output.getvalue()
 
 
 def test_main_processes_stats_and_shutdown_lines() -> None:

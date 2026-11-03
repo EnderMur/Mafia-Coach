@@ -572,6 +572,99 @@ async def test_orchestrator_send_stats_empty_predictions_clears_rows(tmp_path: P
     await orchestrator.shutdown()
 
 
+async def test_send_stats_includes_all_players(tmp_path: Path) -> None:
+    """One prediction and two unknown players are all shown in confidence/name order."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    for player_id, name in ((100, "Вера"), (101, "Борис"), (102, "Аня")):
+        result.game_state.register_player(player_id, name)
+    result.repos.players.upsert_player(player_id=100, username=None, display_name="Вера")
+    result.repos.predictions.upsert_prediction(
+        game_id=result.game_state.game_id,
+        player_id=100,
+        predicted_role="Мафия",
+        confidence=0.8,
+        reasoning="голосование",
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert ui.stats[-1].rows == [
+            StatsRow(player_name="Вера", role="Мафия", confidence=0.8),
+            StatsRow(player_name="Аня", role="—", confidence=0.0),
+            StatsRow(player_name="Борис", role="—", confidence=0.0),
+        ]
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_send_stats_skips_placeholder(tmp_path: Path) -> None:
+    """Synthetic non-positive player IDs must never be sent to the window."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    result.game_state.register_player(100, "Реальный")
+    result.game_state.register_player(-12345, "Плейсхолдер")
+    result.game_state.register_player(0, "Нулевой плейсхолдер")
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert ui.stats[-1].rows == [StatsRow(player_name="Реальный", role="—", confidence=0.0)]
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_send_stats_keeps_low_confidence_players_but_hides_prediction(tmp_path: Path) -> None:
+    """The threshold is inclusive and a lower score renders an unknown role."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    for player_id, name, confidence in ((100, "Анна", 0.15), (101, "Борис", 0.14)):
+        result.game_state.register_player(player_id, name)
+        result.repos.players.upsert_player(player_id=player_id, username=None, display_name=name)
+        result.repos.predictions.upsert_prediction(
+            game_id=result.game_state.game_id,
+            player_id=player_id,
+            predicted_role="Мафия",
+            confidence=confidence,
+            reasoning="голосование",
+        )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert ui.stats[-1].rows == [
+            StatsRow(player_name="Анна", role="Мафия", confidence=0.15),
+            StatsRow(player_name="Борис", role="—", confidence=0.0),
+        ]
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_send_stats_preserves_predictions_beyond_first_twenty(tmp_path: Path) -> None:
+    """A large game does not turn valid predictions after the old cap into dashes."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    for player_id in range(100, 125):
+        name = f"Игрок {player_id}"
+        result.game_state.register_player(player_id, name)
+        result.repos.players.upsert_player(player_id=player_id, username=None, display_name=name)
+        result.repos.predictions.upsert_prediction(
+            game_id=result.game_state.game_id,
+            player_id=player_id,
+            predicted_role="Мафия",
+            confidence=0.5,
+            reasoning="наблюдение",
+        )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert len(ui.stats[-1].rows) == 25
+        assert all(row.role == "Мафия" for row in ui.stats[-1].rows)
+        assert [row.player_name for row in ui.stats[-1].rows] == [
+            f"Игрок {player_id}" for player_id in range(100, 125)
+        ]
+    finally:
+        await orchestrator.shutdown()
+
+
 async def test_send_stats_logs_debug_info(tmp_path: Path) -> None:
     """_send_stats and _send_reasoning log at DEBUG without noisy INFO lines."""
     result, _telegram, _llm = await make_result(tmp_path)
@@ -712,6 +805,36 @@ async def test_orchestrator_sends_reasoning_after_scanner_flush(tmp_path: Path) 
     assert len(ui.reasoning) == 1
     assert "Проверяю" in ui.reasoning[0].text
     await orchestrator.shutdown()
+
+
+async def test_non_thinking_json_reasoning_reaches_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """JSON fallback flows from the analyzer through a real scanner flush to the UI."""
+    result, _telegram, llm = await make_result(tmp_path)
+    response = AnalysisResponse(analysis=[], game_read="Партия продолжается.", reasoning="My COT")
+    analyze_stream = AsyncMock(return_value=response)
+    monkeypatch.setattr(llm, "analyze_stream", analyze_stream)
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        scanner = orchestrator._default_scanner(GAME_CHAT_ID)
+        result.game_state.apply(
+            PhaseChangeEvent(
+                ts=EVENT_TS,
+                game_id=result.game_state.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
+
+        await scanner._flush()
+
+        analyze_stream.assert_awaited_once()
+        assert ui.reasoning == [ReasoningMessage(text="My COT", truncated=False, total_chars=6)]
+    finally:
+        await orchestrator.shutdown()
 
 
 async def test_orchestrator_ui_disabled_is_noop(tmp_path: Path) -> None:

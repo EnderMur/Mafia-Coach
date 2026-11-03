@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import sqlite3
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
+import yaml
+from loguru import logger
 
 from app.bootstrap import Repositories, bootstrap, shutdown_result
 from domain.exceptions import ConfigError
@@ -15,6 +19,98 @@ from infra.db.connection import close, connect
 from infra.db.migrations.runner import apply_migrations
 from infra.db.repositories.games import GamesRepository
 from tests.unit.app.conftest import FakeLLMClient, FakeTelegram, create_settings_file
+
+
+def _settings_with_patterns_file(tmp_path: Path, patterns_path: Path) -> Path:
+    """Point temporary settings at an isolated patterns file."""
+    config_path = create_settings_file(tmp_path)
+    settings = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    settings["club_patterns_file"] = str(patterns_path)
+    config_path.write_text(yaml.safe_dump(settings, allow_unicode=True), encoding="utf-8")
+    return config_path
+
+
+async def test_bootstrap_loads_club_patterns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The primary file wins over an example and flows all the way to the LLM."""
+    patterns_path = tmp_path / "patterns.txt"
+    patterns_path.write_text("  SYNTHETIC PRIMARY  \n", encoding="utf-8")
+    (tmp_path / "patterns.example.txt").write_text("SYNTHETIC EXAMPLE", encoding="utf-8")
+    llm_client = FakeLLMClient()
+    analyze_stream = AsyncMock(wraps=llm_client.analyze_stream)
+    monkeypatch.setattr(llm_client, "analyze_stream", analyze_stream)
+    result = await bootstrap(
+        _settings_with_patterns_file(tmp_path, patterns_path),
+        telegram=FakeTelegram(),  # type: ignore[arg-type]
+        llm_client=llm_client,
+    )
+    try:
+        assert result.config.club_patterns_file == str(patterns_path)
+        assert result.club_patterns == "SYNTHETIC PRIMARY"
+        analysis = await result.analyzer.analyze(result.game_state, persist=False)
+        assert analysis.success
+        assert analyze_stream.await_args is not None
+        prompt = analyze_stream.await_args.kwargs["messages"][1]["content"]
+        assert "SYNTHETIC PRIMARY" in prompt
+        assert "SYNTHETIC EXAMPLE" not in prompt
+    finally:
+        await shutdown_result(result)
+
+
+async def test_bootstrap_falls_back_to_example(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An example is read with a warning when the configured file is absent."""
+    patterns_path = tmp_path / "patterns.txt"
+    example_path = tmp_path / "patterns.example.txt"
+    example_path.write_text("  SYNTHETIC EXAMPLE  \n", encoding="utf-8")
+    monkeypatch.setattr("app.bootstrap.setup_logging", lambda **kwargs: None)
+    captured = io.StringIO()
+    sink = logger.add(captured, level="WARNING", format="{level}: {message}")
+    try:
+        result = await bootstrap(
+            _settings_with_patterns_file(tmp_path, patterns_path),
+            telegram=FakeTelegram(),  # type: ignore[arg-type]
+            llm_client=FakeLLMClient(),
+        )
+        try:
+            assert result.club_patterns == "SYNTHETIC EXAMPLE"
+            assert result.analyzer._club_patterns == result.club_patterns
+        finally:
+            await shutdown_result(result)
+    finally:
+        logger.remove(sink)
+
+    assert "WARNING: club_patterns: using example file" in captured.getvalue()
+    assert str(example_path) in captured.getvalue()
+    assert str(patterns_path) in captured.getvalue()
+    assert not patterns_path.exists()
+
+
+async def test_bootstrap_missing_both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both files can be missing without preventing bootstrap or inventing patterns."""
+    patterns_path = tmp_path / "absent" / "patterns.txt"
+    monkeypatch.setattr("app.bootstrap.setup_logging", lambda **kwargs: None)
+    captured = io.StringIO()
+    sink = logger.add(captured, level="INFO", format="{level}: {message}")
+    try:
+        result = await bootstrap(
+            _settings_with_patterns_file(tmp_path, patterns_path),
+            telegram=FakeTelegram(),  # type: ignore[arg-type]
+            llm_client=FakeLLMClient(),
+        )
+        try:
+            assert result.club_patterns == ""
+            assert result.analyzer._club_patterns == ""
+        finally:
+            await shutdown_result(result)
+    finally:
+        logger.remove(sink)
+
+    assert "INFO: club_patterns: file not found, using empty" in captured.getvalue()
+    assert "club_patterns loaded: 0 chars" in captured.getvalue()
+    assert not patterns_path.exists()
 
 
 async def test_bootstrap_creates_all_resources(tmp_path: Path) -> None:
@@ -36,6 +132,7 @@ async def test_bootstrap_creates_all_resources(tmp_path: Path) -> None:
         assert result.telegram.me_id == telegram.me_id
         assert result.game_state.game_id > 0
         assert result.analyzer is not None
+        assert result.club_patterns == ""
         assert result.trigger_policy.mode is TriggerMode.QUEUE
         assert result.jinja_env.get_template("system.jinja") is not None
         assert result.owns_llm is False
