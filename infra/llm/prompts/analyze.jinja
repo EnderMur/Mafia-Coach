@@ -5,6 +5,13 @@ ID партии: {{ game_id }}
 Фаза: {{ current_phase }}
 Игровой день: {{ current_day }}
 
+{% if revealed_roles %}
+## Раскрытые роли (ground truth — НЕ пересматривать)
+{% for p in revealed_roles %}- player_id={{ p.player_id }} ({{ p.player_name }}): {{ p.role_name_ru }}{% if p.is_winner is not none %} [победитель]{% endif %}
+{% endfor %}
+
+ВАЖНО: роли выше — подтверждены ботом. Не меняй их на "Мирный".
+{% endif %}
 Игроки
 {% for player in players %}- ID {{ player.player_id }}; имя: {{ player.display_name }}; жив: {{ player.alive }}; известная роль: {{ player.known_role if player.known_role else "неизвестна" }}
 {% else %}- Список игроков пуст.
