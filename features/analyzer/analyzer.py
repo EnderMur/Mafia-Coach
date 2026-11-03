@@ -97,6 +97,7 @@ class GameAnalyzer:
         jinja_env: Environment,
         max_messages: int = 200,
         reasoning_max_chars: int = DEFAULT_REASONING_MAX_CHARS,
+        club_patterns: str = "",
     ) -> None:
         """Retain the dependencies and context/reasoning limits for analysis."""
         self._llm_client = llm_client
@@ -105,6 +106,7 @@ class GameAnalyzer:
         self._jinja_env = jinja_env
         self._max_messages = max_messages
         self._reasoning_max_chars = reasoning_max_chars
+        self._club_patterns = club_patterns
 
     async def analyze(
         self,
@@ -133,6 +135,7 @@ class GameAnalyzer:
             registry=self._registry,
             jinja_env=self._jinja_env,
             club_notes_summary=self._render_hints(hints),
+            club_patterns=self._club_patterns,
         )
 
         reasoning_buffer: list[str] = []

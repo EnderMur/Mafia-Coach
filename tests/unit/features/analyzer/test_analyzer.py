@@ -225,6 +225,7 @@ def make_analyzer(
     *,
     max_messages: int = 200,
     reasoning_max_chars: int = 4096,
+    club_patterns: str = "",
 ) -> GameAnalyzer:
     """Create a GameAnalyzer with test dependencies."""
     return GameAnalyzer(
@@ -234,6 +235,7 @@ def make_analyzer(
         jinja_env=jinja_env,
         max_messages=max_messages,
         reasoning_max_chars=reasoning_max_chars,
+        club_patterns=club_patterns,
     )
 
 
@@ -256,6 +258,25 @@ async def test_analyze_success_returns_response(
     assert result.response is response
     assert result.error is None
     assert fake_llm.calls[0]["log_reasoning_chunks"] is False
+
+
+async def test_analyzer_passes_club_patterns(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """The analyzer sends configured club patterns through the actual prompt builder."""
+    _, repository = memory_database
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, club_patterns="PATTERN X")
+
+    result = await analyzer.analyze(make_game_state(registry), persist=False)
+
+    assert result.success
+    prompt = fake_llm.calls[0]["messages"][1]["content"]
+    assert "Паттерны этого клуба" in prompt
+    assert "PATTERN X" in prompt
 
 
 async def test_analyze_llm_error_returns_result_with_error(

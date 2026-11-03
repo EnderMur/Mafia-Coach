@@ -56,7 +56,27 @@ class BootstrapResult:
     jinja_env: jinja2.Environment
     owns_telegram: bool
     owns_llm: bool
+    club_patterns: str = ""
     _shutdown_complete: bool = field(default=False, init=False, repr=False)
+
+
+def _load_club_patterns(path_str: str) -> str:
+    """Read the private patterns file, fall back to its example, or use empty text."""
+    primary = Path(path_str)
+    if primary.is_file():
+        return primary.read_text(encoding="utf-8").strip()
+    example = primary.with_name(primary.stem + ".example" + primary.suffix)
+    if example.is_file():
+        logger.bind(channel="bootstrap").warning(
+            "club_patterns: using example file ({}); create {} for custom patterns",
+            example,
+            primary,
+        )
+        return example.read_text(encoding="utf-8").strip()
+    logger.bind(channel="bootstrap").info(
+        "club_patterns: file not found, using empty (create {} to add)", primary
+    )
+    return ""
 
 
 async def bootstrap(
@@ -95,6 +115,8 @@ async def bootstrap(
         retention_days=config.logging.retention_days,
     )
     logger.bind(channel="bootstrap").info("config loaded")
+    club_patterns = _load_club_patterns(config.club_patterns_file)
+    logger.bind(channel="bootstrap").info("club_patterns loaded: {} chars", len(club_patterns))
 
     connection: sqlite3.Connection | None = None
     active_llm: LLMClient | None = None
@@ -190,6 +212,7 @@ async def bootstrap(
             jinja_env=jinja_env,
             max_messages=config.llm.context_window_messages,
             reasoning_max_chars=config.llm.reasoning_max_chars,
+            club_patterns=club_patterns,
         )
 
         logger.bind(channel="bootstrap").info(
@@ -209,6 +232,7 @@ async def bootstrap(
             jinja_env=jinja_env,
             owns_telegram=owns_telegram,
             owns_llm=owns_llm,
+            club_patterns=club_patterns,
         )
     except BaseException:
         await _close_partial_resources(

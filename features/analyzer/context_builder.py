@@ -7,7 +7,7 @@ The module is intentionally pure: no I/O, no async, no clients, no imports from
 Two responsibilities live here:
 
 - :func:`build_context` — collapse the mutable :class:`GameState` into an
-  immutable :class:`LLMContext` (players, last messages, deaths, phase);
+  immutable :class:`LLMContext` (players, last messages, votes, deaths, phase);
 - :func:`to_llm_messages` — render ``system.jinja`` + ``analyze.jinja`` into the
   ``messages`` list consumed by the LLM client.
 """
@@ -20,7 +20,7 @@ from typing import Final
 import jinja2
 from pydantic import BaseModel, ConfigDict, Field
 
-from domain.events import DeathEvent, MessageEvent
+from domain.events import DeathEvent, MessageEvent, VoteEvent
 from domain.game_state import GameState
 from domain.phases import Phase
 from domain.roles import RoleRegistry
@@ -54,6 +54,16 @@ class MessageInfo(BaseModel):
     ts: datetime
     author_name: str = Field(min_length=1)
     text: str
+
+
+class VoteInfo(BaseModel):
+    """A recent vote, including abstentions and partially known targets."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ts: datetime
+    voter_name: str = Field(min_length=1)
+    target_name: str | None
 
 
 class DeathInfo(BaseModel):
@@ -95,6 +105,7 @@ class LLMContext(BaseModel):
     players: list[PlayerInfo]
     recent_messages: list[MessageInfo]
     recent_deaths: list[DeathInfo]
+    recent_votes: list[VoteInfo] = Field(default_factory=list)
     previous_predictions: list[PredictionSnapshot] = []
     truncated_messages: int = Field(ge=0)
     total_messages_seen: int = Field(ge=0)
@@ -117,14 +128,15 @@ def build_context(
       objects, chronological (oldest → newest);
     - ``recent_deaths`` — all :class:`DeathEvent` objects (usually fewer than 15
       per game);
+    - ``recent_votes`` — the last 20 :class:`VoteEvent` objects in append order;
     - ``players`` — alive and dead players, with ``known_role_name_ru`` filled in
       when the role was publicly revealed and resolved by the registry;
     - ``previous_predictions`` — carried over from the previous analysis cycle;
     - ``truncated_messages`` — ``max(0, total_messages_seen - max_messages)``.
 
     Only :class:`MessageEvent` reaches ``recent_messages``. Phase changes, votes,
-    deaths, and role reveals are *not* duplicated there: they are already
-    reflected in ``phase``, ``recent_deaths``, and the players' ``known_role``.
+    deaths, and role reveals are *not* duplicated there: they are reflected in
+    ``phase``, ``recent_votes``, ``recent_deaths``, and players' ``known_role``.
 
     The message text is used as stored by :class:`GameState`, which keeps the
     already normalized parser output; no extra cleanup is applied here.
@@ -166,6 +178,18 @@ def build_context(
         if isinstance(event, DeathEvent)
     ]
 
+    vote_events = [
+        event for event in game_state.events_by_kind("vote") if isinstance(event, VoteEvent)
+    ]
+    recent_votes = [
+        VoteInfo(
+            ts=event.ts,
+            voter_name=event.payload.voter_name,
+            target_name=event.payload.target_name,
+        )
+        for event in vote_events[-20:]
+    ]
+
     players = [
         PlayerInfo(
             player_id=player.player_id,
@@ -190,6 +214,7 @@ def build_context(
         players=players,
         recent_messages=recent_messages,
         recent_deaths=recent_deaths,
+        recent_votes=recent_votes,
         previous_predictions=list(previous_predictions or []),
         truncated_messages=max(0, total_messages - max_messages),
         total_messages_seen=total_messages,
@@ -205,6 +230,7 @@ def to_llm_messages(
     jinja_env: jinja2.Environment,
     response_schema_json: str | None = None,
     club_notes_summary: str = "",
+    club_patterns: str = "",
 ) -> list[dict[str, str]]:
     """Render ``system.jinja`` and ``analyze.jinja`` for one analysis cycle.
 
@@ -222,6 +248,7 @@ def to_llm_messages(
             value the ``response_schema_json`` global of ``jinja_env`` is used,
             and :data:`DEFAULT_RESPONSE_SCHEMA_JSON` as the last resort.
         club_notes_summary: optional textual summary of heuristic hints.
+        club_patterns: optional free-text observations specific to the club.
 
     Returns:
         ``[{"role": "system", ...}, {"role": "user", ...}]``.
@@ -251,6 +278,9 @@ def to_llm_messages(
         role_count=context.role_count,
         total_players=context.total_players,
         club_notes_summary=club_notes_summary,
+        recent_votes=context.recent_votes,
+        role_notes=_render_role_notes(registry),
+        club_patterns=club_patterns,
     )
 
     messages = [
@@ -259,6 +289,16 @@ def to_llm_messages(
     ]
     _ensure_fully_rendered(messages)
     return messages
+
+
+def _render_role_notes(registry: RoleRegistry) -> str:
+    """Render nonempty role notes for the club heuristics prompt."""
+    lines = []
+    for role in registry.all_roles():
+        notes = (role.notes or "").strip()
+        if notes:
+            lines.append(f"- {role.name_ru}: {notes}")
+    return "\n".join(lines)
 
 
 def _game_id(game_state: GameState) -> int:

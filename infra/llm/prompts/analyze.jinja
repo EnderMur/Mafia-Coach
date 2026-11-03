@@ -20,6 +20,18 @@ ID партии: {{ game_id }}
 {% for message in recent_messages %}- {{ message.ts }} — {{ message.author_name }}: {{ message.text }}
 {% else %}- Сообщений нет.
 {% endfor %}
+{% if recent_votes %}
+## Голосования (последние {{ recent_votes|length }})
+{% for v in recent_votes %}- {{ v.voter_name }} → {{ v.target_name or "(воздержался)" }}
+{% endfor %}{% endif %}
+{% if role_notes %}
+## Тонкости ролей (эвристики клуба)
+{{ role_notes }}
+{% endif %}
+{% if club_patterns %}
+## Паттерны этого клуба
+{{ club_patterns }}
+{% endif %}
 {% if previous_predictions %}Прошлые предсказания
 {% for prediction in previous_predictions %}- {{ prediction }}
 {% endfor %}{% endif %}
