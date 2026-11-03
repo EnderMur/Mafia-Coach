@@ -653,3 +653,30 @@ def test_placeholder_id_is_stable_negative_int64() -> None:
     assert -(2**63) < pid < 0
     assert pid == _placeholder_player_id("Never Wrote")
     assert pid != _placeholder_player_id("Another Player")
+
+
+def test_last_alive_list_names_whitelist(game: GameState) -> None:
+    """E. Последний ALIVE_LIST задаёт whitelist реальных игроков."""
+    assert game.last_alive_list_names == frozenset()
+
+    game.apply(make_alive_list(["A", "B"]))
+
+    assert game.last_alive_list_names == frozenset({"A", "B"})
+
+
+def test_last_alive_list_names_reset_on_new_game(game: GameState) -> None:
+    """E. Новый GAME_START очищает whitelist вместе с остальным состоянием."""
+    game.apply(make_alive_list(["A", "B"]))
+    game.apply(
+        PhaseChangeEvent(
+            ts=event_time(),
+            game_id=1,
+            payload=PhaseChangePayload(
+                from_phase=Phase.END,
+                to_phase=Phase.REGISTRATION,
+                day_number=0,
+            ),
+        )
+    )
+
+    assert game.last_alive_list_names == frozenset()

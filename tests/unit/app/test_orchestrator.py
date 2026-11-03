@@ -1401,3 +1401,25 @@ async def test_send_stats_no_whitelist(tmp_path: Path) -> None:
         assert {row.player_name for row in ui.stats[-1].rows} == {"A", "B", "C"}
     finally:
         await orchestrator.shutdown()
+
+
+async def test_send_stats_whitelist_matches_username(tmp_path: Path) -> None:
+    """E. ALIVE_LIST приходит display-именами; username тоже принимается."""
+    result, _telegram, _llm = await make_result(tmp_path)
+    game_state = result.game_state
+    game_state.register_player(100, "Вася", username="vasya")
+    game_state.register_player(101, "Петя", username="petya")
+    game_state.apply(
+        AliveListEvent(
+            ts=EVENT_TS,
+            game_id=game_state.game_id,
+            payload=AliveListPayload(alive_player_names=["vasya", "Петя"], total_players=2),
+        )
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert len(ui.stats[-1].rows) == 2
+    finally:
+        await orchestrator.shutdown()

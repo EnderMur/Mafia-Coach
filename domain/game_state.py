@@ -54,6 +54,9 @@ class GameState:
         self._day_number = 0
         self._role_count: dict[str, int] | None = None
         self._total_players: int | None = None
+        #: Names from the last ``ALIVE_LIST`` — the whitelist of real players
+        #: (utility bots writing in the game chat are not in it).
+        self._last_alive_list_names: frozenset[str] = frozenset()
 
     @property
     def game_id(self) -> int:
@@ -146,6 +149,7 @@ class GameState:
                 self._players = {}
                 self._role_count = None
                 self._total_players = None
+                self._last_alive_list_names = frozenset()
                 self._events.append(event)
                 return
 
@@ -164,6 +168,7 @@ class GameState:
                     f"but current phase is {self._phase.value}"
                 )
         elif isinstance(event, AliveListEvent):
+            known_usernames = {p.username for p in self._players.values() if p.username is not None}
             for name in event.payload.alive_player_names:
                 pid = _placeholder_player_id(name)
                 if pid in self._players:
@@ -171,19 +176,34 @@ class GameState:
                     # previously from ALIVE_LIST). Don't overwrite
                     # display_name, just refresh alive.
                     continue
-                # A real (positive) id already known by this name must never
-                # get a second, placeholder identity.
-                if any(p.player_id > 0 and p.display_name == name for p in self._players.values()):
+                # A real (positive) id already known by this name (or by this
+                # username) must never get a second, placeholder identity.
+                if any(
+                    p.player_id > 0 and (p.display_name == name or p.username == name)
+                    for p in self._players.values()
+                ):
+                    continue
+                if name in known_usernames:
                     continue
                 self.register_player(pid, name, username=None)
             alive_names = set(event.payload.alive_player_names)
             for name in event.payload.alive_player_names:
+                # ALIVE_LIST names are display names, but a name that resolves
+                # to a registered username must keep that player alive as well.
                 pid = _placeholder_player_id(name)
-                if pid in self._players:
-                    alive_names.add(self._players[pid].display_name)
+                placeholder = self._players.get(pid)
+                if placeholder is not None:
+                    alive_names.add(placeholder.display_name)
+                alive_names.update(
+                    p.display_name
+                    for p in self._players.values()
+                    if p.username is not None and p.username == name
+                )
             updated: dict[int, Player] = {}
             for pid, player in self._players.items():
-                if player.display_name in alive_names:
+                if player.display_name in alive_names or (
+                    player.username is not None and player.username in alive_names
+                ):
                     updated[pid] = player
                 elif player.alive:
                     updated[pid] = player.model_copy(update={"alive": False})
@@ -194,6 +214,7 @@ class GameState:
                 dict(event.payload.role_count) if event.payload.role_count is not None else None
             )
             self._total_players = event.payload.total_players
+            self._last_alive_list_names = frozenset(event.payload.alive_player_names)
         elif isinstance(event, (MessageEvent, VoteEvent)):
             pass
         elif isinstance(event, EndGameEvent):
@@ -319,6 +340,11 @@ class GameState:
     def total_players(self) -> int | None:
         """Bot-reported total alive count, or None."""
         return self._total_players
+
+    @property
+    def last_alive_list_names(self) -> frozenset[str]:
+        """Names from the last ALIVE_LIST (empty before the first one)."""
+        return self._last_alive_list_names
 
     def events(self) -> tuple[AnyEvent, ...]:
         """Return successfully applied events in append order."""

@@ -605,7 +605,10 @@ class Orchestrator:
             for player in all_players:
                 if player.player_id <= 0:  # placeholder
                     continue
-                if whitelist and player.display_name not in whitelist:
+                if whitelist and not (
+                    player.display_name in whitelist
+                    or (player.username is not None and player.username in whitelist)
+                ):
                     continue
                 if not show_dead and not player.alive:
                     continue
