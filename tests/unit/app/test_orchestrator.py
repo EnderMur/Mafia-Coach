@@ -1599,3 +1599,67 @@ async def test_merge_conflicting_final_roles_rolls_back(tmp_path: Path) -> None:
     assert old is not None and old["final_role"] == "Мафия"
     assert real is not None and real["final_role"] == "Доктор"
     await orchestrator.shutdown()
+
+
+@pytest.mark.parametrize("show_dead", [False, True])
+async def test_stats_filter_dead_before_confidence_order(tmp_path: Path, show_dead: bool) -> None:
+    result, _, _ = await make_result(tmp_path)
+    result.config = result.config.model_copy(
+        update={
+            "analysis": result.config.analysis.model_copy(
+                update={"show_dead": show_dead, "min_confidence_to_display": 0.1}
+            )
+        }
+    )
+    state = result.game_state
+    for pid, name, confidence in [(100, "Умерший", 0.9), (101, "Живой", 0.4)]:
+        state.register_player(pid, name)
+        result.repos.players.upsert_player(player_id=pid, username=None, display_name=name)
+        result.repos.predictions.upsert_prediction(
+            game_id=state.game_id,
+            player_id=pid,
+            predicted_role="Мафия",
+            confidence=confidence,
+            reasoning="test",
+        )
+    state.apply(
+        DeathEvent(
+            ts=EVENT_TS,
+            game_id=state.game_id,
+            payload=DeathPayload(victim_id=100, victim_name="Умерший", cause="lynch"),
+        )
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert [row.player_name for row in ui.stats[-1].rows] == (
+            ["Умерший", "Живой"] if show_dead else ["Живой"]
+        )
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_stats_threshold_preserves_player_with_dash(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    result.config = result.config.model_copy(
+        update={
+            "analysis": result.config.analysis.model_copy(update={"min_confidence_to_display": 0.5})
+        }
+    )
+    result.game_state.register_player(100, "Игрок")
+    result.repos.players.upsert_player(player_id=100, username=None, display_name="Игрок")
+    result.repos.predictions.upsert_prediction(
+        game_id=result.game_state.game_id,
+        player_id=100,
+        predicted_role="Мафия",
+        confidence=0.3,
+        reasoning="test",
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert ui.stats[-1].rows == [StatsRow(player_name="Игрок", role="—", confidence=0.0)]
+    finally:
+        await orchestrator.shutdown()

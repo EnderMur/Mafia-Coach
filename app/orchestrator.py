@@ -697,20 +697,19 @@ class Orchestrator:
                 )
             min_confidence = self._result.config.analysis.min_confidence_to_display
             show_dead = self._result.config.analysis.show_dead
-            sorted_predictions = sorted(
-                predictions,
-                key=lambda row: float(row["confidence"]),
-                reverse=True,
-            )
+            all_players = game_state.players()
+            eligible_ids = {player.player_id for player in all_players if show_dead or player.alive}
             predictions_by_player = {
-                int(prediction["player_id"]): prediction for prediction in sorted_predictions
+                int(prediction["player_id"]): prediction
+                for prediction in predictions
+                if int(prediction["player_id"]) in eligible_ids
+                and float(prediction["confidence"]) >= min_confidence
             }
             # ALIVE_LIST whitelist: utility bots that post in the game chat
             # (EzzProd & co.) are not players and must not get a table row.
             # An empty set means the bot has not sent ALIVE_LIST yet — show all
             # real players rather than nothing.
             whitelist = game_state.last_alive_list_names
-            all_players = game_state.players()
             rows: list[StatsRow] = []
             for player in all_players:
                 whitelisted = not whitelist or (
@@ -729,7 +728,7 @@ class Orchestrator:
                 if not show_dead and not player.alive:
                     continue
                 prediction = predictions_by_player.get(player.player_id)
-                if prediction is not None and float(prediction["confidence"]) >= min_confidence:
+                if prediction is not None:
                     role_str = str(prediction["predicted_role"])
                     if not player.alive:
                         role_str = f"[мёртв] {role_str}"
