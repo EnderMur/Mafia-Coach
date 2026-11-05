@@ -125,8 +125,8 @@ def test_pattern_lists_must_have_equal_length() -> None:
         )
 
 
-def test_null_role_allowed_only_for_silent_players() -> None:
-    """Contextual validation drops a null role for a player with messages or votes."""
+def test_null_role_with_messages_is_normalized_not_dropped() -> None:
+    """FIX-LOG-ANALYSIS C: null + messages/votes → composition slot, not a drop."""
     raw = response_json(
         [valid_prediction(suspected_role=None, confidence=0.0, reason="нет данных")]
     )
@@ -135,8 +135,13 @@ def test_null_role_allowed_only_for_silent_players() -> None:
         known_player_ids=frozenset({100}),
         role_names_ru=frozenset({"Role A", "Role B"}),
     )
-    assert result.analysis == []
-    assert any("null suspected role" in warning for warning in warnings)
+    assert len(result.analysis) == 1
+    prediction = result.analysis[0]
+    assert prediction.suspected_role in {"Role A", "Role B"}
+    assert 0.3 <= prediction.confidence <= 0.5
+    assert prediction.reason == "распределение состава бота"
+    assert not any("prediction dropped" in warning for warning in warnings)
+    assert any("100" in warning and "normalized" in warning for warning in warnings)
 
 
 def test_null_role_kept_for_silent_player() -> None:
@@ -578,3 +583,104 @@ def test_unknown_placeholder_without_valid_alternative_remains_silent() -> None:
         role_names_ru=frozenset({"Role A", "Role B"}),
     )
     assert result.analysis == [] and warnings == []
+
+
+def test_pattern_ids_one_vs_descriptions_two_is_normalized() -> None:
+    """FIX-LOG-ANALYSIS B: 1 vs 2 must not fail AnalysisResponse."""
+    raw = response_json(
+        [valid_prediction(pattern_ids=["#2"], pattern_descriptions=["desc a", "desc b"])]
+    )
+    result, warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert len(result.analysis) == 1
+    prediction = result.analysis[0]
+    assert prediction.pattern_ids == ["#2"]
+    assert prediction.pattern_descriptions == ["desc a"]
+    assert len(prediction.pattern_ids) == len(prediction.pattern_descriptions)
+    assert any(
+        "100" in warning and "1" in warning and "2" in warning for warning in warnings
+    )
+
+
+@pytest.mark.parametrize(
+    ("pattern_ids", "pattern_descriptions"),
+    [(["#2", "#7"], []), ([], ["desc a", "desc b"]), (None, ["desc a"])],
+)
+def test_empty_or_invalid_pattern_list_forces_both_empty(
+    pattern_ids: object, pattern_descriptions: object
+) -> None:
+    """If either pattern list is empty (or not a list), both become empty."""
+    raw = response_json(
+        [
+            valid_prediction(
+                pattern_ids=pattern_ids, pattern_descriptions=pattern_descriptions
+            )
+        ]
+    )
+    result, _warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis[0].pattern_ids == []
+    assert result.analysis[0].pattern_descriptions == []
+
+
+def test_model_validator_still_rejects_mismatched_pattern_lists() -> None:
+    """The equality invariant stays in the model; only raw data is normalized."""
+    raw = json.loads(
+        response_json(
+            [valid_prediction(pattern_ids=["#2"], pattern_descriptions=["a", "b"])]
+        )
+    )
+    with pytest.raises(ValidationError, match="same length"):
+        AnalysisResponse.model_validate(raw)
+
+
+def test_pattern_alignment_also_applies_to_null_role() -> None:
+    """PR #54 null handling still clears pattern lists after alignment."""
+    raw = response_json(
+        [
+            valid_prediction(
+                suspected_role=None,
+                confidence=0.0,
+                reason="нет данных",
+                pattern_ids=["#2"],
+                pattern_descriptions=["a", "b"],
+            )
+        ]
+    )
+    result, _warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+        silent_player_ids=frozenset({100}),
+    )
+    assert len(result.analysis) == 1
+    assert result.analysis[0].suspected_role is None
+    assert result.analysis[0].pattern_ids == []
+    assert result.analysis[0].pattern_descriptions == []
+
+
+def test_null_role_without_messages_or_votes_is_not_dropped() -> None:
+    """FIX-LOG-ANALYSIS C: null + no data → role=null, 0.0, 'нет данных'."""
+    raw = response_json(
+        [valid_prediction(suspected_role=None, confidence=0.42, reason="не знаю")]
+    )
+    result, warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+        silent_player_ids=frozenset({100}),
+    )
+    assert len(result.analysis) == 1
+    prediction = result.analysis[0]
+    assert prediction.suspected_role is None
+    assert prediction.confidence == 0.0
+    assert prediction.reason == "нет данных"
+    assert prediction.pattern_ids == []
+    assert prediction.pattern_descriptions == []
+    assert warnings == []

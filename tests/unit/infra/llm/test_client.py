@@ -941,3 +941,92 @@ async def test_empty_analysis_response_is_valid_contract() -> None:
     assert response.analysis == []
     assert response.game_read
     assert response.reasoning
+
+
+MISMATCHED_CONTENT = json.dumps(
+    {
+        "analysis": [
+            {
+                "player_id": 100,
+                "player_name": "Player A",
+                "suspected_role": ROLE_NAME,
+                "confidence": 0.5,
+                "reason": "Observed behavior.",
+                "reasons": ["observed behavior"],
+                "pattern_ids": ["#2"],
+                "pattern_descriptions": ["first description", "second description"],
+            }
+        ],
+        "game_read": "A concise read.",
+        "reasoning": "A short explanation.",
+    }
+)
+
+NULL_ROLE_CONTENT = json.dumps(
+    {
+        "analysis": [
+            {
+                "player_id": 100,
+                "player_name": "Player A",
+                "suspected_role": None,
+                "confidence": 0.0,
+                "reason": "нет данных",
+                "reasons": ["нет данных"],
+            }
+        ],
+        "game_read": "A concise read.",
+        "reasoning": "A short explanation.",
+    }
+)
+
+
+async def test_analyze_stream_mismatched_pattern_lists_does_not_fail(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """FIX-LOG-ANALYSIS B: streaming 1 vs 2 no longer raises 'same length'."""
+    respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=stream_response(MISMATCHED_CONTENT)
+    )
+    response = await run_stream(client)
+    assert len(response.analysis) == 1
+    prediction = response.analysis[0]
+    assert len(prediction.pattern_ids) == len(prediction.pattern_descriptions) == 1
+
+
+async def test_analyze_stream_null_role_with_messages_is_not_dropped(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """FIX-LOG-ANALYSIS C: streamed null + messages becomes a composition slot."""
+    respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=stream_response(NULL_ROLE_CONTENT)
+    )
+    response = await client.analyze_stream(
+        messages=MESSAGES,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({ROLE_NAME}),
+    )
+    assert len(response.analysis) == 1
+    prediction = response.analysis[0]
+    assert prediction.suspected_role == ROLE_NAME
+    assert 0.3 <= prediction.confidence <= 0.5
+    assert prediction.reason == "распределение состава бота"
+
+
+async def test_analyze_stream_silent_null_role_is_not_dropped(
+    client: LMStudioClient, respx_mock: respx.MockRouter
+) -> None:
+    """FIX-LOG-ANALYSIS C: silent null stays as an explicit no-data prediction."""
+    respx_mock.post(f"{BASE_URL}/chat/completions").mock(
+        return_value=stream_response(NULL_ROLE_CONTENT)
+    )
+    response = await client.analyze_stream(
+        messages=MESSAGES,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({ROLE_NAME}),
+        silent_player_ids=frozenset({100}),
+    )
+    assert len(response.analysis) == 1
+    prediction = response.analysis[0]
+    assert prediction.suspected_role is None
+    assert prediction.confidence == 0.0
+    assert prediction.reason == "нет данных"

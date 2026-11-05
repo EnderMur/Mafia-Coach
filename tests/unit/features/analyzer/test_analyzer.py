@@ -1452,3 +1452,65 @@ async def test_death_during_persistence_drops_remaining_prediction(
     assert result.response is not None
     assert [p.player_id for p in result.response.analysis] == [100]
     assert [row["player_id"] for row in repository.list_predictions(game_id)] == [100]
+
+
+async def test_null_role_with_messages_is_filled_from_bot_composition(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """FIX-LOG-ANALYSIS C: null + messages survives and gets a composition slot."""
+    import json
+
+    from infra.llm.schemas import validate_response
+
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100)
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=game_id,
+            payload=AliveListPayload(
+                alive_player_names=["Player 100"],
+                role_count={"Мафия": 1},
+                total_players=1,
+            ),
+        )
+    )
+    raw = json.dumps(
+        {
+            "analysis": [
+                {
+                    "player_id": 100,
+                    "player_name": "Player 100",
+                    "suspected_role": None,
+                    "confidence": 0.0,
+                    "reason": "нет данных",
+                    "reasons": ["нет данных"],
+                }
+            ],
+            "game_read": "A short game read.",
+        }
+    )
+    validated, warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset(role.name_ru for role in registry.all_roles()),
+    )
+    assert len(validated.analysis) == 1
+    assert validated.analysis[0].suspected_role is not None
+    assert not any("prediction dropped" in warning for warning in warnings)
+
+    llm = FakeLLMClient()
+    llm.set_response(validated)
+    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(
+        state, persist=False
+    )
+    assert result.success and result.response is not None
+    assert len(result.response.analysis) == 1
+    prediction = result.response.analysis[0]
+    assert prediction.suspected_role == "Мафия"
+    assert 0.3 <= prediction.confidence <= 0.5
+    assert "состав" in prediction.reason

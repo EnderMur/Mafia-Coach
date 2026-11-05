@@ -46,13 +46,13 @@ def load_real_patterns() -> ClubPatterns:
     return load_club_patterns(PATTERNS_PATH)
 
 
-def test_load_real_config_has_6_patterns() -> None:
-    """The real configuration contains 6 club patterns (#6 removed)."""
-    assert len(load_real_patterns()) == 6
+def test_load_real_config_has_8_patterns() -> None:
+    """The real configuration contains all 8 club patterns (#1..#8)."""
+    assert len(load_real_patterns()) == 8
 
 
-def test_real_pattern_ids_are_hash1_to_hash5_and_hash7() -> None:
-    """Every configured identifier is #1..#5 and #7 in order (#6 removed)."""
+def test_real_pattern_ids_are_hash1_to_hash8() -> None:
+    """Every configured identifier is #1..#8 in order."""
     patterns = load_real_patterns()
     assert [pattern.id for pattern in patterns.patterns] == [
         "#1",
@@ -60,32 +60,38 @@ def test_real_pattern_ids_are_hash1_to_hash5_and_hash7() -> None:
         "#3",
         "#4",
         "#5",
+        "#6",
         "#7",
+        "#8",
     ]
 
 
 def test_real_pattern_tiers_match_contract() -> None:
-    """#2/#7 are 0.9, #1/#5 are 0.8, #3/#4 are 0.6."""
+    """0.9: #2/#7/#8; 0.8: #1/#5/#6; 0.6: #3/#4 (all allowed tiers)."""
     patterns = load_real_patterns()
     tiers = {pattern.id: pattern.confidence_tier for pattern in patterns.patterns}
     assert tiers["#2"] == 0.9
     assert tiers["#7"] == 0.9
+    assert tiers["#8"] == 0.9  # reference said 1.0; schema allows only 0.9 max
     assert tiers["#1"] == 0.8
     assert tiers["#5"] == 0.8
+    assert tiers["#6"] == 0.8
     assert tiers["#3"] == 0.6
     assert tiers["#4"] == 0.6
 
 
 def test_real_patterns_require_confirmation_flags() -> None:
-    """#1 and #5 require confirmation; the rest do not."""
+    """#1/#4/#5 require confirmation; the rest do not."""
     patterns = load_real_patterns()
     flags = {pattern.id: pattern.requires_confirmation for pattern in patterns.patterns}
     assert flags["#1"] is True
+    assert flags["#4"] is True
     assert flags["#5"] is True
     assert flags["#2"] is False
     assert flags["#3"] is False
-    assert flags["#4"] is False
+    assert flags["#6"] is False
     assert flags["#7"] is False
+    assert flags["#8"] is False
 
 
 def test_real_pattern_confidence_tiers_are_valid() -> None:
@@ -139,8 +145,8 @@ def test_registry_get_by_id_and_unknown_id() -> None:
 def test_by_tier_groups_patterns_correctly() -> None:
     """by_tier returns exactly the patterns of the requested tier."""
     registry = load_real_patterns()
-    assert {p.id for p in registry.by_tier(0.9)} == {"#2", "#7"}
-    assert {p.id for p in registry.by_tier(0.8)} == {"#1", "#5"}
+    assert {p.id for p in registry.by_tier(0.9)} == {"#2", "#7", "#8"}
+    assert {p.id for p in registry.by_tier(0.8)} == {"#1", "#5", "#6"}
     assert {p.id for p in registry.by_tier(0.6)} == {"#3", "#4"}
     assert registry.by_tier(0.5) == ()
 
@@ -171,3 +177,21 @@ def test_pattern_model_rejects_unknown_fields() -> None:
                 "unknown_field": True,
             }
         )
+
+
+def test_real_config_is_flat_schema_with_eight_valid_patterns() -> None:
+    """FIX-LOG-ANALYSIS A: real YAML loads, 8 patterns, flat schema is valid."""
+    registry = load_club_patterns(PATTERNS_PATH)
+    assert len(registry) == 8
+    assert registry.all_ids() == frozenset({f"#{index}" for index in range(1, 9)})
+    for pattern in registry.patterns:
+        assert isinstance(pattern.trigger, str) and pattern.trigger
+        assert isinstance(pattern.conclusion_role, str) and pattern.conclusion_role
+        assert isinstance(pattern.description, str) and pattern.description
+        assert isinstance(pattern.requires_confirmation, bool)
+        assert pattern.confidence_tier in CONFIDENCE_TIERS
+    roles = {pattern.id: pattern.conclusion_role for pattern in registry.patterns}
+    assert roles["#1"] == "Комиссар Каттани"
+    assert roles["#3"] == "НЕ Мирный житель (Мафия или Нейтральная роль)"
+    assert roles["#6"] == "Счастливчик"
+    assert roles["#8"] == "<роль из сообщения бота>"

@@ -325,11 +325,20 @@ class PatternDetector:
         return None
 
     def _find_pattern_by_conclusion(self, role_name: str, trigger: str) -> ClubPattern | None:
-        """Find a pattern matching the given conclusion role and trigger."""
-        for pattern in self._patterns.patterns:
-            if pattern.trigger == trigger and pattern.conclusion_role == role_name:
-                return pattern
-        return None
+        """Find the strongest pattern concluding ``role_name`` for ``trigger``.
+
+        Machine-readable trigger ids (``claim_role_direct``) match exactly. The
+        flat club config uses free-text triggers, so a case-insensitive mention
+        of the claimed role in the trigger also identifies a direct-claim
+        pattern. Ties resolve to the highest configured confidence tier.
+        """
+        candidates = [
+            pattern
+            for pattern in self._patterns.patterns
+            if pattern.conclusion_role == role_name
+            and (pattern.trigger == trigger or role_name.casefold() in pattern.trigger.casefold())
+        ]
+        return max(candidates, key=lambda pattern: pattern.confidence_tier, default=None)
 
     def _detect_direct_claim(self, payload: MessagePayload) -> PatternMatch | None:
         """Detect a direct role claim ('я - Role', 'он - Role', …).

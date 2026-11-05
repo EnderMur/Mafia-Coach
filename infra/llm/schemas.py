@@ -6,7 +6,7 @@ import json
 import math
 from collections.abc import Callable
 from copy import deepcopy
-from typing import Any, TypeGuard
+from typing import Any, Final, TypeGuard
 
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
@@ -24,6 +24,14 @@ _PLACEHOLDER_REASONS: frozenset[str] = frozenset(
         "none",
     }
 )
+
+#: Marker for a prediction about a player with no messages and no votes.
+_NO_DATA_REASON: Final[str] = "нет данных"
+#: Marker for a model error: ``null`` returned for a player who has messages or
+#: votes. Such a prediction is normalized into a low-confidence bot-composition
+#: slot instead of being dropped.
+_COMPOSITION_REASON: Final[str] = "распределение состава бота"
+_COMPOSITION_CONFIDENCE: Final[float] = 0.4
 
 
 class AlternativePrediction(BaseModel):
@@ -115,7 +123,12 @@ def validate_response(
     Schema violations raise Pydantic's ValidationError. Contextual mismatches are
     softened into warnings and dropped predictions or alternatives.
     ``silent_player_ids`` are players with no messages and no votes in the game
-    so far; only they may receive ``suspected_role = null``.
+    so far; only they may keep ``suspected_role = null``.
+
+    All normalizations run *before* ``AnalysisResponse.model_validate`` so the
+    model invariants (equal pattern-list lengths, zero-confidence null roles)
+    are never relaxed. A null role for a player with messages/votes is a model
+    error and becomes a low-confidence bot-composition slot, not a dropped row.
     """
     try:
         parsed: Any = json.loads(raw)
@@ -128,18 +141,13 @@ def validate_response(
     warnings: list[str] = []
     normalized_data = deepcopy(parsed)
     _normalize_confidence_values(normalized_data, warnings)
-
-    # Псевдокод: нормализация null-ролей перед валидацией
-    # Только если normalized_data — это словарь и analysis — список словарей
-    if isinstance(normalized_data, dict):
-        analysis_list = normalized_data.get("analysis")
-        if isinstance(analysis_list, list):
-            for item in analysis_list:
-                if isinstance(item, dict) and item.get("suspected_role") is None:
-                    item["confidence"] = 0.0
-                    item["reason"] = "нет данных"
-                    item["pattern_ids"] = []
-                    item["pattern_descriptions"] = []
+    _normalize_pattern_lists(normalized_data, warnings)
+    _normalize_null_roles(
+        normalized_data,
+        silent_player_ids=silent_player_ids,
+        role_names_ru=role_names_ru,
+        warnings=warnings,
+    )
 
     response = AnalysisResponse.model_validate(normalized_data)
 
@@ -150,12 +158,10 @@ def validate_response(
             continue
 
         if prediction.suspected_role is None:
-            if prediction.player_id not in silent_player_ids:
-                warnings.append(
-                    f"null suspected role for player {prediction.player_id} with "
-                    f"messages or votes; prediction dropped"
-                )
-                continue
+            # Null roles were normalized *before* validation: silent players now
+            # carry the explicit "нет данных" marker, and a null for a player
+            # with messages/votes became a bot-composition slot. Only dead or
+            # out-of-game players are dropped (above and in GameAnalyzer).
             validated_predictions.append(prediction)
             continue
 
@@ -328,6 +334,112 @@ def _normalize_confidence_values(data: Any, warnings: list[str]) -> None:
                 warnings.append(
                     f"confidence values normalized for player {player_id}: their sum exceeded 1.0"
                 )
+
+
+def _normalize_pattern_lists(data: Any, warnings: list[str]) -> None:
+    """Align ``pattern_ids``/``pattern_descriptions`` before schema validation.
+
+    The model sometimes emits different numbers of ids and descriptions (the
+    app.log failure was ``1 vs 2``). The ``PlayerPrediction`` invariant "lengths
+    are equal" stays in the model; this helper brings the raw payload to that
+    invariant by truncating both lists to their common prefix, or emptying both
+    when either one is empty. A WARNING with the player id and the original
+    lengths is returned to the caller (logged by ``client._log_warnings``).
+    """
+    if not isinstance(data, dict):
+        return
+    analysis = data.get("analysis")
+    if not isinstance(analysis, list):
+        return
+    for item in analysis:
+        if not isinstance(item, dict):
+            continue
+        raw_ids = item.get("pattern_ids", [])
+        raw_descriptions = item.get("pattern_descriptions", [])
+        ids = raw_ids if isinstance(raw_ids, list) else []
+        descriptions = raw_descriptions if isinstance(raw_descriptions, list) else []
+        ids_len, descriptions_len = len(ids), len(descriptions)
+        # Coerce malformed (non-list) values to lists even when lengths agree.
+        item["pattern_ids"] = list(ids)
+        item["pattern_descriptions"] = list(descriptions)
+        if ids_len == descriptions_len:
+            continue
+        if not ids or not descriptions:
+            item["pattern_ids"] = []
+            item["pattern_descriptions"] = []
+        else:
+            common = min(ids_len, descriptions_len)
+            item["pattern_ids"] = list(ids[:common])
+            item["pattern_descriptions"] = list(descriptions[:common])
+        warnings.append(
+            f"pattern lists normalized for player {item.get('player_id', 'unknown')}: "
+            f"pattern_ids={ids_len}, pattern_descriptions={descriptions_len}"
+        )
+
+
+def _normalize_null_roles(
+    data: Any,
+    *,
+    silent_player_ids: frozenset[int],
+    role_names_ru: frozenset[str],
+    warnings: list[str],
+) -> None:
+    """Normalize ``suspected_role = null`` before schema validation (PR #54).
+
+    * Silent players (no messages, no votes) get an explicit ``нет данных``
+      prediction with zero confidence and empty pattern lists.
+    * A null role for any other player is a model error: it becomes a
+      low-confidence role slot from the available role catalogue. The analyzer
+      later enforces the exact bot composition. Nothing is dropped here.
+
+    Works for null roles regardless of the pattern-list state, so it composes
+    with :func:`_normalize_pattern_lists` without breaking the PR #54 logic.
+    """
+    if not isinstance(data, dict):
+        return
+    analysis = data.get("analysis")
+    if not isinstance(analysis, list):
+        return
+    catalogue = sorted(role_names_ru)
+    used_roles = {
+        str(item["suspected_role"])
+        for item in analysis
+        if isinstance(item, dict) and isinstance(item.get("suspected_role"), str)
+    }
+    fallback_role: str | None = next(
+        (role for role in catalogue if role not in used_roles), None
+    )
+    if fallback_role is None and catalogue:
+        fallback_role = catalogue[0]
+
+    for item in analysis:
+        if not isinstance(item, dict) or item.get("suspected_role") is not None:
+            continue
+        player_id = item.get("player_id", "unknown")
+        is_silent = isinstance(player_id, int) and player_id in silent_player_ids
+        if is_silent or fallback_role is None:
+            item["confidence"] = 0.0
+            item["reason"] = _NO_DATA_REASON
+            item["reasons"] = [_NO_DATA_REASON]
+            item["pattern_ids"] = []
+            item["pattern_descriptions"] = []
+            if not is_silent:
+                warnings.append(
+                    f"null role for player {player_id} with messages or votes; "
+                    f"no role catalogue available, kept as no-data prediction"
+                )
+            continue
+        warnings.append(
+            f"null role for player {player_id} with messages or votes; "
+            f"normalized to bot composition distribution"
+        )
+        item["suspected_role"] = fallback_role
+        item["confidence"] = _COMPOSITION_CONFIDENCE
+        item["reason"] = _COMPOSITION_REASON
+        item["reasons"] = [_COMPOSITION_REASON]
+        item["pattern_ids"] = []
+        item["pattern_descriptions"] = []
+        item["alternative"] = None
 
 
 def _clamp_value(value: Any) -> tuple[float, bool] | None:

@@ -868,3 +868,37 @@ def test_previous_predictions_render_as_anchor(
     assert "Прошлые предсказания (якорь)" in content
     assert "ID 100: Мирный житель" in content
     assert "НЕ меняй роль игрока без НОВОГО аргумента" in content
+
+
+def test_real_club_patterns_reach_analyze_prompt(
+    registry: RoleRegistry, jinja_env: jinja2.Environment
+) -> None:
+    """FIX-LOG-ANALYSIS A.5: the 8 loaded patterns really reach analyze.jinja."""
+    from pathlib import Path
+
+    from domain.club_patterns import load_club_patterns
+    from features.analyzer.context_builder import build_context, to_llm_messages
+
+    config_path = Path(__file__).parents[4] / "configs" / "club_patterns.yaml"
+    loaded = load_club_patterns(config_path)
+    assert len(loaded) == 8
+    club_patterns: list[dict[str, object]] = [
+        {
+            "id": pattern.id,
+            "trigger": pattern.trigger,
+            "conclusion_role": pattern.conclusion_role,
+            "confidence_tier": pattern.confidence_tier,
+            "requires_confirmation": pattern.requires_confirmation,
+            "description": pattern.description,
+        }
+        for pattern in loaded.patterns
+    ]
+    context = build_context(game_state=make_game_state(registry=registry), registry=registry)
+    messages = to_llm_messages(
+        context, registry=registry, jinja_env=jinja_env, club_patterns=club_patterns
+    )
+    prompt = messages[1]["content"]
+    assert "Паттерны этого клуба" in prompt
+    for pattern in loaded.patterns:
+        assert pattern.id in prompt
+        assert pattern.conclusion_role in prompt
