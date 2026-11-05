@@ -41,6 +41,7 @@ ID партии: {{ game_id }}
 
 Бот ещё не прислал состав ролей. Не считай «Мирный житель» ролью по умолчанию; без состава давай только осторожные гипотезы.
 {% endif %}
+
 {% if alive_list_names %}
 ## Живые игроки из сообщения бота ({{ alive_list_names | length }})
 
@@ -49,6 +50,7 @@ ID партии: {{ game_id }}
 Игроки с синтетическим отрицательным ID (не писали в чат, но бот назвал их живыми): {{ placeholder_player_names | join("; ") }}. Их ID всё равно валидны для analysis.
 {% endif %}
 {% endif %}
+
 {% if previous_predictions %}
 ## Прошлые предсказания (якорь)
 {% for p in previous_predictions %}- ID {{ p.player_id }}: {{ p.suspected_role }} (уверенность {{ p.confidence }})
@@ -56,6 +58,7 @@ ID партии: {{ game_id }}
 
 НЕ меняй роль игрока без НОВОГО аргумента из сообщений, голосований или раскрытых ролей. Если нового аргумента нет — оставь прежнюю роль, можно понизить confidence, но нельзя «забыть» её и заменить на «Мафию» / «Мирный житель» без причины. Любая смена роли должна быть явно объяснена в reasons.
 {% endif %}
+
 {% if revealed_roles %}
 ## Раскрытые роли (ground truth — НЕ пересматривать)
 {% for p in revealed_roles %}- player_id={{ p.player_id }} ({{ p.player_name }}): {{ p.role_name_ru }}{% if p.is_winner is not none %} [победитель]{% endif %}
@@ -63,6 +66,7 @@ ID партии: {{ game_id }}
 
 ВАЖНО: роли выше подтверждены ботом. Не меняй их на «Мирный житель».
 {% endif %}
+
 ## Игроки
 {% set alive_players = players | selectattr("alive") | list %}
 {% for player in players %}- ID {{ player.player_id }}; имя: {{ player.display_name }}; жив: {{ player.alive }}; известная роль: {{ player.known_role if player.known_role else "неизвестна" }}{% if player.is_placeholder %} [синтетический ID]{% endif %}
@@ -73,18 +77,39 @@ ID партии: {{ game_id }}
 {% for message in recent_messages %}- {{ message.ts }} — {{ message.author_name }}: {{ message.text }}
 {% else %}- Сообщений нет.
 {% endfor %}
+
 {% if recent_votes %}
 ## Голосования (последние {{ recent_votes|length }})
 {% for v in recent_votes %}- {{ v.voter_name }} → {{ v.target_name or "(воздержался)" }}
-{% endfor %}{% endif %}
+{% endfor %}
+{% endif %}
+
 {% if role_notes %}
 ## Тонкости ролей (эвристики клуба)
 {{ role_notes }}
 {% endif %}
+
 {% if club_notes_summary %}Сводка эвристик
 {{ club_notes_summary }}
-{% endif %}Что нужно сделать
+{% endif %}
+
+Что нужно сделать
 Верни предсказания ролей в JSON по системной схеме. Используй только player_id и имена из раздела «Игроки»; кратко обоснуй выводы на русском языке.
+
+### Два разных случая (не путай их):
+
+1. Игрок ПОЛНОСТЬЮ МОЛЧИТ (нет сообщений И нет голосов в этой партии):
+   → suspected_role = null
+   → confidence = 0.0
+   → reason = "нет данных"
+   → pattern_ids = []
+   → pattern_descriptions = []
+
+2. Игрок жив / есть в составе / placeholder, но поведенческих аргументов мало или нет:
+   → ОБЯЗАТЕЛЬНО выдай роль из состава бота
+   → confidence 0.3–0.5
+   → reason = "распределение состава бота"
+   → НИКОГДА не ставь null в этом случае
 
 {% if role_count %}
 ## Полное распределение состава
