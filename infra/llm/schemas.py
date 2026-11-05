@@ -68,15 +68,21 @@ class PlayerPrediction(BaseModel):
 
     @model_validator(mode="after")
     def _null_role_invariants(self) -> PlayerPrediction:
-        """Enforce the contract for ``suspected_role = null`` and pattern lists."""
+        """Enforce the contract for ``suspected_role = null`` and pattern lists.
+
+        Silent players (no messages, no votes) get ``reason="нет данных"`` with
+        empty pattern lists. Pattern slot-releases may carry a custom reason
+        with a non-empty ``pattern_ids`` list.
+        """
         if self.suspected_role is None:
             if self.confidence != 0.0:
                 raise ValueError(
                     f"confidence must be 0.0 when suspected_role is null (got {self.confidence})"
                 )
-            if self.reason != "нет данных":
+            if not self.pattern_ids and self.reason != "нет данных":
                 raise ValueError(
-                    f'reason must be "нет данных" when suspected_role is null (got {self.reason!r})'
+                    f'reason must be "нет данных" when suspected_role is null '
+                    f"and no patterns apply (got {self.reason!r})"
                 )
         if len(self.pattern_ids) != len(self.pattern_descriptions):
             raise ValueError(

@@ -11,6 +11,7 @@ from jinja2 import Environment
 from loguru import logger
 from pydantic import ValidationError
 
+from domain.club_patterns import ClubPatterns
 from domain.exceptions import LLMConnectionError, LLMError
 from domain.game_state import GameState
 from domain.roles import RoleRegistry
@@ -21,6 +22,7 @@ from features.analyzer.context_builder import (
     to_llm_messages,
 )
 from features.analyzer.heuristic_hints import HeuristicHint, compute_hints
+from features.analyzer.pattern_detector import PatternDetector
 from infra.db.repositories.predictions import PredictionsRepository
 from infra.llm.client import LLMClient
 from infra.llm.schemas import AnalysisResponse, PlayerPrediction
@@ -132,8 +134,15 @@ class GameAnalyzer:
         max_messages: int = 200,
         reasoning_max_chars: int = DEFAULT_REASONING_MAX_CHARS,
         club_patterns: str = "",
+        patterns: ClubPatterns | None = None,
     ) -> None:
-        """Retain the dependencies and context/reasoning limits for analysis."""
+        """Retain the dependencies and context/reasoning limits for analysis.
+
+        Args:
+            patterns: validated club patterns from ``configs/club_patterns.yaml``.
+                When provided, pattern-based role overrides are applied before
+                composition enforcement.
+        """
         self._llm_client = llm_client
         self._predictions_repo = predictions_repo
         self._registry = registry
@@ -141,6 +150,9 @@ class GameAnalyzer:
         self._max_messages = max_messages
         self._reasoning_max_chars = reasoning_max_chars
         self._club_patterns = club_patterns
+        self._pattern_detector = (
+            PatternDetector(patterns=patterns, registry=registry) if patterns is not None else None
+        )
 
     async def analyze(
         self,
@@ -243,6 +255,26 @@ class GameAnalyzer:
         )
         if silent_forced != response.analysis:
             response = response.model_copy(update={"analysis": silent_forced})
+
+        # Club-pattern overrides: pattern-based roles take priority over
+        # bot-composition slots. Released slots are redistributed by
+        # _enforce_composition inside _postprocess_response.
+        if self._pattern_detector is not None:
+            previous_roles_by_id = {p.player_id: p.suspected_role for p in response.analysis}
+            name_by_id = {player.player_id: player.display_name for player in game_state.players()}
+            pattern_matches, slot_releases = self._pattern_detector.detect(
+                game_state=game_state,
+                previous_predictions_role_by_id=previous_roles_by_id,
+            )
+            if pattern_matches or slot_releases:
+                overridden = self._pattern_detector.apply_overrides(
+                    predictions=response.analysis,
+                    matches=pattern_matches,
+                    releases=slot_releases,
+                    name_by_id=name_by_id,
+                )
+                if overridden != response.analysis:
+                    response = response.model_copy(update={"analysis": overridden})
 
         response, correction_warnings = self._postprocess_response(
             response,

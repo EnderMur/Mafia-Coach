@@ -211,6 +211,22 @@ mafia_coach/
 (`ClubPattern`, `ClubPatterns`). Файл не коммитится как `.txt` — актуальная
 версия хранится в `configs/club_patterns.yaml`.
 
+Обнаружение и применение паттернов — `features.analyzer.pattern_detector.PatternDetector`:
+
+- `detect()` сканирует события игры (сообщения, голоса, раскрытия ролей) и
+  возвращает `PatternMatch` (переопределение роли) и `SlotRelease` (освобождённый
+  слот composition). Паттерны с `requires_confirmation=true` (#1, #5) срабатывают
+  только при подтверждающем действии (голосование).
+- `apply_overrides()` применяет совпадения к `PlayerPrediction`: роль, confidence
+  по tiers §10, `pattern_ids` / `pattern_descriptions` из конфига. При конфликте
+  паттернов приоритет у более сильного (выше confidence); конфликт фиксируется в
+  `reason`.
+- Освобождённый слот получает `suspected_role = null`, `confidence = 0.0`,
+  `reason = "слот переопределён паттерном #N"`, `pattern_ids = ["#N"]`.
+- Остальные квоты redistribuруются `_enforce_composition` среди живых не-молчаливых
+  игроков без ролей. Молчаливые игроки (без сообщений и голосов) не подлежат
+  переопределению паттерном.
+
 ---
 
 ## 6. Как добавлять фичи (workflow)
