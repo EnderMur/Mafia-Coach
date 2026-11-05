@@ -28,7 +28,7 @@ CONFIDENCE_TIERS: frozenset[float] = frozenset({0.9, 0.8, 0.6})
 class ClubPattern(BaseModel):
     """One documented club pattern with a confidence tier.
 
-    ``id`` is a short pattern identifier such as ``"#1"`` through ``"#7"``.
+    ``id`` is a short pattern identifier such as ``"#1"`` through ``"#8"``.
     ``trigger`` names the kind of observable behaviour (for example
     ``claim_investigation`` or ``bot_investigation_result``).
     ``conclusion_role`` is the role the pattern points to (canonical
