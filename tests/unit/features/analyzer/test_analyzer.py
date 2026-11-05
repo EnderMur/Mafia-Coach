@@ -470,10 +470,12 @@ async def test_analyze_persistence_failure_adds_warning(
             *,
             game_id: int,
             player_id: int,
-            predicted_role: str,
+            predicted_role: str | None,
             confidence: float,
             reasoning: str,
-            **kwargs: object,
+            reason: str = "",
+            pattern_ids: list[str] | None = None,
+            pattern_descriptions: list[str] | None = None,
         ) -> int:
             raise sqlite3.OperationalError("disk full")
 
