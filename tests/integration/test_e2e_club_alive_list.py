@@ -232,6 +232,7 @@ async def test_club_snapshot_produces_16_role_predictions(
 
     used: dict[str, int] = {}
     for prediction in result.response.analysis:
+        assert prediction.suspected_role is not None
         used[prediction.suspected_role] = used.get(prediction.suspected_role, 0) + 1
         assert prediction.player_id in ids
         assert prediction.reasons
