@@ -128,6 +128,19 @@ def validate_response(
     warnings: list[str] = []
     normalized_data = deepcopy(parsed)
     _normalize_confidence_values(normalized_data, warnings)
+
+    # Псевдокод: нормализация null-ролей перед валидацией
+    # Только если normalized_data — это словарь и analysis — список словарей
+    if isinstance(normalized_data, dict):
+        analysis_list = normalized_data.get("analysis")
+        if isinstance(analysis_list, list):
+            for item in analysis_list:
+                if isinstance(item, dict) and item.get("suspected_role") is None:
+                    item["confidence"] = 0.0
+                    item["reason"] = "нет данных"
+                    item["pattern_ids"] = []
+                    item["pattern_descriptions"] = []
+
     response = AnalysisResponse.model_validate(normalized_data)
 
     validated_predictions: list[PlayerPrediction] = []
