@@ -375,7 +375,7 @@ def to_llm_messages(
     jinja_env: jinja2.Environment,
     response_schema_json: str | None = None,
     club_notes_summary: str = "",
-    club_patterns: str = "",
+    club_patterns: list[dict[str, object]] | None = None,
 ) -> list[dict[str, str]]:
     """Render ``system.jinja`` and ``analyze.jinja`` for one analysis cycle.
 
@@ -393,7 +393,9 @@ def to_llm_messages(
             value the ``response_schema_json`` global of ``jinja_env`` is used,
             and :data:`DEFAULT_RESPONSE_SCHEMA_JSON` as the last resort.
         club_notes_summary: optional textual summary of heuristic hints.
-        club_patterns: optional free-text observations specific to the club.
+        club_patterns: optional structured club patterns (list of dicts with
+            keys id, trigger, conclusion_role, confidence_tier,
+            requires_confirmation, description).
 
     Returns:
         ``[{"role": "system", ...}, {"role": "user", ...}]``.
@@ -407,6 +409,9 @@ def to_llm_messages(
     system_content = jinja_env.get_template(SYSTEM_TEMPLATE_NAME).render(
         role_names_ru=role_names_ru,
         response_schema_json=schema_json,
+        previous_predictions=[
+            _prediction_payload(prediction) for prediction in context.previous_predictions
+        ],
     )
     analyze_content = jinja_env.get_template(ANALYZE_TEMPLATE_NAME).render(
         game_id=context.game_id,

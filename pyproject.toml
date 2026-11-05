@@ -37,7 +37,7 @@ training = []
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["*.md"]
+extend-exclude = ["*.md", "*.jinja"]
 
 [tool.ruff.format]
 quote-style = "double"

@@ -133,12 +133,16 @@ class GameAnalyzer:
         jinja_env: Environment,
         max_messages: int = 200,
         reasoning_max_chars: int = DEFAULT_REASONING_MAX_CHARS,
-        club_patterns: str = "",
+        club_patterns: list[dict[str, object]] | None = None,
         patterns: ClubPatterns | None = None,
     ) -> None:
         """Retain the dependencies and context/reasoning limits for analysis.
 
         Args:
+            club_patterns: structured club patterns as list of dicts with keys
+                id, trigger, conclusion_role, confidence_tier,
+                requires_confirmation, description. Passed to the Jinja
+                prompt templates.
             patterns: validated club patterns from ``configs/club_patterns.yaml``.
                 When provided, pattern-based role overrides are applied before
                 composition enforcement.
@@ -150,6 +154,18 @@ class GameAnalyzer:
         self._max_messages = max_messages
         self._reasoning_max_chars = reasoning_max_chars
         self._club_patterns = club_patterns
+        if self._club_patterns is None and patterns is not None:
+            self._club_patterns = [
+                {
+                    "id": p.id,
+                    "trigger": p.trigger,
+                    "conclusion_role": p.conclusion_role,
+                    "confidence_tier": p.confidence_tier,
+                    "requires_confirmation": p.requires_confirmation,
+                    "description": p.description,
+                }
+                for p in patterns.patterns
+            ]
         self._pattern_detector = (
             PatternDetector(patterns=patterns, registry=registry) if patterns is not None else None
         )

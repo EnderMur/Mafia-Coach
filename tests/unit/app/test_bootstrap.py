@@ -30,13 +30,47 @@ def _settings_with_patterns_file(tmp_path: Path, patterns_path: Path) -> Path:
     return config_path
 
 
+def _write_patterns_yaml(path: Path, patterns: list[dict[str, object]]) -> None:
+    """Write a YAML club-patterns file with a top-level ``patterns`` key."""
+    path.write_text(yaml.safe_dump({"patterns": patterns}, allow_unicode=True), encoding="utf-8")
+
+
 async def test_bootstrap_loads_club_patterns(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The primary file wins over an example and flows all the way to the LLM."""
-    patterns_path = tmp_path / "patterns.txt"
-    patterns_path.write_text("  SYNTHETIC PRIMARY  \n", encoding="utf-8")
-    (tmp_path / "patterns.example.txt").write_text("SYNTHETIC EXAMPLE", encoding="utf-8")
+    """The primary YAML file wins over an example and flows all the way to the LLM."""
+    patterns_path = tmp_path / "patterns.yaml"
+    _write_patterns_yaml(
+        patterns_path,
+        [
+            {
+                "id": "#1",
+                "trigger": "claim_investigation",
+                "conclusion_role": "Комиссар Каттани",
+                "confidence_tier": 0.8,
+                "requires_confirmation": True,
+                "description": "Игрок заявляет о проверке роли",
+            }
+        ],
+    )
+    (tmp_path / "patterns.example.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "patterns": [
+                    {
+                        "id": "#9",
+                        "trigger": "example",
+                        "conclusion_role": "Мафия",
+                        "confidence_tier": 0.6,
+                        "requires_confirmation": False,
+                        "description": "Example fallback",
+                    }
+                ]
+            },
+            allow_unicode=True,
+        ),
+        encoding="utf-8",
+    )
     llm_client = FakeLLMClient()
     analyze_stream = AsyncMock(wraps=llm_client.analyze_stream)
     monkeypatch.setattr(llm_client, "analyze_stream", analyze_stream)
@@ -47,13 +81,19 @@ async def test_bootstrap_loads_club_patterns(
     )
     try:
         assert result.config.club_patterns_file == str(patterns_path)
-        assert result.club_patterns == "SYNTHETIC PRIMARY"
+        assert result.club_patterns[0]["id"] == "#1"
+        assert result.club_patterns[0]["conclusion_role"] == "Комиссар Каттани"
+        assert result.club_patterns[0]["confidence_tier"] == 0.8
+        assert result.club_patterns[0]["requires_confirmation"] is True
         analysis = await result.analyzer.analyze(result.game_state, persist=False)
         assert analysis.success
         assert analyze_stream.await_args is not None
         prompt = analyze_stream.await_args.kwargs["messages"][1]["content"]
-        assert "SYNTHETIC PRIMARY" in prompt
-        assert "SYNTHETIC EXAMPLE" not in prompt
+        assert "#1" in prompt
+        assert "claim_investigation" in prompt
+        assert "Комиссар Каттани" in prompt
+        assert "0.8" in prompt
+        assert "#9" not in prompt
     finally:
         await shutdown_result(result)
 
@@ -61,10 +101,22 @@ async def test_bootstrap_loads_club_patterns(
 async def test_bootstrap_falls_back_to_example(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """An example is read with a warning when the configured file is absent."""
-    patterns_path = tmp_path / "patterns.txt"
-    example_path = tmp_path / "patterns.example.txt"
-    example_path.write_text("  SYNTHETIC EXAMPLE  \n", encoding="utf-8")
+    """An example YAML is read with a warning when the configured file is absent."""
+    patterns_path = tmp_path / "patterns.yaml"
+    example_path = tmp_path / "patterns.example.yaml"
+    _write_patterns_yaml(
+        example_path,
+        [
+            {
+                "id": "#9",
+                "trigger": "example",
+                "conclusion_role": "Мафия",
+                "confidence_tier": 0.6,
+                "requires_confirmation": False,
+                "description": "Example fallback",
+            }
+        ],
+    )
     monkeypatch.setattr("app.bootstrap.setup_logging", lambda **kwargs: None)
     captured = io.StringIO()
     sink = logger.add(captured, level="WARNING", format="{level}: {message}")
@@ -75,7 +127,8 @@ async def test_bootstrap_falls_back_to_example(
             llm_client=FakeLLMClient(),
         )
         try:
-            assert result.club_patterns == "SYNTHETIC EXAMPLE"
+            assert result.club_patterns[0]["id"] == "#9"
+            assert result.club_patterns[0]["conclusion_role"] == "Мафия"
             assert result.analyzer._club_patterns == result.club_patterns
         finally:
             await shutdown_result(result)
@@ -90,7 +143,7 @@ async def test_bootstrap_falls_back_to_example(
 
 async def test_bootstrap_missing_both(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Both files can be missing without preventing bootstrap or inventing patterns."""
-    patterns_path = tmp_path / "absent" / "patterns.txt"
+    patterns_path = tmp_path / "absent" / "patterns.yaml"
     monkeypatch.setattr("app.bootstrap.setup_logging", lambda **kwargs: None)
     captured = io.StringIO()
     sink = logger.add(captured, level="INFO", format="{level}: {message}")
@@ -101,15 +154,14 @@ async def test_bootstrap_missing_both(tmp_path: Path, monkeypatch: pytest.Monkey
             llm_client=FakeLLMClient(),
         )
         try:
-            assert result.club_patterns == ""
-            assert result.analyzer._club_patterns == ""
+            assert result.club_patterns == []
+            assert result.analyzer._club_patterns == []
         finally:
             await shutdown_result(result)
     finally:
         logger.remove(sink)
 
     assert "INFO: club_patterns: file not found, using empty" in captured.getvalue()
-    assert "club_patterns loaded: 0 chars" in captured.getvalue()
     assert not patterns_path.exists()
 
 
@@ -132,7 +184,7 @@ async def test_bootstrap_creates_all_resources(tmp_path: Path) -> None:
         assert result.telegram.me_id == telegram.me_id
         assert result.game_state.game_id > 0
         assert result.analyzer is not None
-        assert result.club_patterns == ""
+        assert result.club_patterns == []
         assert result.trigger_policy.mode is TriggerMode.QUEUE
         assert result.jinja_env.get_template("system.jinja") is not None
         assert result.owns_llm is False

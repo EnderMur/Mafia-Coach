@@ -258,7 +258,7 @@ def make_analyzer(
     *,
     max_messages: int = 200,
     reasoning_max_chars: int = 4096,
-    club_patterns: str = "",
+    club_patterns: list[dict[str, object]] | None = None,
     patterns: ClubPatterns | None = None,
 ) -> GameAnalyzer:
     """Create a GameAnalyzer with test dependencies."""
@@ -304,14 +304,32 @@ async def test_analyzer_passes_club_patterns(
     _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]))
-    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, club_patterns="PATTERN X")
+    analyzer = make_analyzer(
+        fake_llm,
+        repository,
+        registry,
+        jinja_env,
+        club_patterns=[
+            {
+                "id": "#1",
+                "trigger": "claim_investigation",
+                "conclusion_role": "Комиссар Каттани",
+                "confidence_tier": 0.8,
+                "requires_confirmation": True,
+                "description": "Игрок заявляет, что проверил чью-то роль.",
+            }
+        ],
+    )
 
     result = await analyzer.analyze(make_game_state(registry), persist=False)
 
     assert result.success
     prompt = fake_llm.calls[0]["messages"][1]["content"]
     assert "Паттерны этого клуба" in prompt
-    assert "PATTERN X" in prompt
+    assert "#1" in prompt
+    assert "claim_investigation" in prompt
+    assert "Комиссар Каттани" in prompt
+    assert "0.8" in prompt
 
 
 async def test_analyze_llm_error_returns_result_with_error(

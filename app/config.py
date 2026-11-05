@@ -114,7 +114,7 @@ class AppConfig(BaseModel):
     llm: LLMSection
     db: DBSection
     roles_file: str = Field(min_length=1)
-    club_patterns_file: str = "configs/club_patterns.txt"
+    club_patterns_file: str = "configs/club_patterns.yaml"
     analysis: AnalysisSection = Field(default_factory=AnalysisSection)
     ui: UISection = Field(default_factory=UISection)
     logging: LoggingSection = Field(default_factory=LoggingSection)

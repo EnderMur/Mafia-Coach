@@ -235,7 +235,16 @@ async def test_e2e_non_thinking_sse_json_reasoning_and_honesty(
             predictions_repo=predictions_repository,
             registry=registry,
             jinja_env=jinja_env,
-            club_patterns="SYNTHETIC CLUB PATTERN",
+            club_patterns=[
+                {
+                    "id": "#SYN",
+                    "trigger": "synthetic",
+                    "conclusion_role": "Мафия",
+                    "confidence_tier": 0.9,
+                    "requires_confirmation": False,
+                    "description": "Synthetic club pattern for E2E test",
+                }
+            ],
         )
         try:
             result = await analyzer.analyze(game_state)
@@ -251,7 +260,8 @@ async def test_e2e_non_thinking_sse_json_reasoning_and_honesty(
     prompt = sent_payloads[0]["messages"][1]["content"]
     assert "Player 101 → Player 100" in prompt
     assert "Тонкости ролей" in prompt
-    assert "SYNTHETIC CLUB PATTERN" in prompt
+    assert "#SYN" in prompt
+    assert "synthetic" in prompt
     assert "Честность predictions" in prompt
 
 

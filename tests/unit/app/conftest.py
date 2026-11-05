@@ -206,7 +206,7 @@ def create_settings_file(
     settings["db"]["path"] = db_path or str(tmp_path / "mafia.db")
     settings["roles_file"] = str(ROOT / "configs" / "roles.yaml")
     # Never read a developer's private club file when bootstrapping tests.
-    settings["club_patterns_file"] = str(tmp_path / "patterns.txt")
+    settings["club_patterns_file"] = str(tmp_path / "patterns.yaml")
     settings["logging"]["dir"] = str(tmp_path / "logs")
 
     config_path = tmp_path / "settings.yaml"
