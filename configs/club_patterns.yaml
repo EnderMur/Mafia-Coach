@@ -13,9 +13,9 @@ patterns:
 
   - id: "#2"
     trigger: claim_role_direct
-    conclusion_role: "Мафия"
+    conclusion_role: "Мирный житель"
     confidence_tier: 0.9
-    description: "Прямое заявление игрока о своей или чужой роли («я — Мафия», «он — Дон»)."
+    description: "Прямое заявление игрока о своей или чужой мирной роли («я — мирный», «он — мирный»)."
     requires_confirmation: false
 
   - id: "#3"
@@ -27,28 +27,21 @@ patterns:
 
   - id: "#4"
     trigger: claim_peaceful_contradiction
-    conclusion_role: "Мирный житель"
+    conclusion_role: "Мафия"
     confidence_tier: 0.6
-    description: "Противоречивое или недоказуемое заявление о мирной роли — слабый негативный вывод."
+    description: "Противоречивое или недоказуемое заявление о мирной роли — слабый негативный вывод, указывающий на мафию."
     requires_confirmation: false
 
   - id: "#5"
     trigger: bot_investigation_result
-    conclusion_role: "Комиссар Каттани"
+    conclusion_role: "Бомж"
     confidence_tier: 0.8
     description: "Результат проверки из сообщения бота, подтверждённый исходом голосования."
     requires_confirmation: true
 
-  - id: "#6"
-    trigger: bot_lucky_survived
-    conclusion_role: "Мафия"
-    confidence_tier: 0.6
-    description: "Игрок выжил в ночь, когда на него был нацелен deadly навык мафии — косвенный признак мафии."
-    requires_confirmation: false
-
   - id: "#7"
     trigger: claim_role_direct
-    conclusion_role: "Дон"
+    conclusion_role: "Счастливчик"
     confidence_tier: 0.9
-    description: "Прямое заявление игрока о роли Дона (себя или другого игрока)."
+    description: "Прямое заявление игрока о роли Счастливчика (себя или другого игрока)."
     requires_confirmation: false

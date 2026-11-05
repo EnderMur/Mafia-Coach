@@ -173,13 +173,17 @@ class PatternDetector:
                 )
                 seen_players.add(vote.payload.voter_id)
 
-        # Lucky survival (#6): survived a night kill.
-        # Requires night-action targeting data not yet available; skipped here.
+        # Lucky survival (#6): temporarily disabled — no night-action targeting
+        # data available in GameState. Pattern #6 was removed from config;
+        # see AI_INSTRUCTIONS.md for details.
 
         # Compute slot releases: players who previously had a role that a
-        # pattern now overrides with a different role.
+        # pattern now overrides with a different role. Only matches with a
+        # non-empty pattern_id count — unmatched direct claims are ignored.
         releases: list[SlotRelease] = []
         for match in matches:
+            if not match.pattern_id:
+                continue
             old_role = previous_predictions_role_by_id.get(match.player_id)
             if old_role is not None and old_role != match.role:
                 releases.append(SlotRelease(player_id=match.player_id, pattern_id=match.pattern_id))
@@ -218,10 +222,14 @@ class PatternDetector:
         result: list[PlayerPrediction] = []
         for prediction in predictions:
             if prediction.player_id in match_by_id:
-                # Pattern override takes priority: the player gets the pattern
-                # role. Any slot release for this player is implicit — their old
-                # role is freed by the new assignment.
                 match = match_by_id[prediction.player_id]
+                # Unmatched direct claims (empty pattern_id) do not override
+                # the role — they only record that the claim was examined.
+                if not match.pattern_id:
+                    result.append(
+                        prediction.model_copy(update={"reason": match.reason or prediction.reason})
+                    )
+                    continue
                 pattern = self._patterns.get(match.pattern_id)
                 result.append(
                     prediction.model_copy(
@@ -329,6 +337,11 @@ class PatternDetector:
         Only the explicit dash-separated claim syntax is recognised; bare
         keyword mentions (e.g. "он Комиссар" in an investigation story) are
         intentionally ignored to avoid false positives.
+
+        If the claimed role does not match any configured pattern's
+        conclusion_role for the claim_role_direct trigger, no pattern is
+        assigned — pattern_ids stays empty and the reason reports that the
+        claim was not matched to a pattern.
         """
         text = payload.text
         claim_match = _CLAIM_ROLE_RE.search(text)
@@ -340,11 +353,15 @@ class PatternDetector:
         if claimed_role is None:
             return None
 
-        # Match against pattern conclusion_role; fall back to #2 for any
-        # unmatched direct claim.
         pattern = self._find_pattern_by_conclusion(claimed_role, "claim_role_direct")
         if pattern is None:
-            pattern = self._patterns.get("#2")
+            return PatternMatch(
+                player_id=payload.author_id,
+                pattern_id="",
+                role=claimed_role,
+                confidence=0.0,
+                reason="прямое заявление не сопоставлено с паттерном",
+            )
 
         return PatternMatch(
             player_id=payload.author_id,

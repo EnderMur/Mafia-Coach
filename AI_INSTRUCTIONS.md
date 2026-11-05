@@ -200,7 +200,7 @@ mafia_coach/
 Файл содержит список документированных паттернов поведения игроков с выводом о
 роли и уровнем уверенности. Каждый паттерн имеет поля:
 
-- `id` — идентификатор вида ``"#1"``..``"#7"`` (единственный источник истины для `pattern_ids` в `AnalysisResponse`);
+- `id` — идентификатор вида ``"#1"``..``"#5", "#7"`` (паттерн #6 удалён; единственный источник истины для `pattern_ids` в `AnalysisResponse`);
 - `trigger` — тип наблюдаемого поведения (`claim_investigation`, `claim_role_direct`, `vote_against_confirmed_commissioner`, `bot_investigation_result`, `bot_lucky_survived`, `claim_peaceful_contradiction` и т.п.);
 - `conclusion_role` — роль, на которую указывает паттерн (каноническое `name_ru` из `roles.yaml`);
 - `confidence_tier` — один из ``0.9``, ``0.8``, ``0.6`` (см. §10);

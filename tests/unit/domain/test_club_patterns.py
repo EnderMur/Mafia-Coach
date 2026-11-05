@@ -46,13 +46,13 @@ def load_real_patterns() -> ClubPatterns:
     return load_club_patterns(PATTERNS_PATH)
 
 
-def test_load_real_config_has_7_patterns() -> None:
-    """The real configuration contains the contracted 7 club patterns."""
-    assert len(load_real_patterns()) == 7
+def test_load_real_config_has_6_patterns() -> None:
+    """The real configuration contains 6 club patterns (#6 removed)."""
+    assert len(load_real_patterns()) == 6
 
 
-def test_real_pattern_ids_are_hash1_to_hash7() -> None:
-    """Every configured identifier is #1..#7 in order."""
+def test_real_pattern_ids_are_hash1_to_hash5_and_hash7() -> None:
+    """Every configured identifier is #1..#5 and #7 in order (#6 removed)."""
     patterns = load_real_patterns()
     assert [pattern.id for pattern in patterns.patterns] == [
         "#1",
@@ -60,13 +60,12 @@ def test_real_pattern_ids_are_hash1_to_hash7() -> None:
         "#3",
         "#4",
         "#5",
-        "#6",
         "#7",
     ]
 
 
 def test_real_pattern_tiers_match_contract() -> None:
-    """#2/#7 are 0.9, #1/#5 are 0.8, #3/#4/#6 are 0.6."""
+    """#2/#7 are 0.9, #1/#5 are 0.8, #3/#4 are 0.6."""
     patterns = load_real_patterns()
     tiers = {pattern.id: pattern.confidence_tier for pattern in patterns.patterns}
     assert tiers["#2"] == 0.9
@@ -75,7 +74,6 @@ def test_real_pattern_tiers_match_contract() -> None:
     assert tiers["#5"] == 0.8
     assert tiers["#3"] == 0.6
     assert tiers["#4"] == 0.6
-    assert tiers["#6"] == 0.6
 
 
 def test_real_patterns_require_confirmation_flags() -> None:
@@ -87,7 +85,6 @@ def test_real_patterns_require_confirmation_flags() -> None:
     assert flags["#2"] is False
     assert flags["#3"] is False
     assert flags["#4"] is False
-    assert flags["#6"] is False
     assert flags["#7"] is False
 
 
@@ -144,7 +141,7 @@ def test_by_tier_groups_patterns_correctly() -> None:
     registry = load_real_patterns()
     assert {p.id for p in registry.by_tier(0.9)} == {"#2", "#7"}
     assert {p.id for p in registry.by_tier(0.8)} == {"#1", "#5"}
-    assert {p.id for p in registry.by_tier(0.6)} == {"#3", "#4", "#6"}
+    assert {p.id for p in registry.by_tier(0.6)} == {"#3", "#4"}
     assert registry.by_tier(0.5) == ()
 
 

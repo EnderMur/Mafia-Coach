@@ -1207,6 +1207,35 @@ async def test_pattern_investigation_without_confirmation_does_not_fire(
     assert p.pattern_descriptions == []
 
 
+async def test_unmatched_direct_claim_empty_pattern_ids_and_reason(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Unmatched direct claim → empty pattern_ids, reason notes no match, LLM role stays."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100, text="я - Мафия")
+
+    patterns = load_real_patterns()
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, "Мафия", confidence=0.5)]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, patterns=patterns)
+
+    result = await analyzer.analyze(state, persist=False)
+
+    assert result.success and result.response is not None
+    p = result.response.analysis[0]
+    assert p.player_id == 100
+    # No pattern matched → LLM role stays, no override
+    assert p.suspected_role == "Мафия"
+    assert p.confidence == 0.5
+    assert p.pattern_ids == []
+    assert p.pattern_descriptions == []
+    assert "прямое заявление не сопоставлено с паттерном" in p.reason
+
+
 async def test_pattern_investigation_with_confirmation_fires(
     registry: RoleRegistry,
     jinja_env: jinja2.Environment,
