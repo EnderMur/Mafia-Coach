@@ -33,6 +33,7 @@ VALID_CONTENT = json.dumps(
                 "player_name": "Player A",
                 "suspected_role": ROLE_NAME,
                 "confidence": 0.8,
+                "reason": "Observed behavior.",
                 "reasons": ["observed behavior"],
             }
         ],

@@ -11,6 +11,7 @@ import jinja2
 from loguru import logger
 
 from app.config import AppConfig, load_config
+from domain.club_patterns import load_club_patterns
 from domain.exceptions import ConfigError
 from domain.game_state import GameState
 from domain.roles import RoleRegistry, load_roles
@@ -56,15 +57,37 @@ class BootstrapResult:
     jinja_env: jinja2.Environment
     owns_telegram: bool
     owns_llm: bool
-    club_patterns: str = ""
+    club_patterns: list[dict[str, object]] = field(default_factory=list)
     _shutdown_complete: bool = field(default=False, init=False, repr=False)
 
 
-def _load_club_patterns(path_str: str) -> str:
-    """Read the private patterns file, fall back to its example, or use empty text."""
+def _load_club_patterns(path_str: str) -> list[dict[str, object]]:
+    """Load club patterns from YAML config, return structured list of dicts.
+
+    Falls back to the example file, or returns an empty list when no config
+    exists. Each dict has keys: id, trigger, conclusion_role,
+    confidence_tier, requires_confirmation, description.
+    """
     primary = Path(path_str)
     if primary.is_file():
-        return primary.read_text(encoding="utf-8").strip()
+        try:
+            patterns = load_club_patterns(primary)
+        except ConfigError as error:
+            logger.bind(channel="bootstrap").warning(
+                "club_patterns: invalid YAML ({}), using empty list", error
+            )
+            return []
+        return [
+            {
+                "id": p.id,
+                "trigger": p.trigger,
+                "conclusion_role": p.conclusion_role,
+                "confidence_tier": p.confidence_tier,
+                "requires_confirmation": p.requires_confirmation,
+                "description": p.description,
+            }
+            for p in patterns.patterns
+        ]
     example = primary.with_name(primary.stem + ".example" + primary.suffix)
     if example.is_file():
         logger.bind(channel="bootstrap").warning(
@@ -72,11 +95,28 @@ def _load_club_patterns(path_str: str) -> str:
             example,
             primary,
         )
-        return example.read_text(encoding="utf-8").strip()
+        try:
+            patterns = load_club_patterns(example)
+        except ConfigError as error:
+            logger.bind(channel="bootstrap").warning(
+                "club_patterns: invalid example YAML ({}), using empty list", error
+            )
+            return []
+        return [
+            {
+                "id": p.id,
+                "trigger": p.trigger,
+                "conclusion_role": p.conclusion_role,
+                "confidence_tier": p.confidence_tier,
+                "requires_confirmation": p.requires_confirmation,
+                "description": p.description,
+            }
+            for p in patterns.patterns
+        ]
     logger.bind(channel="bootstrap").info(
         "club_patterns: file not found, using empty (create {} to add)", primary
     )
-    return ""
+    return []
 
 
 async def bootstrap(
@@ -116,7 +156,7 @@ async def bootstrap(
     )
     logger.bind(channel="bootstrap").info("config loaded")
     club_patterns = _load_club_patterns(config.club_patterns_file)
-    logger.bind(channel="bootstrap").info("club_patterns loaded: {} chars", len(club_patterns))
+    logger.bind(channel="bootstrap").info("club_patterns loaded: {} patterns", len(club_patterns))
 
     connection: sqlite3.Connection | None = None
     active_llm: LLMClient | None = None

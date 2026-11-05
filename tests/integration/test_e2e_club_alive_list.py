@@ -15,7 +15,7 @@ from typing import Any
 import jinja2
 import pytest
 
-from domain.events import AliveListEvent, AliveListPayload
+from domain.events import AliveListEvent, AliveListPayload, MessageEvent, MessagePayload
 from domain.game_state import GameState, _placeholder_player_id
 from domain.roles import RoleRegistry, load_roles
 from features.analyzer.analyzer import GameAnalyzer
@@ -88,6 +88,7 @@ class RecordingLLM(LLMClient):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Delegate to the streaming fake."""
         return await self.analyze_stream(
@@ -95,6 +96,7 @@ class RecordingLLM(LLMClient):
             known_player_ids=known_player_ids,
             role_names_ru=role_names_ru,
             role_alias_resolver=role_alias_resolver,
+            silent_player_ids=silent_player_ids,
         )
 
     async def analyze_stream(
@@ -106,6 +108,7 @@ class RecordingLLM(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Record the request and return the canned response."""
         self.calls.append(
@@ -185,6 +188,17 @@ async def test_club_snapshot_produces_16_role_predictions(
     ids = [_placeholder_player_id(name) for name in parsed.alive_player_names]
     for name, player_id in zip(parsed.alive_player_names, ids, strict=True):
         players_repo.upsert_player(player_id=player_id, username=None, display_name=name)
+        state.apply(
+            MessageEvent(
+                ts=TS,
+                game_id=game_id,
+                payload=MessagePayload(
+                    author_id=player_id,
+                    author_name=name,
+                    text=f"сообщение от {name}",
+                ),
+            )
+        )
 
     first_id = ids[0]
     llm = RecordingLLM(
@@ -195,6 +209,7 @@ async def test_club_snapshot_produces_16_role_predictions(
                     player_name=parsed.alive_player_names[0],
                     suspected_role="Мафия",
                     confidence=0.6,
+                    reason="Активно давит в первый день.",
                     reasons=["активно давит в первый день"],
                 )
             ],
@@ -217,6 +232,7 @@ async def test_club_snapshot_produces_16_role_predictions(
 
     used: dict[str, int] = {}
     for prediction in result.response.analysis:
+        assert prediction.suspected_role is not None
         used[prediction.suspected_role] = used.get(prediction.suspected_role, 0) + 1
         assert prediction.player_id in ids
         assert prediction.reasons

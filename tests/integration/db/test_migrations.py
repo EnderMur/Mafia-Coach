@@ -16,7 +16,7 @@ def test_first_migration_applies_once() -> None:
     """The initial schema applies once and is skipped thereafter."""
     connection = connect(":memory:")
     try:
-        assert apply_migrations(connection) == 4
+        assert apply_migrations(connection) == 6
         assert apply_migrations(connection) == 0
     finally:
         close(connection)
@@ -40,7 +40,7 @@ def test_migration_runner_creates_all_schema_tables(conn: sqlite3.Connection) ->
 def test_schema_version_records_version_one(conn: sqlite3.Connection) -> None:
     """The initial schema is recorded in the migration ledger."""
     rows = conn.execute("SELECT version FROM schema_version").fetchall()
-    assert [row[0] for row in rows] == [1, 2, 3, 4]
+    assert [row[0] for row in rows] == [1, 2, 3, 4, 5, 6]
 
 
 def test_migration_creates_expected_indexes(conn: sqlite3.Connection) -> None:
@@ -62,7 +62,7 @@ def test_failed_migration_rolls_back_all_its_statements(
     conn: sqlite3.Connection, tmp_path: Path
 ) -> None:
     """A migration failure rolls back DDL and its version record."""
-    migration = tmp_path / "005_broken.sql"
+    migration = tmp_path / "007_broken.sql"
     migration.write_text(
         "CREATE TABLE transient_table (id INTEGER PRIMARY KEY);\nNOT VALID SQL;\n",
         encoding="utf-8",
@@ -73,7 +73,7 @@ def test_failed_migration_rolls_back_all_its_statements(
         "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
         ("transient_table",),
     ).fetchone()
-    version = conn.execute("SELECT version FROM schema_version WHERE version=5").fetchone()
+    version = conn.execute("SELECT version FROM schema_version WHERE version=7").fetchone()
     assert table is None
     assert version is None
     assert conn.in_transaction is False
@@ -83,7 +83,7 @@ def test_incomplete_migration_statement_rolls_back(
     conn: sqlite3.Connection, tmp_path: Path
 ) -> None:
     """A migration ending with an incomplete statement is rejected."""
-    migration = tmp_path / "005_incomplete.sql"
+    migration = tmp_path / "007_incomplete.sql"
     migration.write_text("CREATE TABLE unfinished_table (id INTEGER PRIMARY KEY)", encoding="utf-8")
     with pytest.raises(sqlite3.OperationalError, match=re.escape("incomplete SQL")):
         apply_migrations(conn, migrations_dir=tmp_path)
@@ -104,13 +104,13 @@ def test_invalid_migration_filename_raises(conn: sqlite3.Connection, tmp_path: P
 def test_migration_002_creates_history() -> None:
     connection = connect(":memory:")
     try:
-        assert apply_migrations(connection) == 4
+        assert apply_migrations(connection) == 6
         tables = {
             row[0]
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert {"predictions", "predictions_history"} <= tables
-        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 4
+        assert connection.execute("SELECT max(version) FROM schema_version").fetchone()[0] == 6
         assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
     finally:
         connection.close()
@@ -212,7 +212,8 @@ def test_migration_003_adds_is_winner_column() -> None:
     """The ground-truth winner flag is added by migration 003 as a nullable INTEGER."""
     connection = connect(":memory:")
     try:
-        assert apply_migrations(connection) == 4
+        assert apply_migrations(connection) == 6
+        assert apply_migrations(connection) == 0
         columns = {row[1]: row[2] for row in connection.execute("PRAGMA table_info(game_players)")}
         assert "is_winner" in columns
         assert columns["is_winner"] == "INTEGER"

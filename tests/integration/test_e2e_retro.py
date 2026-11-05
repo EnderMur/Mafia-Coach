@@ -255,6 +255,7 @@ def build_end_game_environment(tmp_path: Path) -> EndGameEnvironment:
                 player_name="Вася",
                 suspected_role="Мафия",
                 confidence=0.8,
+                reason="Путаница в показаниях днём и ночью.",
                 reasons=["путается в показаниях"],
             ),
             PlayerPrediction(
@@ -262,6 +263,7 @@ def build_end_game_environment(tmp_path: Path) -> EndGameEnvironment:
                 player_name="Петя",
                 suspected_role="Мирный житель",
                 confidence=0.6,
+                reason="Спокойно отвечает, без подозрительных сдвигов.",
                 reasons=["спокойно отвечает"],
             ),
         ],

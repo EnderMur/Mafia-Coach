@@ -66,6 +66,31 @@ def _format_confidence(row: StatsRow) -> str:
     return f"{int(row.confidence * 100)}%"
 
 
+def _format_reason(row: StatsRow) -> str:
+    """Return the per-player reason, with a dash when empty or null-role."""
+    if row.role == "—" and not row.reason:
+        return "нет данных"
+    return row.reason or "—"
+
+
+def _format_patterns(row: StatsRow) -> str:
+    """Format pattern ids + descriptions as ``#N: описание, #M: описание``.
+
+    Returns ``—`` when no patterns are associated with the row.
+    Long descriptions are truncated with an ellipsis so the table stays
+    readable; the full text is available via Rich's tooltip on hover
+    (the :class:`Text` object stores it untruncated).
+    """
+    if not row.pattern_ids:
+        return "—"
+    parts: list[str] = []
+    for pid, desc in zip(row.pattern_ids, row.pattern_descriptions):
+        # Truncate long descriptions so the column stays readable.
+        short_desc = desc if len(desc) <= 40 else desc[:37] + "..."
+        parts.append(f"{pid}: {short_desc}")
+    return ", ".join(parts)
+
+
 def render_table(console: Console, msg: StatsMessage) -> None:
     """Render one stats frame."""
     _safe_clear(console)
@@ -76,12 +101,16 @@ def render_table(console: Console, msg: StatsMessage) -> None:
     table.add_column("Игрок", style="cyan", no_wrap=True)
     table.add_column("Роль")
     table.add_column("Уверенность", justify="right")
+    table.add_column("Причина")
+    table.add_column("Паттерн")
     for row in msg.rows[:_MAX_ROWS]:
         confidence = _format_confidence(row)
         table.add_row(
             row.player_name,
             Text(row.role, style="dim" if row.role == "—" else "magenta"),
             Text(confidence, style="dim" if confidence == "—" else "green"),
+            Text(_format_reason(row), style="dim" if not row.reason else "white"),
+            Text(_format_patterns(row), style="dim" if not row.pattern_ids else "yellow"),
         )
     console.print(table)
 

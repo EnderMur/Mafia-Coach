@@ -24,8 +24,11 @@ def valid_prediction(**overrides: Any) -> dict[str, Any]:
         "player_name": "Player A",
         "suspected_role": "Role A",
         "confidence": 0.6,
+        "reason": "Краткое объяснение роли.",
         "alternative": {"role": "Role B", "confidence": 0.3},
         "reasons": ["reason one"],
+        "pattern_ids": [],
+        "pattern_descriptions": [],
     }
     prediction.update(overrides)
     return prediction
@@ -48,8 +51,11 @@ def test_valid_analysis_response_parses_all_fields() -> None:
         "player_name",
         "suspected_role",
         "confidence",
+        "reason",
         "alternative",
         "reasons",
+        "pattern_ids",
+        "pattern_descriptions",
     }
 
 
@@ -81,6 +87,96 @@ def test_confidence_sum_over_one_is_rejected_by_model() -> None:
                 alternative={"role": "Role B", "confidence": 0.4},
             )
         )
+
+
+def test_null_role_requires_zero_confidence() -> None:
+    """suspected_role = null is only valid with confidence 0.0."""
+    with pytest.raises(ValidationError, match=r"confidence must be 0.0"):
+        PlayerPrediction.model_validate(valid_prediction(suspected_role=None, confidence=0.5))
+
+
+def test_null_role_requires_no_data_reason() -> None:
+    """suspected_role = null is only valid with reason "нет данных"."""
+    with pytest.raises(ValidationError, match=r'"нет данных"'):
+        PlayerPrediction.model_validate(
+            valid_prediction(
+                suspected_role=None,
+                confidence=0.0,
+                reason="неизвестно",
+            )
+        )
+
+
+def test_null_role_with_zero_confidence_and_no_data_is_valid() -> None:
+    """suspected_role = null with confidence 0.0 and reason "нет данных" passes."""
+    prediction = PlayerPrediction.model_validate(
+        valid_prediction(suspected_role=None, confidence=0.0, reason="нет данных")
+    )
+    assert prediction.suspected_role is None
+    assert prediction.confidence == 0.0
+    assert prediction.reason == "нет данных"
+
+
+def test_pattern_lists_must_have_equal_length() -> None:
+    """pattern_ids and pattern_descriptions must stay in sync."""
+    with pytest.raises(ValidationError, match=r"same length"):
+        PlayerPrediction.model_validate(
+            valid_prediction(pattern_ids=["#2"], pattern_descriptions=[])
+        )
+
+
+def test_null_role_allowed_only_for_silent_players() -> None:
+    """Contextual validation drops a null role for a player with messages or votes."""
+    raw = response_json(
+        [valid_prediction(suspected_role=None, confidence=0.0, reason="нет данных")]
+    )
+    result, warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis == []
+    assert any("null suspected role" in warning for warning in warnings)
+
+
+def test_null_role_kept_for_silent_player() -> None:
+    """A silent player (no messages, no votes) may receive a null role."""
+    raw = response_json(
+        [valid_prediction(suspected_role=None, confidence=0.0, reason="нет данных")]
+    )
+    result, warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+        silent_player_ids=frozenset({100}),
+    )
+    assert len(result.analysis) == 1
+    assert result.analysis[0].suspected_role is None
+    assert result.analysis[0].confidence == 0.0
+    assert result.analysis[0].reason == "нет данных"
+    assert warnings == []
+
+
+def test_null_role_not_dropped_as_placeholder_reasons() -> None:
+    """A null role carries "нет данных" in ``reason`` and survives the placeholder drop."""
+    raw = response_json(
+        [
+            valid_prediction(
+                suspected_role=None,
+                confidence=0.0,
+                reason="нет данных",
+                reasons=["нет данных"],
+            )
+        ]
+    )
+    result, warnings = validate_response(
+        raw,
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+        silent_player_ids=frozenset({100}),
+    )
+    assert len(result.analysis) == 1
+    assert warnings == []
 
 
 def test_empty_reasons_are_rejected() -> None:

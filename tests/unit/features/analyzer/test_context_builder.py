@@ -596,14 +596,27 @@ def test_to_llm_messages_with_club_patterns(
     """Custom club patterns reach the user prompt without changing the system message."""
     context = build_context(game_state=make_game_state(registry=registry), registry=registry)
 
+    patterns = [
+        {
+            "id": "#TEST",
+            "trigger": "test_trigger",
+            "conclusion_role": "Мафия",
+            "confidence_tier": 0.9,
+            "requires_confirmation": False,
+            "description": "Тестовый паттерн",
+        }
+    ]
     messages = to_llm_messages(
-        context, registry=registry, jinja_env=jinja_env, club_patterns="TEST"
+        context, registry=registry, jinja_env=jinja_env, club_patterns=patterns
     )
     empty_messages = to_llm_messages(context, registry=registry, jinja_env=jinja_env)
 
     assert "Паттерны этого клуба" in messages[1]["content"]
-    assert "TEST" in messages[1]["content"]
-    assert "TEST" not in messages[0]["content"]
+    assert "#TEST" in messages[1]["content"]
+    assert "test_trigger" in messages[1]["content"]
+    assert "Мафия" in messages[1]["content"]
+    assert "0.9" in messages[1]["content"]
+    assert "#TEST" not in messages[0]["content"]
     assert "Паттерны этого клуба" not in empty_messages[1]["content"]
     assert "Голосования (последние" not in empty_messages[1]["content"]
 
@@ -629,7 +642,19 @@ def test_analyze_jinja_renders_votes_and_patterns(
     context = build_context(game_state=state, registry=registry)
 
     messages = to_llm_messages(
-        context, registry=registry, jinja_env=jinja_env, club_patterns="Иллюстративный паттерн"
+        context,
+        registry=registry,
+        jinja_env=jinja_env,
+        club_patterns=[
+            {
+                "id": "#IL",
+                "trigger": "illustrative",
+                "conclusion_role": "Дон",
+                "confidence_tier": 0.9,
+                "requires_confirmation": False,
+                "description": "Иллюстративный паттерн",
+            }
+        ],
     )
 
     prompt = messages[1]["content"]
@@ -639,6 +664,9 @@ def test_analyze_jinja_renders_votes_and_patterns(
     assert "Тонкости ролей" in prompt
     assert "Стреляет после проверки" in prompt
     assert "Паттерны этого клуба" in prompt
+    assert "#IL" in prompt
+    assert "illustrative" in prompt
+    assert "Дон" in prompt
     assert "Иллюстративный паттерн" in prompt
 
 

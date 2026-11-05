@@ -22,7 +22,7 @@ def test_load_valid_config(tmp_path: Path) -> None:
     assert config.telegram.bot_id == 42
     assert config.llm.trigger_mode == "queue"
     assert config.db.path == str(tmp_path / "mafia.db")
-    assert config.club_patterns_file == str(tmp_path / "patterns.txt")
+    assert config.club_patterns_file == str(tmp_path / "patterns.yaml")
 
 
 def test_config_defaults_club_patterns_file(tmp_path: Path) -> None:
@@ -32,7 +32,7 @@ def test_config_defaults_club_patterns_file(tmp_path: Path) -> None:
     del settings["club_patterns_file"]
     config_path.write_text(yaml.safe_dump(settings, allow_unicode=True), encoding="utf-8")
 
-    assert load_config(config_path).club_patterns_file == "configs/club_patterns.txt"
+    assert load_config(config_path).club_patterns_file == "configs/club_patterns.yaml"
 
 
 def test_config_accepts_custom_club_patterns_path(tmp_path: Path) -> None:

@@ -38,6 +38,7 @@ class FakeLLMClient(LLMClient):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Delegate to the fake streaming implementation."""
         return await self.analyze_stream(
@@ -45,6 +46,7 @@ class FakeLLMClient(LLMClient):
             known_player_ids=known_player_ids,
             role_names_ru=role_names_ru,
             role_alias_resolver=role_alias_resolver,
+            silent_player_ids=silent_player_ids,
         )
 
     async def analyze_stream(
@@ -56,6 +58,7 @@ class FakeLLMClient(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Return the canned response and record the model invocation."""
         self.calls += 1
@@ -203,7 +206,7 @@ def create_settings_file(
     settings["db"]["path"] = db_path or str(tmp_path / "mafia.db")
     settings["roles_file"] = str(ROOT / "configs" / "roles.yaml")
     # Never read a developer's private club file when bootstrapping tests.
-    settings["club_patterns_file"] = str(tmp_path / "patterns.txt")
+    settings["club_patterns_file"] = str(tmp_path / "patterns.yaml")
     settings["logging"]["dir"] = str(tmp_path / "logs")
 
     config_path = tmp_path / "settings.yaml"

@@ -17,13 +17,18 @@ from pydantic import ValidationError
 if TYPE_CHECKING:
     from loguru import Record
 
+from domain.club_patterns import ClubPatterns, load_club_patterns
 from domain.events import (
     AliveListEvent,
     AliveListPayload,
     DeathEvent,
     DeathPayload,
+    MessageEvent,
+    MessagePayload,
     PhaseChangeEvent,
     PhaseChangePayload,
+    VoteEvent,
+    VotePayload,
 )
 from domain.exceptions import LLMConnectionError, LLMError
 from domain.game_state import GameState
@@ -43,6 +48,7 @@ from infra.llm.schemas import (
 )
 
 ROLES_PATH = Path(__file__).parents[4] / "configs" / "roles.yaml"
+PATTERNS_PATH = Path(__file__).parents[4] / "configs" / "club_patterns.yaml"
 BASE_TS = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -77,6 +83,7 @@ class FakeLLMClient(LLMClient):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Delegate non-streaming calls to the fake streaming implementation."""
         return await self.analyze_stream(
@@ -84,6 +91,7 @@ class FakeLLMClient(LLMClient):
             known_player_ids=known_player_ids,
             role_names_ru=role_names_ru,
             role_alias_resolver=role_alias_resolver,
+            silent_player_ids=silent_player_ids,
         )
 
     async def analyze_stream(
@@ -95,6 +103,7 @@ class FakeLLMClient(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Record LLM arguments and return the configured fake result."""
         call: dict[str, Any] = {
@@ -186,11 +195,32 @@ def make_game_state(
     return game_state
 
 
+def add_message(
+    state: GameState,
+    player_id: int,
+    *,
+    text: str = "тестовое сообщение",
+) -> None:
+    """Add a message event so the player is not classified as silent."""
+    state.apply(
+        MessageEvent(
+            ts=BASE_TS,
+            game_id=state.game_id,
+            payload=MessagePayload(
+                author_id=player_id,
+                author_name=f"Player {player_id}",
+                text=text,
+            ),
+        )
+    )
+
+
 def make_prediction(
     player_id: int,
     role_name: str,
     *,
     confidence: float = 0.7,
+    reason: str = "observed behavior",
     reasons: list[str] | None = None,
     alternative: AlternativePrediction | None = None,
 ) -> PlayerPrediction:
@@ -200,6 +230,7 @@ def make_prediction(
         player_name=f"Player {player_id}",
         suspected_role=role_name,
         confidence=confidence,
+        reason=reason,
         alternative=alternative,
         reasons=reasons if reasons is not None else ["observed behavior"],
     )
@@ -227,7 +258,8 @@ def make_analyzer(
     *,
     max_messages: int = 200,
     reasoning_max_chars: int = 4096,
-    club_patterns: str = "",
+    club_patterns: list[dict[str, object]] | None = None,
+    patterns: ClubPatterns | None = None,
 ) -> GameAnalyzer:
     """Create a GameAnalyzer with test dependencies."""
     return GameAnalyzer(
@@ -238,6 +270,7 @@ def make_analyzer(
         max_messages=max_messages,
         reasoning_max_chars=reasoning_max_chars,
         club_patterns=club_patterns,
+        patterns=patterns,
     )
 
 
@@ -247,7 +280,7 @@ async def test_analyze_success_returns_response(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """A valid response is returned as a successful AnalysisResult."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     response = make_response([])
     fake_llm.set_response(response)
@@ -268,17 +301,35 @@ async def test_analyzer_passes_club_patterns(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """The analyzer sends configured club patterns through the actual prompt builder."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]))
-    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, club_patterns="PATTERN X")
+    analyzer = make_analyzer(
+        fake_llm,
+        repository,
+        registry,
+        jinja_env,
+        club_patterns=[
+            {
+                "id": "#1",
+                "trigger": "claim_investigation",
+                "conclusion_role": "Комиссар Каттани",
+                "confidence_tier": 0.8,
+                "requires_confirmation": True,
+                "description": "Игрок заявляет, что проверил чью-то роль.",
+            }
+        ],
+    )
 
     result = await analyzer.analyze(make_game_state(registry), persist=False)
 
     assert result.success
     prompt = fake_llm.calls[0]["messages"][1]["content"]
     assert "Паттерны этого клуба" in prompt
-    assert "PATTERN X" in prompt
+    assert "#1" in prompt
+    assert "claim_investigation" in prompt
+    assert "Комиссар Каттани" in prompt
+    assert "0.8" in prompt
 
 
 async def test_analyze_llm_error_returns_result_with_error(
@@ -287,7 +338,7 @@ async def test_analyze_llm_error_returns_result_with_error(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """An LLMError becomes an unsuccessful result instead of escaping."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_error(LLMError("boom"))
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
@@ -305,7 +356,7 @@ async def test_analyze_validation_error_returns_llm_error_result(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """Direct response validation errors are translated into LLM errors."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     with pytest.raises(ValidationError) as validation_error:
         AnalysisResponse.model_validate(
@@ -327,7 +378,7 @@ async def test_analyze_llm_connection_error(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """A connection error is returned with the documented connection prefix."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_error(LLMConnectionError("refused"))
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
@@ -349,6 +400,8 @@ async def test_analyze_persists_predictions(
     player_ids = [100, 101]
     game_id = create_game_with_players(connection, player_ids)
     game_state = make_game_state(registry, game_id=game_id, player_ids=tuple(player_ids))
+    add_message(game_state, 100)
+    add_message(game_state, 101)
     roles = registry.all_roles()
     fake_llm = FakeLLMClient()
     fake_llm.set_response(
@@ -417,9 +470,12 @@ async def test_analyze_persistence_failure_adds_warning(
             *,
             game_id: int,
             player_id: int,
-            predicted_role: str,
+            predicted_role: str | None,
             confidence: float,
             reasoning: str,
+            reason: str = "",
+            pattern_ids: list[str] | None = None,
+            pattern_descriptions: list[str] | None = None,
         ) -> int:
             raise sqlite3.OperationalError("disk full")
 
@@ -444,7 +500,7 @@ async def test_non_thinking_uses_json_reasoning_as_fallback(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """A response without streamed chunks displays and counts JSON reasoning."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     response = make_response([]).model_copy(update={"reasoning": "My COT"})
     fake_llm = FakeLLMClient()
     fake_llm.set_response(response)
@@ -468,7 +524,7 @@ async def test_thinking_uses_streaming_not_json(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """A nonempty reasoning stream always takes precedence over JSON."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     response = make_response([]).model_copy(update={"reasoning": "json COT"})
     fake_llm = FakeLLMClient()
     fake_llm.set_response(response, reasoning="stream COT")
@@ -492,7 +548,7 @@ async def test_json_reasoning_fallback_is_truncated_and_counted(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """JSON fallback obeys the configured limit and retains the full character count."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]).model_copy(update={"reasoning": "z" * 500}))
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, reasoning_max_chars=80)
@@ -510,7 +566,7 @@ async def test_failed_analysis_preserves_partial_stream(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """An LLM failure has no JSON fallback but still preserves partial streamed text."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_error(LLMConnectionError("offline"))
     fake_llm._next_reasoning = "p" * 150
@@ -529,7 +585,7 @@ async def test_analyze_reasoning_truncated(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """Long reasoning is truncated in logs but fully counted in the result."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     reasoning = "x" * 5000
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]), reasoning=reasoning)
@@ -564,7 +620,7 @@ async def test_analyze_reasoning_not_truncated_when_short(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """Short reasoning is logged with its source and full length."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     reasoning = "r" * 100
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]), reasoning=reasoning)
@@ -598,7 +654,7 @@ async def test_analyze_passes_hints_to_context(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """An early lynch hint is rendered into the user prompt for the LLM."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     game_state = make_game_state(registry, game_id=1, player_ids=(100, 101, 102, 103))
     game_state.apply(
         PhaseChangeEvent(
@@ -656,7 +712,7 @@ async def test_analyze_no_crash_on_validation_edge(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """A structurally valid response with zero predictions remains valid."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]))
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
@@ -697,7 +753,7 @@ async def test_analyze_duration_positive(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """The analyzer reports a positive elapsed duration for a completed cycle."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]))
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
@@ -731,7 +787,7 @@ async def test_analyze_duration_clamped_non_negative(
     # (strict no_implicit_reexport), while pytest resolves this path itself.
     monkeypatch.setattr("features.analyzer.analyzer.time.perf_counter", fake_pc)
 
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]))
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
@@ -747,7 +803,7 @@ async def test_analyze_known_player_ids_passed(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """The LLM client receives exactly the player ids in the game context."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([]))
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
@@ -766,7 +822,7 @@ async def test_analyze_role_alias_resolver_works(
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
     """An alternative role alias is resolved by the callback sent to the LLM."""
-    _, repository = memory_database
+    _connection, repository = memory_database
     role_names = {role.name_ru for role in registry.all_roles()}
     alias = next(
         alias
@@ -839,10 +895,9 @@ async def test_analyze_persist_runs_in_thread(
         registry,
         jinja_env,
     )
-    result = await analyzer.analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,)),
-        persist=True,
-    )
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100)
+    result = await analyzer.analyze(state, persist=True)
     assert result.success
     assert calls == ["list_predictions", "upsert_prediction", "insert_history"]
 
@@ -866,9 +921,10 @@ async def test_analyzer_uses_upsert_and_history(
         monkeypatch.setattr(repository, name, spy)
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([make_prediction(i, "Мафия") for i in (100, 101)]))
-    result = await make_analyzer(fake_llm, repository, registry, jinja_env).analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100, 101))
-    )
+    state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    add_message(state, 100)
+    add_message(state, 101)
+    result = await make_analyzer(fake_llm, repository, registry, jinja_env).analyze(state)
     assert result.success and not result.warnings
     assert calls == [
         ("upsert_prediction", 100),
@@ -893,9 +949,9 @@ async def test_history_failure_is_warning(
     monkeypatch.setattr(repository, "insert_history", fail)
     llm = FakeLLMClient()
     llm.set_response(make_response([make_prediction(100, "Мафия")]))
-    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,))
-    )
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100)
+    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state)
     assert result.success and result.warnings == ("history_failed: history unavailable",)
     assert len(repository.list_predictions(game_id)) == 1
 
@@ -928,18 +984,18 @@ async def test_analyzer_preserves_previous_role_without_new_evidence(
             ]
         )
     )
-    first = await analyzer.analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,)), persist=True
-    )
+    state1 = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state1, 100)
+    first = await analyzer.analyze(state1, persist=True)
     assert first.success
     assert len(repository.list_predictions(game_id)) == 1
 
     fake_llm.set_response(
         make_response([make_prediction(100, "Мафия", confidence=0.8, reasons=["молчит"])])
     )
-    second = await analyzer.analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,)), persist=True
-    )
+    state2 = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state2, 100)
+    second = await analyzer.analyze(state2, persist=True)
 
     assert second.success and second.response is not None
     kept = second.response.analysis[0]
@@ -963,6 +1019,9 @@ async def test_analyzer_fills_full_composition_and_caps_quotas(
     connection, repository = memory_database
     game_id = create_game_with_players(connection, [100, 101, 102])
     state = make_game_state(registry, game_id=game_id, player_ids=(100, 101, 102))
+    add_message(state, 100)
+    add_message(state, 101)
+    add_message(state, 102)
     state.apply(
         AliveListEvent(
             ts=BASE_TS,
@@ -1013,6 +1072,7 @@ async def test_analyze_missing_reasoning_falls_back_to_player_reasons(
     connection, repository = memory_database
     game_id = create_game_with_players(connection, [100])
     state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100)
     prediction = make_prediction(100, registry.all_roles()[0].name_ru, reasons=["причина", "довод"])
     raw: dict[str, Any] = {"analysis": [prediction], "game_read": "Обзор"}
     if reasoning != "missing":
@@ -1038,6 +1098,7 @@ async def test_incomplete_composition_never_fills_slots_and_logs_warning(
     ids = [100, 101, 102, 103, 104]
     game_id = create_game_with_players(connection, ids)
     state = make_game_state(registry, game_id=game_id, player_ids=tuple(ids))
+    add_message(state, 100)  # player 100 is not silent; 101-104 stay silent
     state.apply(
         AliveListEvent(
             ts=BASE_TS,
@@ -1058,10 +1119,14 @@ async def test_incomplete_composition_never_fills_slots_and_logs_warning(
     finally:
         logger.remove(sink)
     assert result.response is not None
-    assert [p.player_id for p in result.response.analysis] == [100]
-    assert [r["player_id"] for r in repository.list_predictions(game_id)] == [100]
-    assert any("composition_mismatch" in w and "2" in w and "5" in w for w in result.warnings)
-    assert any("composition_mismatch" in msg and "2" in msg and "5" in msg for msg in logs)
+    assert [p.player_id for p in result.response.analysis] == ids
+    assert result.response.analysis[0].suspected_role == "Мафия"
+    assert all(p.suspected_role is None for p in result.response.analysis[1:])
+    assert all(p.confidence == 0.0 for p in result.response.analysis[1:])
+    assert all(p.reason == "нет данных" for p in result.response.analysis[1:])
+    assert [r["player_id"] for r in repository.list_predictions(game_id)] == ids
+    assert any("composition_mismatch" in w and "2" in w and "1" in w for w in result.warnings)
+    assert any("composition_mismatch" in msg and "2" in msg and "1" in msg for msg in logs)
 
 
 @pytest.mark.parametrize("quota", [None, {}, {"Мафия": 0}])
@@ -1080,6 +1145,174 @@ def test_composition_empty_quota_does_not_fill(
     analyzer = make_analyzer(FakeLLMClient(), memory_database[1], registry, jinja_env)
     predictions, _ = analyzer._enforce_composition([], context, state)
     assert predictions == []
+
+
+def load_real_patterns() -> ClubPatterns:
+    """Load the repository's real club-patterns configuration."""
+    return load_club_patterns(PATTERNS_PATH)
+
+
+async def test_pattern_direct_claim_gives_role_conf09_pattern_ids(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Pattern #2 (direct role claim) → claimed role, confidence 0.9, pattern_ids=["#2"]."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100, text="я - Мирный")
+
+    patterns = load_real_patterns()
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, patterns=patterns)
+
+    result = await analyzer.analyze(state, persist=False)
+
+    assert result.success and result.response is not None
+    assert len(result.response.analysis) == 1
+    p = result.response.analysis[0]
+    assert p.player_id == 100
+    assert p.suspected_role == "Мирный житель"
+    assert p.confidence == 0.9
+    assert p.pattern_ids == ["#2"]
+    assert len(p.pattern_descriptions) == len(p.pattern_ids)
+    assert "паттерн #2" in p.reason
+
+
+async def test_pattern_investigation_without_confirmation_does_not_fire(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Pattern #1 (investigation claim) without vote confirmation → no override."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100, text="я проверил user_101, он Комиссар")
+
+    patterns = load_real_patterns()
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, "Мафия", confidence=0.5)]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, patterns=patterns)
+
+    result = await analyzer.analyze(state, persist=False)
+
+    assert result.success and result.response is not None
+    p = result.response.analysis[0]
+    # No vote confirmation → pattern #1 must not fire → LLM role stays
+    assert p.suspected_role == "Мафия"
+    assert p.pattern_ids == []
+    assert p.pattern_descriptions == []
+
+
+async def test_unmatched_direct_claim_empty_pattern_ids_and_reason(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Unmatched direct claim → empty pattern_ids, reason notes no match, LLM role stays."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100, text="я - Мафия")
+
+    patterns = load_real_patterns()
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, "Мафия", confidence=0.5)]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, patterns=patterns)
+
+    result = await analyzer.analyze(state, persist=False)
+
+    assert result.success and result.response is not None
+    p = result.response.analysis[0]
+    assert p.player_id == 100
+    # No pattern matched → LLM role stays, no override
+    assert p.suspected_role == "Мафия"
+    assert p.confidence == 0.5
+    assert p.pattern_ids == []
+    assert p.pattern_descriptions == []
+    assert "прямое заявление не сопоставлено с паттерном" in p.reason
+
+
+async def test_pattern_investigation_with_confirmation_fires(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Pattern #1 (investigation claim) with vote confirmation → override applies."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100, text="я проверил user_101, он Комиссар")
+    # Vote confirms the claim: author_id (100) is in vote_targets
+    state.apply(
+        VoteEvent(
+            ts=BASE_TS,
+            game_id=game_id,
+            payload=VotePayload(
+                voter_id=100, voter_name="Player 100", target_id=101, target_name="Player 101"
+            ),
+        )
+    )
+
+    patterns = load_real_patterns()
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, "Мафия", confidence=0.5)]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, patterns=patterns)
+
+    result = await analyzer.analyze(state, persist=False)
+
+    assert result.success and result.response is not None
+    p = result.response.analysis[0]
+    # Vote confirmation present → pattern #1 fires → Комиссар Каттани, 0.8
+    assert p.suspected_role == "Комиссар Каттани"
+    assert p.confidence == 0.8
+    assert p.pattern_ids == ["#1"]
+    assert len(p.pattern_descriptions) == len(p.pattern_ids)
+    assert "паттерн #1" in p.reason
+
+
+async def test_pattern_override_releases_slot_and_redistributes(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    """Pattern override releases a composition slot which is then redistributed."""
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100, 101])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    add_message(state, 100, text="я - Мирный")
+    add_message(state, 101, text="whatever")
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=game_id,
+            payload=AliveListPayload(
+                alive_player_names=["Player 100", "Player 101"],
+                role_count={"Мафия": 1, "Мирный житель": 1},
+                total_players=2,
+            ),
+        )
+    )
+
+    patterns = load_real_patterns()
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(make_response([make_prediction(100, "Мафия")]))
+    analyzer = make_analyzer(fake_llm, repository, registry, jinja_env, patterns=patterns)
+
+    result = await analyzer.analyze(state, persist=False)
+
+    assert result.success and result.response is not None
+    by_id = {p.player_id: p for p in result.response.analysis}
+    # Player 100: pattern #2 overrides Мафия → Мирный, confidence 0.9
+    assert by_id[100].suspected_role == "Мирный житель"
+    assert by_id[100].confidence == 0.9
+    assert by_id[100].pattern_ids == ["#2"]
+    # Player 101: no LLM prediction, gets released Мафия slot via composition fill
+    assert by_id[101].suspected_role == "Мафия"
+    assert by_id[101].confidence == 0.3  # composition fill confidence
 
 
 @pytest.mark.parametrize("death_before_request", [True, False])
@@ -1129,6 +1362,8 @@ async def test_dead_during_llm_gets_no_deterministic_composition_slot(
     connection, repository = memory_database
     game_id = create_game_with_players(connection, [100, 101])
     state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    add_message(state, 100)
+    add_message(state, 101)
     state.apply(
         AliveListEvent(
             ts=BASE_TS,
