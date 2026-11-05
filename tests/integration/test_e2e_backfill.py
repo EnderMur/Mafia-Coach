@@ -72,6 +72,7 @@ class FakeLLMClient(LLMClient):
                     player_name="Вася",
                     suspected_role="Мафия",
                     confidence=0.75,
+                    reason="Активно давит в первый день.",
                     reasons=["активно давит в первый день"],
                 )
             ],
@@ -89,6 +90,7 @@ class FakeLLMClient(LLMClient):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Serve non-streaming calls from the same canned response."""
         return await self.analyze_stream(
@@ -96,6 +98,7 @@ class FakeLLMClient(LLMClient):
             known_player_ids=known_player_ids,
             role_names_ru=role_names_ru,
             role_alias_resolver=role_alias_resolver,
+            silent_player_ids=silent_player_ids,
         )
 
     async def analyze_stream(
@@ -107,6 +110,7 @@ class FakeLLMClient(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Count the call, emit one reasoning chunk, and return predictions."""
         self.calls += 1

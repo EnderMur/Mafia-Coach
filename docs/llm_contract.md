@@ -16,12 +16,15 @@ response is assembled after generation completes.
 | `analysis` | list of `PlayerPrediction` | yes | May be empty |
 | `analysis[].player_id` | integer | yes | Must belong to the current game |
 | `analysis[].player_name` | string | yes | Non-empty display name |
-| `analysis[].suspected_role` | string | yes | Canonical configured role name |
-| `analysis[].confidence` | float | yes | Inclusive range 0.0–1.0 |
+| `analysis[].suspected_role` | string or null | yes | Canonical configured role name, or `null` when the player has no messages and no votes |
+| `analysis[].confidence` | float | yes | Inclusive range 0.0–1.0; must be `0.0` when `suspected_role` is null |
+| `analysis[].reason` | string | yes | Brief 1–2 sentence explanation of the role in Russian; `"нет данных"` when `suspected_role` is null |
 | `analysis[].alternative` | `AlternativePrediction` or null | no | Optional second hypothesis |
 | `analysis[].alternative.role` | string | yes when present | Canonical configured role name |
 | `analysis[].alternative.confidence` | float | yes when present | Inclusive range 0.0–1.0 |
 | `analysis[].reasons` | list of strings | yes | Between one and five entries |
+| `analysis[].pattern_ids` | list of strings | yes | Club pattern IDs supporting the role (e.g. `["#2"]`); empty when no pattern was used |
+| `analysis[].pattern_descriptions` | list of strings | yes | Human-readable descriptions of the patterns above; same length as `pattern_ids` |
 | Primary and alternative confidence total | float | when alternative exists | At most 1.0 |
 | `game_read` | string | yes | Non-empty summary |
 | `reasoning` | string or null | no | Full explanation; empty, null, or absent is permitted |
@@ -45,7 +48,12 @@ returned to the caller for retry handling.
 4. If primary and alternative confidence total exceeds one beyond floating
    point tolerance, both values are normalized proportionally and a warning is
    returned.
-5. Contextual issues are warnings; structurally invalid JSON data is an error.
+5. `suspected_role` is `null` only for players without messages and votes;
+   any other null role drops the prediction with a warning.
+6. `suspected_role` is `null` implies `confidence` is `0.0` and `reason` is
+   `"нет данных"`; `pattern_ids` and `pattern_descriptions` must have equal
+   length.
+7. Contextual issues are warnings; structurally invalid JSON data is an error.
 
 ## 4. Errors and retries
 
@@ -98,8 +106,10 @@ does not consume retry budget.
 
 ## 6. Version notes
 
-This document describes the v1 structured response contract. Context building,
-request transport, and streaming orchestration are implemented in later layers.
+This document describes the v1 structured response contract (v1.1 with the
+`reason`, `pattern_ids`, `pattern_descriptions` fields and nullable
+`suspected_role`). Context building, request transport, and streaming
+orchestration are implemented in later layers.
 
 ## Known limitations / TODO
 

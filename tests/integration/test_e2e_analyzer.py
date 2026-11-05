@@ -45,6 +45,7 @@ class FakeLLMClient(LLMClient):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Return the configured response for a non-streaming call."""
         return self._response
@@ -58,6 +59,7 @@ class FakeLLMClient(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Return the configured response for a streaming call."""
         return self._response
@@ -134,6 +136,7 @@ def make_response(role_name: str) -> AnalysisResponse:
                 player_name="Player 100",
                 suspected_role=role_name,
                 confidence=0.75,
+                reason="Стабильное голосование и конкретный аргумент против игрока.",
                 reasons=["consistent vote", "specific argument"],
             )
         ],
@@ -198,6 +201,7 @@ async def test_e2e_non_thinking_sse_json_reasoning_and_honesty(
                     "player_name": "Player 100",
                     "suspected_role": role_name,
                     "confidence": 0.8,
+                    "reason": "Нет данных по игроку.",
                     "reasons": ["нет данных"],
                 },
                 {
@@ -205,6 +209,7 @@ async def test_e2e_non_thinking_sse_json_reasoning_and_honesty(
                     "player_name": "Player 101",
                     "suspected_role": role_name,
                     "confidence": 0.7,
+                    "reason": "Голосовал против Player 100 без объяснений.",
                     "reasons": ["голосовал против Player 100"],
                 },
             ],

@@ -22,6 +22,8 @@ from domain.events import (
     AliveListPayload,
     DeathEvent,
     DeathPayload,
+    MessageEvent,
+    MessagePayload,
     PhaseChangeEvent,
     PhaseChangePayload,
 )
@@ -77,6 +79,7 @@ class FakeLLMClient(LLMClient):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Delegate non-streaming calls to the fake streaming implementation."""
         return await self.analyze_stream(
@@ -84,6 +87,7 @@ class FakeLLMClient(LLMClient):
             known_player_ids=known_player_ids,
             role_names_ru=role_names_ru,
             role_alias_resolver=role_alias_resolver,
+            silent_player_ids=silent_player_ids,
         )
 
     async def analyze_stream(
@@ -95,6 +99,7 @@ class FakeLLMClient(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Record LLM arguments and return the configured fake result."""
         call: dict[str, Any] = {
@@ -186,11 +191,32 @@ def make_game_state(
     return game_state
 
 
+def add_message(
+    state: GameState,
+    player_id: int,
+    *,
+    text: str = "тестовое сообщение",
+) -> None:
+    """Add a message event so the player is not classified as silent."""
+    state.apply(
+        MessageEvent(
+            ts=BASE_TS,
+            game_id=state.game_id,
+            payload=MessagePayload(
+                author_id=player_id,
+                author_name=f"Player {player_id}",
+                text=text,
+            ),
+        )
+    )
+
+
 def make_prediction(
     player_id: int,
     role_name: str,
     *,
     confidence: float = 0.7,
+    reason: str = "observed behavior",
     reasons: list[str] | None = None,
     alternative: AlternativePrediction | None = None,
 ) -> PlayerPrediction:
@@ -200,6 +226,7 @@ def make_prediction(
         player_name=f"Player {player_id}",
         suspected_role=role_name,
         confidence=confidence,
+        reason=reason,
         alternative=alternative,
         reasons=reasons if reasons is not None else ["observed behavior"],
     )
@@ -349,6 +376,8 @@ async def test_analyze_persists_predictions(
     player_ids = [100, 101]
     game_id = create_game_with_players(connection, player_ids)
     game_state = make_game_state(registry, game_id=game_id, player_ids=tuple(player_ids))
+    add_message(game_state, 100)
+    add_message(game_state, 101)
     roles = registry.all_roles()
     fake_llm = FakeLLMClient()
     fake_llm.set_response(
@@ -839,10 +868,9 @@ async def test_analyze_persist_runs_in_thread(
         registry,
         jinja_env,
     )
-    result = await analyzer.analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,)),
-        persist=True,
-    )
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100)
+    result = await analyzer.analyze(state, persist=True)
     assert result.success
     assert calls == ["list_predictions", "upsert_prediction", "insert_history"]
 
@@ -866,9 +894,10 @@ async def test_analyzer_uses_upsert_and_history(
         monkeypatch.setattr(repository, name, spy)
     fake_llm = FakeLLMClient()
     fake_llm.set_response(make_response([make_prediction(i, "Мафия") for i in (100, 101)]))
-    result = await make_analyzer(fake_llm, repository, registry, jinja_env).analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100, 101))
-    )
+    state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    add_message(state, 100)
+    add_message(state, 101)
+    result = await make_analyzer(fake_llm, repository, registry, jinja_env).analyze(state)
     assert result.success and not result.warnings
     assert calls == [
         ("upsert_prediction", 100),
@@ -893,9 +922,9 @@ async def test_history_failure_is_warning(
     monkeypatch.setattr(repository, "insert_history", fail)
     llm = FakeLLMClient()
     llm.set_response(make_response([make_prediction(100, "Мафия")]))
-    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,))
-    )
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100)
+    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state)
     assert result.success and result.warnings == ("history_failed: history unavailable",)
     assert len(repository.list_predictions(game_id)) == 1
 
@@ -928,18 +957,18 @@ async def test_analyzer_preserves_previous_role_without_new_evidence(
             ]
         )
     )
-    first = await analyzer.analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,)), persist=True
-    )
+    state1 = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state1, 100)
+    first = await analyzer.analyze(state1, persist=True)
     assert first.success
     assert len(repository.list_predictions(game_id)) == 1
 
     fake_llm.set_response(
         make_response([make_prediction(100, "Мафия", confidence=0.8, reasons=["молчит"])])
     )
-    second = await analyzer.analyze(
-        make_game_state(registry, game_id=game_id, player_ids=(100,)), persist=True
-    )
+    state2 = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state2, 100)
+    second = await analyzer.analyze(state2, persist=True)
 
     assert second.success and second.response is not None
     kept = second.response.analysis[0]
@@ -963,6 +992,9 @@ async def test_analyzer_fills_full_composition_and_caps_quotas(
     connection, repository = memory_database
     game_id = create_game_with_players(connection, [100, 101, 102])
     state = make_game_state(registry, game_id=game_id, player_ids=(100, 101, 102))
+    add_message(state, 100)
+    add_message(state, 101)
+    add_message(state, 102)
     state.apply(
         AliveListEvent(
             ts=BASE_TS,
@@ -1013,6 +1045,7 @@ async def test_analyze_missing_reasoning_falls_back_to_player_reasons(
     connection, repository = memory_database
     game_id = create_game_with_players(connection, [100])
     state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    add_message(state, 100)
     prediction = make_prediction(100, registry.all_roles()[0].name_ru, reasons=["причина", "довод"])
     raw: dict[str, Any] = {"analysis": [prediction], "game_read": "Обзор"}
     if reasoning != "missing":
@@ -1038,6 +1071,7 @@ async def test_incomplete_composition_never_fills_slots_and_logs_warning(
     ids = [100, 101, 102, 103, 104]
     game_id = create_game_with_players(connection, ids)
     state = make_game_state(registry, game_id=game_id, player_ids=tuple(ids))
+    add_message(state, 100)  # player 100 is not silent; 101-104 stay silent
     state.apply(
         AliveListEvent(
             ts=BASE_TS,
@@ -1058,10 +1092,14 @@ async def test_incomplete_composition_never_fills_slots_and_logs_warning(
     finally:
         logger.remove(sink)
     assert result.response is not None
-    assert [p.player_id for p in result.response.analysis] == [100]
-    assert [r["player_id"] for r in repository.list_predictions(game_id)] == [100]
-    assert any("composition_mismatch" in w and "2" in w and "5" in w for w in result.warnings)
-    assert any("composition_mismatch" in msg and "2" in msg and "5" in msg for msg in logs)
+    assert [p.player_id for p in result.response.analysis] == ids
+    assert result.response.analysis[0].suspected_role == "Мафия"
+    assert all(p.suspected_role is None for p in result.response.analysis[1:])
+    assert all(p.confidence == 0.0 for p in result.response.analysis[1:])
+    assert all(p.reason == "нет данных" for p in result.response.analysis[1:])
+    assert [r["player_id"] for r in repository.list_predictions(game_id)] == ids
+    assert any("composition_mismatch" in w and "2" in w and "1" in w for w in result.warnings)
+    assert any("composition_mismatch" in msg and "2" in msg and "1" in msg for msg in logs)
 
 
 @pytest.mark.parametrize("quota", [None, {}, {"Мафия": 0}])
@@ -1129,6 +1167,8 @@ async def test_dead_during_llm_gets_no_deterministic_composition_slot(
     connection, repository = memory_database
     game_id = create_game_with_players(connection, [100, 101])
     state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    add_message(state, 100)
+    add_message(state, 101)
     state.apply(
         AliveListEvent(
             ts=BASE_TS,

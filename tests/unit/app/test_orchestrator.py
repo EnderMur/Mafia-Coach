@@ -703,6 +703,7 @@ async def test_orchestrator_send_stats_on_flush_complete(
                 player_name="Вася",
                 suspected_role="Мирный житель",
                 confidence=0.85,
+                reason="Спокойно разбирает аргументы других игроков.",
                 reasons=["Спокойно разбирает аргументы"],
             )
         ],
@@ -721,6 +722,17 @@ async def test_orchestrator_send_stats_on_flush_complete(
     assert scanner is not None
     assert scanner._on_flush_complete_callback is orchestrator._send_stats
     await scanner._register_player(PLAYER_ID, "Вася")
+    result.game_state.apply(
+        MessageEvent(
+            ts=EVENT_TS,
+            game_id=result.game_state.game_id,
+            payload=MessagePayload(
+                author_id=PLAYER_ID,
+                author_name="Вася",
+                text="тестовое сообщение",
+            ),
+        )
+    )
     result.game_state.apply(
         PhaseChangeEvent(
             ts=EVENT_TS,

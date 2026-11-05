@@ -505,16 +505,22 @@ IPC-кадром до 4096 символов. Итоговый JSON (§7.3) со�
       "player_name": "player_1",
       "suspected_role": "Мафия",
       "confidence": 0.68,
+      "reason": "Уходит от прямых вопросов и голосовал против комиссара.",
       "alternative": { "role": "Мирный житель", "confidence": 0.22 },
-      "reasons": ["уклонялся от конкретики", "голосовал против комиссара"]
+      "reasons": ["уклонялся от конкретики", "голосовал против комиссара"],
+      "pattern_ids": ["#2"],
+      "pattern_descriptions": ["Называет дона до голосования, а потом голосует против него"]
     },
     {
       "player_id": 987654321,
       "player_name": "player_2",
       "suspected_role": "Дон",
       "confidence": 0.44,
+      "reason": "Защищает раскрытую мафию в обсуждениях днём.",
       "alternative": { "role": "Мирный житель", "confidence": 0.31 },
-      "reasons": ["защищала раскрытую мафию"]
+      "reasons": ["защищала раскрытую мафию"],
+      "pattern_ids": [],
+      "pattern_descriptions": []
     }
   ],
   "game_read": "Мафия потеряла одного игрока, город играет по инерции первого дня.",
@@ -566,11 +572,14 @@ retro: total=23 correct=3 wrong=11 unknown=9 (3/14 = 21% accuracy).
 | `analysis` | list[`PlayerPrediction`] | да | может быть пустым `[]`, если данных нет |
 | `analysis[].player_id` | int | да | должен присутствовать в текущей партии |
 | `analysis[].player_name` | str | да | как в чате |
-| `analysis[].suspected_role` | str | да | **строго** значение из `roles.yaml → name_ru` |
-| `analysis[].confidence` | float | да | `0.0 ≤ x ≤ 1.0`, не проценты |
+| `analysis[].suspected_role` | str или null | да | **строго** значение из `roles.yaml → name_ru`; `null` только для игроков без сообщений и голосов (`confidence = 0.0`, `reason = "нет данных"`) |
+| `analysis[].confidence` | float | да | `0.0 ≤ x ≤ 1.0`, не проценты; `0.0` при `suspected_role = null` |
+| `analysis[].reason` | str | да | краткое объяснение роли 1–2 предложения, по-русски; `"нет данных"` при `suspected_role = null` |
 | `analysis[].alternative.role` | str | нет | то же ограничение, что `suspected_role` |
 | `analysis[].alternative.confidence` | float | нет | `0..1`; `confidence + alternative.confidence ≤ 1.0` |
 | `analysis[].reasons` | list[str] | да | 1–5 коротких пунктов, по-русски |
+| `analysis[].pattern_ids` | list[str] | да | ID клубных паттернов (например `["#2"]`); пустой список, если роль без паттерна |
+| `analysis[].pattern_descriptions` | list[str] | да | человекочитаемые описания паттернов, такой же длины, как `pattern_ids` |
 | `game_read` | str | да | 1–3 предложения, по-русски |
 | `reasoning` | str | да | пошаговые рассуждения, по-русски |
 

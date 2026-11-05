@@ -127,6 +127,9 @@ class LLMContext(BaseModel):
     recent_deaths: list[DeathInfo]
     recent_votes: list[VoteInfo] = Field(default_factory=list)
     previous_predictions: list[PredictionSnapshot] = Field(default_factory=list)
+    #: Alive player ids with no messages and no votes in the game so far.
+    #: Only they may receive ``suspected_role = null`` from the model.
+    silent_player_ids: frozenset[int] = Field(default_factory=frozenset)
     truncated_messages: int = Field(ge=0)
     total_messages_seen: int = Field(ge=0)
     #: Bot-reported role composition (canonical name_ru → count), or None.
@@ -263,6 +266,18 @@ def build_context(
         for event in vote_events[-20:]
     ]
 
+    # Players who never wrote in chat and never voted have no behavioural
+    # signal at all: the model may only assign them ``suspected_role = null``.
+    message_authors = {event.payload.author_id for event in message_events}
+    vote_voters = {event.payload.voter_id for event in vote_events}
+    silent_player_ids = frozenset(
+        player.player_id
+        for player in game_state.players()
+        if player.alive
+        and player.player_id not in message_authors
+        and player.player_id not in vote_voters
+    )
+
     # ALL players of the snapshot reach the LLM, including deterministic
     # placeholders for players who never wrote in chat. Otherwise a 16-player
     # alive list can produce only e.g. 5 addressable ids and a full role
@@ -338,6 +353,7 @@ def build_context(
         recent_deaths=recent_deaths,
         recent_votes=recent_votes,
         previous_predictions=list(previous_predictions or []),
+        silent_player_ids=silent_player_ids,
         truncated_messages=max(0, total_messages - max_messages),
         total_messages_seen=total_messages,
         role_count=canonical_roles,
@@ -522,6 +538,12 @@ def _ensure_fully_rendered(messages: list[dict[str, str]]) -> None:
 # to to_llm_messages instead. The value is pinned to the contract model by
 # tests/unit/features/analyzer/test_context_builder.py, which fails as soon as
 # the two drift apart.
+# JSON Schema of AnalysisResponse (v1), embedded for the system prompt.
+# Generated from AnalysisResponse.model_json_schema() in infra/llm/schemas.py:
+# features/analyzer must not import infra, so a caller may pass the live schema
+# to to_llm_messages instead. The value is pinned to the contract model by
+# tests/unit/features/analyzer/test_context_builder.py, which fails as soon as
+# the two drift apart.
 DEFAULT_RESPONSE_SCHEMA_JSON: Final[str] = """
 {
   "$defs": {
@@ -562,15 +584,28 @@ DEFAULT_RESPONSE_SCHEMA_JSON: Final[str] = """
           "type": "string"
         },
         "suspected_role": {
-          "minLength": 1,
-          "title": "Suspected Role",
-          "type": "string"
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Suspected Role"
         },
         "confidence": {
           "maximum": 1.0,
           "minimum": 0.0,
           "title": "Confidence",
           "type": "number"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
         },
         "alternative": {
           "anyOf": [
@@ -591,13 +626,27 @@ DEFAULT_RESPONSE_SCHEMA_JSON: Final[str] = """
           "minItems": 1,
           "title": "Reasons",
           "type": "array"
+        },
+        "pattern_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pattern Ids",
+          "type": "array"
+        },
+        "pattern_descriptions": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Pattern Descriptions",
+          "type": "array"
         }
       },
       "required": [
         "player_id",
         "player_name",
-        "suspected_role",
         "confidence",
+        "reason",
         "reasons"
       ],
       "title": "PlayerPrediction",

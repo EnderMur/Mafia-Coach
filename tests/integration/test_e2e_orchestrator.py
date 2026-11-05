@@ -114,6 +114,7 @@ async def test_e2e_headless_pipeline(tmp_path: Path) -> None:
                 player_name="Вася",
                 suspected_role="Мафия",
                 confidence=0.7,
+                reason="Несколько раз менял версию за партию.",
                 reasons=["несколько раз менял версию"],
             )
         ],

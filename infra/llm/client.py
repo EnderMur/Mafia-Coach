@@ -39,6 +39,7 @@ class LLMClient(ABC):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Return a validated non-streaming analysis response."""
 
@@ -52,6 +53,7 @@ class LLMClient(ABC):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Return validated analysis while forwarding reasoning chunks.
 
@@ -201,6 +203,7 @@ class LMStudioClient(LLMClient):
         known_player_ids: frozenset[int],
         role_names_ru: frozenset[str],
         role_alias_resolver: Callable[[str], str | None] | None = None,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Analyze once, sharing a bounded HTTP-request budget across fallbacks."""
         self._ensure_open()
@@ -272,6 +275,7 @@ class LMStudioClient(LLMClient):
                     known_player_ids=known_player_ids,
                     role_names_ru=role_names_ru,
                     role_alias_resolver=role_alias_resolver,
+                    silent_player_ids=silent_player_ids,
                 )
             except ValidationError:
                 messages_current = list(messages) + [
@@ -301,6 +305,7 @@ class LMStudioClient(LLMClient):
         role_alias_resolver: Callable[[str], str | None] | None = None,
         on_reasoning_chunk: ReasoningSink | None = None,
         log_reasoning_chunks: bool = True,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Stream a final JSON response under one shared HTTP-request budget.
 
@@ -339,6 +344,7 @@ class LMStudioClient(LLMClient):
                     on_reasoning_chunk=on_reasoning_chunk,
                     log_reasoning_chunks=log_reasoning_chunks,
                     allow_markdown_fence=not use_schema,
+                    silent_player_ids=silent_player_ids,
                 )
             except (httpx.ConnectError, httpx.ConnectTimeout) as error:
                 raise LLMConnectionError(f"LM Studio недоступен: {error}") from error
@@ -426,6 +432,7 @@ class LMStudioClient(LLMClient):
         on_reasoning_chunk: ReasoningSink | None,
         log_reasoning_chunks: bool,
         allow_markdown_fence: bool = False,
+        silent_player_ids: frozenset[int] = frozenset(),
     ) -> AnalysisResponse:
         """Perform one HTTP stream request and validate its completed JSON."""
         content: list[str] = []
@@ -488,6 +495,7 @@ class LMStudioClient(LLMClient):
                 known_player_ids=known_player_ids,
                 role_names_ru=role_names_ru,
                 role_alias_resolver=role_alias_resolver,
+                silent_player_ids=silent_player_ids,
             )
         except ValidationError as error:
             msg = str(error).lower()

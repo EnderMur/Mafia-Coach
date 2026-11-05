@@ -19,7 +19,7 @@ class PredictionsRepository:
         *,
         game_id: int,
         player_id: int,
-        predicted_role: str,
+        predicted_role: str | None,
         confidence: float,
         reasoning: str,
     ) -> int:
@@ -37,11 +37,15 @@ class PredictionsRepository:
         *,
         game_id: int,
         player_id: int,
-        predicted_role: str,
+        predicted_role: str | None,
         confidence: float,
         reasoning: str,
     ) -> int:
-        """Insert or update the current prediction and return its stable id."""
+        """Insert or update the current prediction and return its stable id.
+
+        ``predicted_role`` is ``None`` when the player has no messages and no
+        votes, so the model assigned no role hypothesis (``confidence 0.0``).
+        """
         cursor = self._conn.execute(
             "INSERT INTO predictions (game_id, ts, player_id, predicted_role, confidence, reasoning) "
             "VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?) "
@@ -59,7 +63,7 @@ class PredictionsRepository:
         *,
         game_id: int,
         player_id: int,
-        predicted_role: str,
+        predicted_role: str | None,
         confidence: float,
         reasoning: str,
     ) -> int:

@@ -197,6 +197,7 @@ class GameAnalyzer:
                 role_alias_resolver=resolve_role_alias,
                 on_reasoning_chunk=on_reasoning,
                 log_reasoning_chunks=False,
+                silent_player_ids=context.silent_player_ids,
             )
         except LLMConnectionError as error:
             logger.bind(channel="llm").error("analysis_failed: connection: {}", str(error))
@@ -234,6 +235,15 @@ class GameAnalyzer:
         )
         if live_warnings:
             response = response.model_copy(update={"analysis": live_predictions})
+
+        # Молчащие игроки (без сообщений и без голосов) получают null-роль с
+        # confidence 0.0 — им не назначаются роли из состава бота.
+        silent_forced = self._force_silent_player_null_roles(
+            response.analysis, game_state, context.silent_player_ids
+        )
+        if silent_forced != response.analysis:
+            response = response.model_copy(update={"analysis": silent_forced})
+
         response, correction_warnings = self._postprocess_response(
             response,
             context=context,
@@ -324,7 +334,10 @@ class GameAnalyzer:
         for row in rows:
             try:
                 player_id = int(row["player_id"])
-                role = str(row["predicted_role"])
+                role = row["predicted_role"]
+                if role is None:
+                    continue
+                role = str(role)
                 confidence = float(row["confidence"])
             except (KeyError, TypeError, ValueError, IndexError):
                 continue
@@ -361,6 +374,56 @@ class GameAnalyzer:
             logger.bind(channel="llm").warning("{}", warning)
         return kept, warnings
 
+    def _force_silent_player_null_roles(
+        self,
+        predictions: list[PlayerPrediction],
+        game_state: GameState,
+        silent_player_ids: frozenset[int],
+    ) -> list[PlayerPrediction]:
+        """Force null-role predictions for silent players (no messages, no votes).
+
+        A silent player gets ``suspected_role = null``, ``confidence = 0.0``,
+        ``reason = "нет данных"`` and empty pattern lists. Existing predictions
+        for silent players are overridden; missing ones are created.
+        """
+        if not silent_player_ids:
+            return predictions
+
+        name_by_id = {player.player_id: player.display_name for player in game_state.players()}
+        prediction_ids = {prediction.player_id for prediction in predictions}
+
+        result: list[PlayerPrediction] = []
+        for prediction in predictions:
+            if prediction.player_id in silent_player_ids:
+                result.append(
+                    prediction.model_copy(
+                        update={
+                            "suspected_role": None,
+                            "confidence": 0.0,
+                            "reason": "нет данных",
+                            "pattern_ids": [],
+                            "pattern_descriptions": [],
+                            "reasons": ["нет данных"],
+                        }
+                    )
+                )
+            else:
+                result.append(prediction)
+
+        for player_id in sorted(silent_player_ids - prediction_ids):
+            result.append(
+                PlayerPrediction(
+                    player_id=player_id,
+                    player_name=name_by_id.get(player_id, f"Игрок {player_id}"),
+                    suspected_role=None,
+                    confidence=0.0,
+                    reason="нет данных",
+                    reasons=["нет данных"],
+                )
+            )
+
+        return result
+
     def _postprocess_response(
         self,
         response: AnalysisResponse,
@@ -380,6 +443,9 @@ class GameAnalyzer:
             old_role = previous_by_id.get(prediction.player_id)
             if (
                 old_role is not None
+                # ``suspected_role = null`` means "no data", not a role flip:
+                # a data-free player keeps null instead of resurrecting an old role.
+                and prediction.suspected_role is not None
                 and prediction.suspected_role != old_role
                 and not _has_new_evidence(prediction.reasons)
             ):
@@ -430,9 +496,14 @@ class GameAnalyzer:
         alive = game_state.alive_players()
         alive_ids = [player.player_id for player in alive]
         alive_set = set(alive_ids)
+        silent_ids = context.silent_player_ids
         names_by_id = {player.player_id: player.display_name for player in alive}
 
-        def canonical(role_name: str) -> str:
+        def canonical(role_name: str | None) -> str | None:
+            if role_name is None:
+                # ``suspected_role = null`` means "no data": the slot stays
+                # unfilled for silent players.
+                return None
             role = self._registry.resolve_alias(role_name)
             return role.name_ru if role is not None else role_name
 
@@ -446,6 +517,10 @@ class GameAnalyzer:
                 warnings.append(f"duplicate_prediction: {prediction.player_id} dropped")
                 continue
             role = canonical(prediction.suspected_role)
+            if role is None:
+                # Null role (silent player): keep, do not consume a quota slot.
+                kept[prediction.player_id] = prediction
+                continue
             if role not in quota:
                 warnings.append(
                     f"role_not_in_composition: {prediction.suspected_role!r} "
@@ -463,10 +538,12 @@ class GameAnalyzer:
             )
 
         total_slots = sum(quota.values())
-        if total_slots != len(alive_set):
+        non_silent_alive_count = len([pid for pid in alive_ids if pid not in silent_ids])
+        if total_slots != non_silent_alive_count:
             warning = (
                 f"composition_mismatch: role slots={total_slots}, "
-                f"alive players={len(alive_set)}; deterministic filling skipped"
+                f"non-silent alive players={non_silent_alive_count}; "
+                f"deterministic filling skipped"
             )
             warnings.append(warning)
             logger.bind(channel="llm").warning("{}", warning)
@@ -475,7 +552,9 @@ class GameAnalyzer:
         remaining: list[str] = []
         for role, count in quota.items():
             remaining.extend([role] * max(0, count - used.get(role, 0)))
-        missing_ids = [pid for pid in alive_ids if pid not in kept]
+        # Only non-silent players without a prediction are filled from
+        # remaining composition slots; silent players keep their null role.
+        missing_ids = [pid for pid in alive_ids if pid not in kept and pid not in silent_ids]
 
         for player_id, role in zip(missing_ids, remaining, strict=False):
             warnings.append(f"composition_slot_filled: {player_id} → {role!r}")
@@ -484,17 +563,19 @@ class GameAnalyzer:
                 player_name=names_by_id[player_id],
                 suspected_role=role,
                 confidence=_COMPOSITION_FILL_CONFIDENCE,
+                reason=f"Роль «{role}» из точного состава бота.",
                 reasons=[f"распределение состава бота: слот «{role}»"],
             )
 
         if len(missing_ids) > len(remaining):
             warnings.append(
-                "composition_mismatch: more alive players than role slots; "
+                "composition_mismatch: more non-silent alive players than role slots; "
                 "some players left without a prediction"
             )
         elif len(remaining) > len(missing_ids):
             warnings.append(
-                "composition_mismatch: more role slots than alive players; unused slots ignored"
+                "composition_mismatch: more role slots than non-silent alive players; "
+                "unused slots remain unfilled"
             )
 
         ordered = [kept[pid] for pid in alive_ids if pid in kept]

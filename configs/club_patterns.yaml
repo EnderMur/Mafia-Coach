@@ -1,0 +1,54 @@
+# Структурированные паттерны этого клуба.
+# Каждый паттерн — задаваемое участником поведение с выводом о роли и уровнем уверенности.
+# См. AI_INSTRUCTIONS.md §10 (приоритеты источников роли и тиры уверенности).
+# Формат задачи A3: id, trigger, conclusion_role, confidence_tier, description, requires_confirmation.
+
+patterns:
+  - id: "#1"
+    trigger: claim_investigation
+    conclusion_role: "Комиссар Каттани"
+    confidence_tier: 0.8
+    description: "Игрок называет роль другого игрока, сославшись на свою ночную проверку; требует подтверждения исходом голосования."
+    requires_confirmation: true
+
+  - id: "#2"
+    trigger: claim_role_direct
+    conclusion_role: "Мафия"
+    confidence_tier: 0.9
+    description: "Прямое заявление игрока о своей или чужой роли («я — Мафия», «он — Дон»)."
+    requires_confirmation: false
+
+  - id: "#3"
+    trigger: vote_against_confirmed_commissioner
+    conclusion_role: "Мафия"
+    confidence_tier: 0.6
+    description: "Голосование против игрока, роль которого подтверждена как Комиссар — негативный вывод."
+    requires_confirmation: false
+
+  - id: "#4"
+    trigger: claim_peaceful_contradiction
+    conclusion_role: "Мирный житель"
+    confidence_tier: 0.6
+    description: "Противоречивое или недоказуемое заявление о мирной роли — слабый негативный вывод."
+    requires_confirmation: false
+
+  - id: "#5"
+    trigger: bot_investigation_result
+    conclusion_role: "Комиссар Каттани"
+    confidence_tier: 0.8
+    description: "Результат проверки из сообщения бота, подтверждённый исходом голосования."
+    requires_confirmation: true
+
+  - id: "#6"
+    trigger: bot_lucky_survived
+    conclusion_role: "Мафия"
+    confidence_tier: 0.6
+    description: "Игрок выжил в ночь, когда на него был нацелен deadly навык мафии — косвенный признак мафии."
+    requires_confirmation: false
+
+  - id: "#7"
+    trigger: claim_role_direct
+    conclusion_role: "Дон"
+    confidence_tier: 0.9
+    description: "Прямое заявление игрока о роли Дона (себя или другого игрока)."
+    requires_confirmation: false

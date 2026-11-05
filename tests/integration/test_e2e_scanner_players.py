@@ -19,6 +19,7 @@ async def test_e2e_players_persisted_and_predictions_save(tmp_path: Path) -> Non
                     player_name="Вася",
                     suspected_role="Мафия",
                     confidence=0.7,
+                    reason="Ведёт себя подозрительно.",
                     reasons=["подозрительно"],
                 ),
                 PlayerPrediction(
@@ -26,6 +27,7 @@ async def test_e2e_players_persisted_and_predictions_save(tmp_path: Path) -> Non
                     player_name="Петя",
                     suspected_role="Мафия",
                     confidence=0.6,
+                    reason="Молчит и не участвует в обсуждениях.",
                     reasons=["молчит"],
                 ),
             ],

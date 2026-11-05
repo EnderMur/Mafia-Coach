@@ -42,10 +42,20 @@ class PlayerPrediction(BaseModel):
 
     player_id: int
     player_name: str = Field(min_length=1)
-    suspected_role: str = Field(min_length=1)
+    #: ``None`` only when the player has no messages and no votes in the game
+    #: so far — then ``confidence`` is 0.0 and ``reason`` is "нет данных".
+    suspected_role: str | None = Field(default=None, min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
+    #: Brief 1–2 sentence explanation of the role in Russian.
+    #: Must be "нет данных" exactly when ``suspected_role`` is null.
+    reason: str = Field(min_length=1)
     alternative: AlternativePrediction | None = None
     reasons: list[str] = Field(min_length=1, max_length=5)
+    #: Club pattern IDs that support this role (e.g. ``["#2"]``).
+    pattern_ids: list[str] = Field(default_factory=list)
+    #: Human-readable descriptions of the patterns above, same order as
+    #: ``pattern_ids``.
+    pattern_descriptions: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _conf_sum_le_one(self) -> PlayerPrediction:
@@ -54,6 +64,25 @@ class PlayerPrediction(BaseModel):
             total = self.confidence + self.alternative.confidence
             if total > 1.0 + 1e-9:
                 raise ValueError(f"confidence + alternative.confidence > 1.0: {total}")
+        return self
+
+    @model_validator(mode="after")
+    def _null_role_invariants(self) -> PlayerPrediction:
+        """Enforce the contract for ``suspected_role = null`` and pattern lists."""
+        if self.suspected_role is None:
+            if self.confidence != 0.0:
+                raise ValueError(
+                    f"confidence must be 0.0 when suspected_role is null (got {self.confidence})"
+                )
+            if self.reason != "нет данных":
+                raise ValueError(
+                    f'reason must be "нет данных" when suspected_role is null (got {self.reason!r})'
+                )
+        if len(self.pattern_ids) != len(self.pattern_descriptions):
+            raise ValueError(
+                "pattern_ids and pattern_descriptions must have the same length "
+                f"({len(self.pattern_ids)} vs {len(self.pattern_descriptions)})"
+            )
         return self
 
 
@@ -73,11 +102,14 @@ def validate_response(
     known_player_ids: frozenset[int],
     role_names_ru: frozenset[str],
     role_alias_resolver: Callable[[str], str | None] | None = None,
+    silent_player_ids: frozenset[int] = frozenset(),
 ) -> tuple[AnalysisResponse, list[str]]:
     """Parse an LLM response and validate its predictions against game context.
 
     Schema violations raise Pydantic's ValidationError. Contextual mismatches are
     softened into warnings and dropped predictions or alternatives.
+    ``silent_player_ids`` are players with no messages and no votes in the game
+    so far; only they may receive ``suspected_role = null``.
     """
     try:
         parsed: Any = json.loads(raw)
@@ -96,6 +128,16 @@ def validate_response(
     for prediction in response.analysis:
         if prediction.player_id not in known_player_ids:
             warnings.append(f"player {prediction.player_id} not in current game")
+            continue
+
+        if prediction.suspected_role is None:
+            if prediction.player_id not in silent_player_ids:
+                warnings.append(
+                    f"null suspected role for player {prediction.player_id} with "
+                    f"messages or votes; prediction dropped"
+                )
+                continue
+            validated_predictions.append(prediction)
             continue
 
         canonical_role = _resolve_role(
@@ -162,7 +204,11 @@ def validate_response(
 
     filtered_predictions: list[PlayerPrediction] = []
     for prediction in validated_predictions:
-        if all(reason.strip().lower() in _PLACEHOLDER_REASONS for reason in prediction.reasons):
+        # A null role already carries the explicit "нет данных" marker in
+        # ``reason``; it is never dropped as a placeholder-reasons guess.
+        if prediction.suspected_role is not None and all(
+            reason.strip().lower() in _PLACEHOLDER_REASONS for reason in prediction.reasons
+        ):
             warnings.append(
                 f"dropped prediction for player {prediction.player_id}: placeholder reasons"
             )
