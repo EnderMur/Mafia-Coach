@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 from domain.exceptions import ConfigError
@@ -40,19 +41,38 @@ class PredictionsRepository:
         predicted_role: str | None,
         confidence: float,
         reasoning: str,
+        reason: str = "",
+        pattern_ids: list[str] | None = None,
+        pattern_descriptions: list[str] | None = None,
     ) -> int:
         """Insert or update the current prediction and return its stable id.
 
         ``predicted_role`` is ``None`` when the player has no messages and no
         votes, so the model assigned no role hypothesis (``confidence 0.0``).
+
+        ``reason`` is the per-player short explanation. ``pattern_ids`` and
+        ``pattern_descriptions`` are parallel lists of fired club patterns.
         """
+        pattern_ids_json = json.dumps(pattern_ids or [], ensure_ascii=False)
+        pattern_descriptions_json = json.dumps(pattern_descriptions or [], ensure_ascii=False)
         cursor = self._conn.execute(
-            "INSERT INTO predictions (game_id, ts, player_id, predicted_role, confidence, reasoning) "
-            "VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?) "
+            "INSERT INTO predictions (game_id, ts, player_id, predicted_role, confidence, reasoning, reason, pattern_ids, pattern_descriptions) "
+            "VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?) "
             "ON CONFLICT(game_id, player_id) DO UPDATE SET "
             "ts = CURRENT_TIMESTAMP, predicted_role = excluded.predicted_role, "
-            "confidence = excluded.confidence, reasoning = excluded.reasoning RETURNING id",
-            (game_id, player_id, predicted_role, confidence, reasoning),
+            "confidence = excluded.confidence, reasoning = excluded.reasoning, "
+            "reason = excluded.reason, pattern_ids = excluded.pattern_ids, "
+            "pattern_descriptions = excluded.pattern_descriptions RETURNING id",
+            (
+                game_id,
+                player_id,
+                predicted_role,
+                confidence,
+                reasoning,
+                reason,
+                pattern_ids_json,
+                pattern_descriptions_json,
+            ),
         )
         row = cursor.fetchone()
         assert row is not None
@@ -66,13 +86,27 @@ class PredictionsRepository:
         predicted_role: str | None,
         confidence: float,
         reasoning: str,
+        reason: str = "",
+        pattern_ids: list[str] | None = None,
+        pattern_descriptions: list[str] | None = None,
     ) -> int:
         """Append a prediction to history and return its id."""
+        pattern_ids_json = json.dumps(pattern_ids or [], ensure_ascii=False)
+        pattern_descriptions_json = json.dumps(pattern_descriptions or [], ensure_ascii=False)
         cursor = self._conn.execute(
             "INSERT INTO predictions_history "
-            "(game_id, ts, player_id, predicted_role, confidence, reasoning) "
-            "VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)",
-            (game_id, player_id, predicted_role, confidence, reasoning),
+            "(game_id, ts, player_id, predicted_role, confidence, reasoning, reason, pattern_ids, pattern_descriptions) "
+            "VALUES (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                game_id,
+                player_id,
+                predicted_role,
+                confidence,
+                reasoning,
+                reason,
+                pattern_ids_json,
+                pattern_descriptions_json,
+            ),
         )
         assert cursor.lastrowid is not None
         return int(cursor.lastrowid)

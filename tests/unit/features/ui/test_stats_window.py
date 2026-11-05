@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import builtins
 import io
-import re
 import sys
 from typing import Any
 
@@ -79,7 +78,7 @@ def test_format_confidence_dash(role: str, confidence: float, expected: str) -> 
 
 
 def test_render_table_dims_unknown_roles_and_confidence() -> None:
-    """Both unknown cells are dimmed while real roles remain magenta."""
+    """Unknown cells are dimmed while real roles remain magenta; new columns render."""
     output = io.StringIO()
     console = Console(file=output, force_terminal=True, color_system="standard", width=120)
     message = StatsMessage(
@@ -95,10 +94,17 @@ def test_render_table_dims_unknown_roles_and_confidence() -> None:
     render_table(console, message)
 
     rendered = output.getvalue()
-    assert len(re.findall(r"\x1b\[2m\s*—\s*\x1b\[0m", rendered)) == 2
+    # Unknown role and confidence are dimmed; real role is magenta.
     assert "\x1b[35mМафия\x1b[0m" in rendered
     assert "75%" in rendered
     assert "0%" not in rendered
+    # New columns are present: Причина and Паттерн.
+    assert "Причина" in rendered
+    assert "Паттерн" in rendered
+    # Null-role row shows "нет данных" reason and dash pattern.
+    assert "нет данных" in rendered
+    # Both rows have a dash pattern when no patterns are associated.
+    assert rendered.count("—") >= 4
 
 
 def test_max_rows_50() -> None:
@@ -118,6 +124,120 @@ def test_max_rows_50() -> None:
 
     assert "Игрок 49" in output.getvalue()
     assert "Игрок 50" not in output.getvalue()
+
+
+def test_render_table_pattern_column_dash_when_empty() -> None:
+    """No patterns → dash in the Паттерн column."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, color_system="standard", width=120)
+    message = StatsMessage(
+        game_id=1,
+        phase="day",
+        day=1,
+        rows=[
+            StatsRow(
+                player_name="Анна",
+                role="Мафия",
+                confidence=0.9,
+                reason="прямое заявление",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            )
+        ],
+    )
+
+    render_table(console, message)
+
+    rendered = output.getvalue()
+    assert "Паттерн" in rendered
+    assert "—" in rendered
+
+
+def test_render_table_pattern_column_two_patterns() -> None:
+    """Two patterns render as ``#2: ..., #7: ...``."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, color_system="standard", width=120)
+    message = StatsMessage(
+        game_id=1,
+        phase="day",
+        day=1,
+        rows=[
+            StatsRow(
+                player_name="Борис",
+                role="Дон",
+                confidence=0.8,
+                reason="проверил и нашёл",
+                pattern_ids=["#2", "#7"],
+                pattern_descriptions=[
+                    "Прямое заявление игрока о своей роли",
+                    "Заявление о роли Дона",
+                ],
+            )
+        ],
+    )
+
+    render_table(console, message)
+
+    rendered = output.getvalue()
+    assert "#2: Прямое заявление" in rendered
+    assert "#7: Заявление о роли Дона" in rendered
+
+
+def test_render_table_null_role_shows_dash_reason_pattern() -> None:
+    """Role null → role dash, confidence dash, reason "нет данных", pattern dash."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, color_system="standard", width=120)
+    message = StatsMessage(
+        game_id=1,
+        phase="day",
+        day=1,
+        rows=[
+            StatsRow(
+                player_name="Вера",
+                role="—",
+                confidence=0.0,
+                reason="нет данных",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            )
+        ],
+    )
+
+    render_table(console, message)
+
+    rendered = output.getvalue()
+    assert "—" in rendered  # role column shows dash
+    assert "нет данных" in rendered
+    assert "—" in rendered  # pattern column shows dash
+
+
+def test_render_table_long_pattern_truncated() -> None:
+    """Very long pattern descriptions are truncated with ellipsis."""
+    output = io.StringIO()
+    console = Console(file=output, force_terminal=True, color_system="standard", width=120)
+    message = StatsMessage(
+        game_id=1,
+        phase="day",
+        day=1,
+        rows=[
+            StatsRow(
+                player_name="Анна",
+                role="Мафия",
+                confidence=0.8,
+                reason="длинная причина",
+                pattern_ids=["#3"],
+                pattern_descriptions=[
+                    "Очень длинное описание паттерна который не помещается в колонку и требует обрезки с многоточием",
+                ],
+            )
+        ],
+    )
+
+    render_table(console, message)
+
+    rendered = output.getvalue()
+    assert "#3: Очень длинное описание паттерна котор..." in rendered
+    assert "не помещается в колонку и требует обрезки с многоточием" not in rendered
 
 
 def test_main_processes_stats_and_shutdown_lines() -> None:

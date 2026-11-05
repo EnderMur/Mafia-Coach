@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import sqlite3
 import sys
 import threading
@@ -751,17 +752,27 @@ class Orchestrator:
                     role_str = str(prediction["predicted_role"])
                     if not player.alive:
                         role_str = f"[мёртв] {role_str}"
+                    pattern_ids_raw = prediction["pattern_ids"] or "[]"
+                    pattern_descriptions_raw = prediction["pattern_descriptions"] or "[]"
                     rows.append(
                         StatsRow(
                             player_name=player.display_name,
                             role=role_str,
                             confidence=float(prediction["confidence"]),
+                            reason=str(prediction["reason"] or ""),
+                            pattern_ids=json.loads(pattern_ids_raw),
+                            pattern_descriptions=json.loads(pattern_descriptions_raw),
                         )
                     )
                 else:
                     role_dash = "—" if player.alive else "[мёртв] —"
                     rows.append(
-                        StatsRow(player_name=player.display_name, role=role_dash, confidence=0.0)
+                        StatsRow(
+                            player_name=player.display_name,
+                            role=role_dash,
+                            confidence=0.0,
+                            reason="нет данных",
+                        )
                     )
             rows.sort(key=lambda row: (-row.confidence, row.player_name))
             logger.bind(channel=_LOGGER_CHANNEL).debug(

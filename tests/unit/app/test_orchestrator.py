@@ -557,7 +557,16 @@ async def test_orchestrator_send_stats_empty_predictions_clears_rows(tmp_path: P
             game_id=result.game_state.game_id,
             phase="day",
             day=1,
-            rows=[StatsRow(player_name="Вася", role="Мафия", confidence=0.9)],
+            rows=[
+                StatsRow(
+                    player_name="Вася",
+                    role="Мафия",
+                    confidence=0.9,
+                    reason="",
+                    pattern_ids=[],
+                    pattern_descriptions=[],
+                )
+            ],
         )
     )
     orchestrator = Orchestrator(
@@ -591,9 +600,30 @@ async def test_send_stats_includes_all_players(tmp_path: Path) -> None:
     try:
         await orchestrator._send_stats()
         assert ui.stats[-1].rows == [
-            StatsRow(player_name="Вера", role="Мафия", confidence=0.8),
-            StatsRow(player_name="Аня", role="—", confidence=0.0),
-            StatsRow(player_name="Борис", role="—", confidence=0.0),
+            StatsRow(
+                player_name="Вера",
+                role="Мафия",
+                confidence=0.8,
+                reason="",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            ),
+            StatsRow(
+                player_name="Аня",
+                role="—",
+                confidence=0.0,
+                reason="нет данных",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            ),
+            StatsRow(
+                player_name="Борис",
+                role="—",
+                confidence=0.0,
+                reason="нет данных",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            ),
         ]
     finally:
         await orchestrator.shutdown()
@@ -609,7 +639,16 @@ async def test_send_stats_skips_placeholder(tmp_path: Path) -> None:
     orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
     try:
         await orchestrator._send_stats()
-        assert ui.stats[-1].rows == [StatsRow(player_name="Реальный", role="—", confidence=0.0)]
+        assert ui.stats[-1].rows == [
+            StatsRow(
+                player_name="Реальный",
+                role="—",
+                confidence=0.0,
+                reason="нет данных",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            )
+        ]
     finally:
         await orchestrator.shutdown()
 
@@ -632,8 +671,22 @@ async def test_send_stats_keeps_low_confidence_players_but_hides_prediction(tmp_
     try:
         await orchestrator._send_stats()
         assert ui.stats[-1].rows == [
-            StatsRow(player_name="Анна", role="Мафия", confidence=0.15),
-            StatsRow(player_name="Борис", role="—", confidence=0.0),
+            StatsRow(
+                player_name="Анна",
+                role="Мафия",
+                confidence=0.15,
+                reason="",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            ),
+            StatsRow(
+                player_name="Борис",
+                role="—",
+                confidence=0.0,
+                reason="нет данных",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            ),
         ]
     finally:
         await orchestrator.shutdown()
@@ -747,7 +800,16 @@ async def test_orchestrator_send_stats_on_flush_complete(
 
     send_stats.assert_awaited_once_with()
     assert len(ui.stats) == 1
-    assert ui.stats[0].rows == [StatsRow(player_name="Вася", role="Мирный житель", confidence=0.85)]
+    assert ui.stats[0].rows == [
+        StatsRow(
+            player_name="Вася",
+            role="Мирный житель",
+            confidence=0.85,
+            reason="Спокойно разбирает аргументы других игроков.",
+            pattern_ids=[],
+            pattern_descriptions=[],
+        )
+    ]
     await orchestrator.shutdown()
 
 
@@ -1672,7 +1734,16 @@ async def test_stats_threshold_preserves_player_with_dash(tmp_path: Path) -> Non
     orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
     try:
         await orchestrator._send_stats()
-        assert ui.stats[-1].rows == [StatsRow(player_name="Игрок", role="—", confidence=0.0)]
+        assert ui.stats[-1].rows == [
+            StatsRow(
+                player_name="Игрок",
+                role="—",
+                confidence=0.0,
+                reason="нет данных",
+                pattern_ids=[],
+                pattern_descriptions=[],
+            )
+        ]
     finally:
         await orchestrator.shutdown()
 

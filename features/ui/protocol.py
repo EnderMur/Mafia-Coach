@@ -26,6 +26,12 @@ class StatsRow(BaseModel):
     player_name: str = Field(min_length=1)
     role: str = Field(min_length=1)
     confidence: float = Field(ge=0.0, le=1.0)
+    #: Short per-player explanation (e.g. "нет данных", "прямое заявление роли").
+    reason: str = Field(default="")
+    #: Fired club pattern IDs, e.g. ["#2"]. Empty when no pattern applies.
+    pattern_ids: list[str] = Field(default_factory=list)
+    #: Human-readable pattern descriptions in the same order as ``pattern_ids``.
+    pattern_descriptions: list[str] = Field(default_factory=list)
 
 
 class StatsMessage(BaseModel):

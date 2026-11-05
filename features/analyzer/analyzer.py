@@ -336,6 +336,9 @@ class GameAnalyzer:
                         predicted_role=prediction.suspected_role,
                         confidence=prediction.confidence,
                         reasoning=response.reasoning or "\n".join(prediction.reasons),
+                        reason=prediction.reason or "",
+                        pattern_ids=list(prediction.pattern_ids or []),
+                        pattern_descriptions=list(prediction.pattern_descriptions or []),
                     )
                 except Exception as error:  # noqa: BLE001 — persistence is defensive
                     warnings.append(f"persistence_failed: {error}")
@@ -349,6 +352,9 @@ class GameAnalyzer:
                         predicted_role=prediction.suspected_role,
                         confidence=prediction.confidence,
                         reasoning="\n".join(prediction.reasons),
+                        reason=prediction.reason or "",
+                        pattern_ids=list(prediction.pattern_ids or []),
+                        pattern_descriptions=list(prediction.pattern_descriptions or []),
                     )
                 except Exception as error:  # noqa: BLE001 — history is optional
                     warnings.append(f"history_failed: {error}")

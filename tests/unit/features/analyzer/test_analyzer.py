@@ -473,6 +473,7 @@ async def test_analyze_persistence_failure_adds_warning(
             predicted_role: str,
             confidence: float,
             reasoning: str,
+            **kwargs: object,
         ) -> int:
             raise sqlite3.OperationalError("disk full")
 
