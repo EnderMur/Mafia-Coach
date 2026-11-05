@@ -1868,3 +1868,169 @@ async def test_same_name_in_next_game_resolves_new_person(
     assert new_state.resolve_name("Вася") == 2
     assert not new_state.is_registered(1)
     assert game_state.player(1).alive
+
+
+async def test_retry_recovers_and_persists_without_new_event(registry: RoleRegistry) -> None:
+    import jinja2
+
+    from domain.exceptions import LLMError
+    from infra.db.connection import connect
+    from infra.db.migrations.runner import apply_migrations
+    from infra.db.repositories.predictions import PredictionsRepository
+    from tests.unit.features.analyzer.test_analyzer import (
+        FakeLLMClient,
+        create_game_with_players,
+        make_analyzer,
+        make_prediction,
+        make_response,
+    )
+
+    connection = connect(":memory:")
+    apply_migrations(connection)
+    repository = PredictionsRepository(connection)
+    game_id = create_game_with_players(connection, [VASYA])
+    state = GameState(game_id=game_id, registry=registry)
+    state.register_player(VASYA, "Вася")
+    start_game(state)
+    llm = FakeLLMClient()
+    cast(Any, llm).max_retries = 3
+    cast(Any, llm).retry_backoff_sec = 0.01
+    llm.set_response(make_response([make_prediction(VASYA, "Мафия")]))
+    call = llm.analyze_stream
+    attempts = 0
+
+    async def respond(**kwargs: Any) -> AnalysisResponse:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise LLMError("max retries (3) reached: _TransientHTTP")
+        return await call(**kwargs)
+
+    llm.analyze_stream = respond  # type: ignore[method-assign]
+    env = jinja2.Environment(loader=jinja2.FileSystemLoader("infra/llm/prompts"), autoescape=False)
+    analyzer = make_analyzer(llm, repository, registry, env)
+    scanner, _, _ = build_scanner(game_state=state, registry=registry)
+    scanner._analyzer = analyzer
+    await scanner.start()
+    try:
+        await scanner._on_event(player_event(VASYA, "Вася", "Один анализ"))
+        await scanner._flush()
+        await asyncio.sleep(0.08)
+        assert attempts == 2
+        assert len(repository.list_predictions(game_id)) == 1
+    finally:
+        await scanner.shutdown()
+        connection.close()
+
+
+async def test_retry_exhaustion_is_bounded_and_warns(
+    game_state: GameState, registry: RoleRegistry, log_records: list[Record]
+) -> None:
+    start_game(game_state)
+    scanner, analyzer, _ = build_scanner(game_state=game_state, registry=registry)
+    cast(Any, analyzer)._llm_client = SimpleNamespace(max_retries=3, retry_backoff_sec=0.01)
+
+    async def fail(*args: Any, **kwargs: Any) -> AnalysisResult:
+        analyzer.calls += 1
+        return AnalysisResult(
+            response=None,
+            error="max retries (3) reached: _TransientHTTP",
+            duration_sec=0,
+            reasoning_chars=0,
+        )
+
+    analyzer.analyze = fail  # type: ignore[method-assign]
+    await scanner.start()
+    try:
+        await scanner._on_event(player_event(VASYA, "Вася", "Проверка"))
+        await scanner._flush()
+        await asyncio.sleep(0.12)
+        assert analyzer.calls == 3
+        assert scanner.buffer_size == 0
+        assert any("retry budget exhausted" in text for text in _messages(log_records))
+    finally:
+        await scanner.shutdown()
+
+
+async def test_retry_cancelled_on_new_game(game_state: GameState, registry: RoleRegistry) -> None:
+    start_game(game_state)
+    scanner, analyzer, _ = build_scanner(game_state=game_state, registry=registry)
+    cast(Any, analyzer)._llm_client = SimpleNamespace(max_retries=3, retry_backoff_sec=0.1)
+
+    async def fail(*args: Any, **kwargs: Any) -> AnalysisResult:
+        analyzer.calls += 1
+        return AnalysisResult(
+            response=None,
+            error="max retries (3) reached: _TransientHTTP",
+            duration_sec=0,
+            reasoning_chars=0,
+        )
+
+    analyzer.analyze = fail  # type: ignore[method-assign]
+    scanner._on_new_game = AsyncMock(return_value=game_state.reset_for_new_game(GAME_ID + 1))
+    await scanner.start()
+    try:
+        await scanner._on_event(player_event(VASYA, "Вася", "Проверка"))
+        await scanner._flush()
+        await scanner._on_event(bot_event("Город ветров начинает новую игру!"))
+        await asyncio.sleep(0.15)
+        assert analyzer.calls == 1
+        assert scanner._game_state.game_id == GAME_ID + 1
+    finally:
+        await scanner.shutdown()
+
+
+@pytest.mark.parametrize(
+    "error", ["connection: refused", "model 'x' not found", "invalid response: bad JSON"]
+)
+async def test_non_retryable_failures_wait_for_new_event(
+    game_state: GameState, registry: RoleRegistry, error: str
+) -> None:
+    start_game(game_state)
+    scanner, analyzer, _ = build_scanner(game_state=game_state, registry=registry)
+    cast(Any, analyzer)._llm_client = SimpleNamespace(max_retries=3, retry_backoff_sec=0.01)
+
+    async def fail(*args: Any, **kwargs: Any) -> AnalysisResult:
+        analyzer.calls += 1
+        return AnalysisResult(response=None, error=error, duration_sec=0, reasoning_chars=0)
+
+    analyzer.analyze = fail  # type: ignore[method-assign]
+    await scanner.start()
+    try:
+        await scanner._flush()
+        await asyncio.sleep(0.04)
+        assert analyzer.calls == 1
+        assert scanner._retry_task is None
+    finally:
+        await scanner.shutdown()
+
+
+async def test_new_event_does_not_duplicate_retry_task(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    start_game(game_state)
+    scanner, analyzer, _ = build_scanner(
+        game_state=game_state, registry=registry, mode=TriggerMode.EVERY_MESSAGE
+    )
+    cast(Any, analyzer)._llm_client = SimpleNamespace(max_retries=3, retry_backoff_sec=0.1)
+
+    async def fail(*args: Any, **kwargs: Any) -> AnalysisResult:
+        analyzer.calls += 1
+        return AnalysisResult(
+            response=None,
+            error="max retries (3) reached: ReadTimeout",
+            duration_sec=0,
+            reasoning_chars=0,
+        )
+
+    analyzer.analyze = fail  # type: ignore[method-assign]
+    await scanner.start()
+    try:
+        await scanner._on_event(player_event(VASYA, "Вася", "Первое"))
+        task = scanner._retry_task
+        assert task is not None
+        await scanner._on_event(player_event(PETYA, "Петя", "Второе"))
+        assert scanner._retry_task is task
+        assert analyzer.calls == 2
+    finally:
+        await scanner.shutdown()

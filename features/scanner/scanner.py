@@ -195,6 +195,8 @@ class MessageScanner:
         self._registration_lock = asyncio.Lock()
         self._buffer: list[AnyEvent] = []
         self._debounce_task: asyncio.Task[None] | None = None
+        self._retry_task: asyncio.Task[None] | None = None
+        self._retry_attempts = 0
         self._flushing: bool = False
         self._started: bool = False
 
@@ -231,6 +233,13 @@ class MessageScanner:
         event-loop turn to unwind so no pending task is left behind.
         """
         self._cancel_debounce()
+        retry = self._retry_task
+        self._cancel_retry()
+        if retry is not None and retry is not asyncio.current_task():
+            try:
+                await retry
+            except asyncio.CancelledError:
+                pass
         await asyncio.sleep(0)
         if self._started:
             await self._telegram.remove_all_handlers()
@@ -487,6 +496,7 @@ class MessageScanner:
                 in {Phase.NIGHT, Phase.DAY, Phase.VOTE, Phase.END}
             ):
                 self._cancel_debounce()
+                self._cancel_retry()
                 self._game_state = await self._on_new_game()
                 self._buffer.clear()
                 event = event.model_copy(update={"game_id": self._game_state.game_id})
@@ -712,6 +722,65 @@ class MessageScanner:
             return
         task.cancel()
 
+    def _cancel_retry(self) -> None:
+        """Stop the retry for this game without cancelling the calling task."""
+        task = self._retry_task
+        self._retry_task = None
+        self._retry_attempts = 0
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _schedule_retry(self, error: str | None) -> None:
+        """Schedule only transient transport failures, not connection or model errors."""
+        transient = (
+            "_TransientHTTP",
+            "HTTPStatusError",
+            "ReadTimeout",
+            "WriteTimeout",
+            "ReadError",
+            "RemoteProtocolError",
+        )
+        if not self._started or error is None or not any(name in error for name in transient):
+            self._cancel_retry()
+            return
+        client = getattr(self._analyzer, "_llm_client", None)
+        limit = min(3, max(1, int(getattr(client, "max_retries", 3))))
+        self._retry_attempts += 1
+        if self._retry_attempts >= limit:
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "retry budget exhausted: game_id={} attempts={}",
+                self._game_state.game_id,
+                self._retry_attempts,
+            )
+            self._cancel_retry()
+            return
+        if self._retry_task is None or self._retry_task.done():
+            backoff = float(getattr(client, "retry_backoff_sec", 2.0))
+            self._retry_task = asyncio.create_task(
+                self._retry_loop(self._game_state.game_id, backoff)
+            )
+
+    async def _retry_loop(self, game_id: int, backoff: float) -> None:
+        """Retry asynchronously, with at most one task for the current game."""
+        task = asyncio.current_task()
+        try:
+            while (
+                self._retry_task is task and self._started and self._game_state.game_id == game_id
+            ):
+                await asyncio.sleep(backoff * 2 ** max(0, self._retry_attempts - 1))
+                if (
+                    self._retry_task is not task
+                    or not self._started
+                    or self._game_state.game_id != game_id
+                ):
+                    return
+                if not self._flushing:
+                    await self._flush()
+        finally:
+            if self._retry_task is task:
+                self._retry_task = None
+                self._retry_attempts = 0
+
     async def _flush(self) -> None:
         """Hand the current game state to the analyzer and drain the buffer.
 
@@ -733,7 +802,7 @@ class MessageScanner:
             return
         phase = self._game_state.current_phase()
         has_alive_list = any(isinstance(event, AliveListEvent) for event in self._buffer)
-        if phase == Phase.REGISTRATION and not has_alive_list:
+        if phase == Phase.REGISTRATION and not has_alive_list and self._retry_task is None:
             logger.bind(channel=_LOGGER_CHANNEL).debug(
                 "flush skipped: phase=registration (game not started)",
             )
@@ -742,6 +811,7 @@ class MessageScanner:
             return
         if phase == Phase.END:
             logger.bind(channel=_LOGGER_CHANNEL).debug("flush skipped: phase=end")
+            self._cancel_retry()
             self._buffer.clear()
             self._cancel_debounce()
             return
@@ -770,11 +840,13 @@ class MessageScanner:
                         str(e),
                     )
             if not result.success or response is None:
+                self._schedule_retry(result.error)
                 logger.bind(channel=_LOGGER_CHANNEL).warning(
                     "flush failed: {}",
                     result.error,
                 )
             else:
+                self._cancel_retry()
                 logger.bind(channel=_LOGGER_CHANNEL).info(
                     "flush ok: {} predictions, {}s",
                     len(response.analysis),
