@@ -1663,3 +1663,137 @@ async def test_stats_threshold_preserves_player_with_dash(tmp_path: Path) -> Non
         assert ui.stats[-1].rows == [StatsRow(player_name="Игрок", role="—", confidence=0.0)]
     finally:
         await orchestrator.shutdown()
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+async def test_duplicate_end_game_runs_retro_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, in_flight: bool
+) -> None:
+    from unittest.mock import Mock
+
+    from features.memory.retro import GameRetroReport
+
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.0)
+    retro = Mock(
+        return_value=GameRetroReport(
+            game_id=result.game_state.game_id,
+            total_predictions=0,
+            correct=0,
+            wrong=0,
+            unknown=0,
+            by_role={},
+        )
+    )
+    monkeypatch.setattr("features.memory.retro.retro_analyze", retro)
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    original = orchestrator._run_retro
+
+    async def controlled_retro() -> None:
+        entered.set()
+        await gate.wait()
+        await original()
+
+    monkeypatch.setattr(orchestrator, "_run_retro", controlled_retro)
+    event = EndGameEvent(
+        ts=EVENT_TS,
+        game_id=result.game_state.game_id,
+        payload=EndGamePayload(winners=[("Вася", "Мафия")]),
+    )
+    try:
+        await orchestrator._persist_event(event)
+        first = orchestrator._pending_retro_task
+        assert first is not None
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        if not in_flight:
+            gate.set()
+            await first
+        await orchestrator._persist_event(event)
+        gate.set()
+        await first
+        await asyncio.sleep(0.01)
+        assert retro.call_count == 1
+        assert orchestrator._retro_done == {event.game_id}
+    finally:
+        gate.set()
+        await orchestrator.shutdown()
+
+
+async def test_retro_new_game_and_late_end_are_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from features.memory.retro import GameRetroReport
+
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.0)
+    retro = Mock(
+        return_value=GameRetroReport(
+            game_id=0, total_predictions=0, correct=0, wrong=0, unknown=0, by_role={}
+        )
+    )
+    monkeypatch.setattr("features.memory.retro.retro_analyze", retro)
+    old_id = result.game_state.game_id
+    old_event = EndGameEvent(
+        ts=EVENT_TS, game_id=old_id, payload=EndGamePayload(winners=[("A", "Мафия")])
+    )
+    try:
+        await orchestrator._persist_event(old_event)
+        first = orchestrator._pending_retro_task
+        assert first is not None
+        await first
+        new_state = await orchestrator._new_game_from_start()
+        assert new_state.game_id != old_id
+        before = set(orchestrator._retro_done)
+        await orchestrator._persist_event(old_event)
+        assert orchestrator._retro_done == before and retro.call_count == 1
+        event = old_event.model_copy(update={"game_id": new_state.game_id})
+        await orchestrator._persist_event(event)
+        second = orchestrator._pending_retro_task
+        assert second is not None
+        await second
+        assert orchestrator._retro_done == {old_id, new_state.game_id}
+        assert retro.call_count == 2
+        assert [c.kwargs["game_id"] for c in retro.call_args_list] == [old_id, new_state.game_id]
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_parallel_direct_schedule_retro_runs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    retro = AsyncMock()
+    monkeypatch.setattr(orchestrator, "_run_retro", retro)
+    try:
+        await asyncio.gather(
+            orchestrator._schedule_retro(delay=0), orchestrator._schedule_retro(delay=0)
+        )
+        retro.assert_awaited_once()
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_late_end_without_prior_retro_does_not_mark_old_game(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    retro = AsyncMock()
+    monkeypatch.setattr(orchestrator, "_run_retro", retro)
+    old_id = result.game_state.game_id
+    try:
+        await orchestrator._new_game_from_start()
+        await orchestrator._persist_event(
+            EndGameEvent(ts=EVENT_TS, game_id=old_id, payload=EndGamePayload(winners=[]))
+        )
+        assert orchestrator._retro_done == set()
+        assert orchestrator._pending_retro_task is None
+        retro.assert_not_awaited()
+    finally:
+        await orchestrator.shutdown()

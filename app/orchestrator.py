@@ -138,6 +138,7 @@ class Orchestrator:
         self._backfill_task: asyncio.Task[None] | None = None
         # END_GAME retro is deferred, not run inline with event persistence.
         self._pending_retro: bool = False
+        self._retro_done: set[int] = set()
         self._pending_retro_task: asyncio.Task[None] | None = None
 
     @property
@@ -408,14 +409,22 @@ class Orchestrator:
         # Schedule retro after END_GAME with a 5.0 s delay (flush may be in
         # progress); the final analysis must persist predictions before retro.
         if isinstance(event, EndGameEvent):
-            self._pending_retro = True
-            pending = self._pending_retro_task
-            if pending is None or pending.done():
-                self._pending_retro_task = asyncio.create_task(
-                    self._schedule_retro(delay=_RETRO_DELAY_SEC)
+            if event.game_id in self._retro_done:
+                logger.bind(channel=_LOGGER_CHANNEL).info(
+                    "retro already scheduled/done: game_id={}", event.game_id
                 )
+                return
+            # No await between the check, reservation and task creation: the
+            # event loop cannot interleave a second END_GAME here.
+            self._retro_done.add(event.game_id)
+            self._pending_retro = True
+            self._pending_retro_task = asyncio.create_task(
+                self._schedule_retro(delay=_RETRO_DELAY_SEC, reserved_game_id=event.game_id)
+            )
 
-    async def _schedule_retro(self, delay: float = 5.0) -> None:
+    async def _schedule_retro(
+        self, delay: float = 5.0, *, reserved_game_id: int | None = None
+    ) -> None:
         """Run the retrospective after ``delay`` seconds, off the event path.
 
         The default is the production grace period (:data:`_RETRO_DELAY_SEC`);
@@ -424,6 +433,15 @@ class Orchestrator:
         Args:
             delay: Grace period for the final analysis flush, in seconds.
         """
+        game_id = reserved_game_id
+        if game_id is None:
+            game_id = self._result.game_state.game_id
+            if game_id in self._retro_done:
+                logger.bind(channel=_LOGGER_CHANNEL).info(
+                    "retro already scheduled/done: game_id={}", game_id
+                )
+                return
+            self._retro_done.add(game_id)
         try:
             await asyncio.sleep(delay)
             scanner = self._scanner
@@ -436,7 +454,8 @@ class Orchestrator:
                     logger.bind(channel=_LOGGER_CHANNEL).info(
                         "retro: waited {:.1f}s for flush to complete", waited
                     )
-            await self._run_retro()
+            if self._result.game_state.game_id == game_id:
+                await self._run_retro()
         except Exception as error:  # noqa: BLE001 — retro must not break scanning
             logger.bind(channel=_LOGGER_CHANNEL).error(
                 "scheduled retro failed: {}: {}",
