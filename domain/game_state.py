@@ -50,6 +50,9 @@ class GameState:
         self._game_id = game_id
         self._registry = registry
         self._players: dict[int, Player] = {}
+        self._name_to_id: dict[str, int] = {}
+        self._registered_ids: set[int] = set()
+        self._persisted_ids: set[int] = set()
         self._events: list[AnyEvent] = []
         self._phase = Phase.REGISTRATION
         self._day_number = 0
@@ -58,6 +61,41 @@ class GameState:
         #: Names from the last ``ALIVE_LIST`` — the whitelist of real players
         #: (utility bots writing in the game chat are not in it).
         self._last_alive_list_names: frozenset[str] = frozenset()
+
+    def reset_for_new_game(self, new_game_id: int) -> GameState:
+        """Return a clean aggregate for a new game, keeping the role registry."""
+        return GameState(game_id=new_game_id, registry=self._registry)
+
+    def register_name(self, name: str, player_id: int) -> None:
+        """Associate a name with its first observed player id."""
+        self._name_to_id.setdefault(name, player_id)
+
+    def resolve_name(self, name: str) -> int | None:
+        """Return the first observed player id for a name."""
+        return self._name_to_id.get(name)
+
+    @property
+    def name_to_id(self) -> dict[str, int]:
+        """Return a copy of the name mapping."""
+        return dict(self._name_to_id)
+
+    @property
+    def registered_ids(self) -> frozenset[int]:
+        """Return ids registered by the scanner."""
+        return frozenset(self._registered_ids)
+
+    def is_registered(self, player_id: int) -> bool:
+        """Return whether the scanner registered this player."""
+        return player_id in self._registered_ids
+
+    def mark_registered(self, player_id: int) -> None:
+        """Mark a player as registered by the scanner."""
+        self._registered_ids.add(player_id)
+
+    @property
+    def persisted_ids(self) -> set[int]:
+        """Return the per-game persistence cache."""
+        return self._persisted_ids
 
     @property
     def game_id(self) -> int:
@@ -118,6 +156,12 @@ class GameState:
     def apply(self, event: AnyEvent) -> None:
         """Validate and apply an event, recording it only after success."""
         if event.game_id != self._game_id:
+            if isinstance(event, EndGameEvent):
+                logger.bind(channel="game_state").warning(
+                    "late END_GAME ignored: event game_id={}, current game_id={}",
+                    event.game_id,
+                    self._game_id,
+                )
             raise ConfigError(f"event belongs to game {event.game_id}, not game {self._game_id}")
 
         updated_player: Player | None = None
@@ -135,35 +179,19 @@ class GameState:
         elif isinstance(event, PhaseChangeEvent):
             payload = event.payload
 
-            # A transition to REGISTRATION marks a new game and resets the
-            # aggregate, including when the previous game had already ended.
             if payload.to_phase == Phase.REGISTRATION:
-                if self._phase != Phase.REGISTRATION or self._players:
-                    logger.bind(channel="game_state").info(
-                        "new game detected: phase {} → REGISTRATION, "
-                        "resetting state ({} players dropped)",
-                        self._phase.value,
-                        len(self._players),
-                    )
-                self._phase = Phase.REGISTRATION
-                self._day_number = 0
-                self._players = {}
-                self._role_count = None
-                self._total_players = None
-                self._last_alive_list_names = frozenset()
-                self._events.append(event)
-                return
-
-            if self._phase == Phase.END:
+                # A repeated start or startup marker does not reset an aggregate.
+                pass
+            elif self._phase == Phase.END:
                 # Post-END phase chatter is expected in backfills/replays:
                 # keep it out of WARNING logs (noise on every finished game).
                 logger.bind(channel="game_state").debug(
                     "phase_change to {} after END — ignored", event.payload.to_phase
                 )
                 return
-            if payload.from_phase == payload.to_phase:
+            elif payload.from_phase == payload.to_phase:
                 raise ConfigError("phase change must transition to a different phase")
-            if payload.from_phase != self._phase:
+            elif payload.from_phase != self._phase:
                 raise ConfigError(
                     f"phase change starts at {payload.from_phase.value}, "
                     f"but current phase is {self._phase.value}"
@@ -231,15 +259,10 @@ class GameState:
             if event.payload.day_number > 0:
                 # Явный номер дня из бота (например, "День 2").
                 self._day_number = event.payload.day_number
-            else:
-                # Бот не указал номер — инкрементим на каждый переход в новую
-                # фазу (DAY/NIGHT/VOTE). REGISTRATION/END — не инкрементят.
-                if event.payload.to_phase in (
-                    Phase.DAY,
-                    Phase.NIGHT,
-                    Phase.VOTE,
-                ):
-                    self._day_number += 1
+            elif event.payload.to_phase == Phase.NIGHT:
+                self._day_number += 1
+            elif event.payload.to_phase == Phase.REGISTRATION:
+                self._day_number = 0
         self._events.append(event)
 
     def _apply_end_game(self, event: EndGameEvent) -> None:
@@ -261,9 +284,18 @@ class GameState:
         losers_map = dict(event.payload.losers)
 
         for name in winners_map.keys() | losers_map.keys():
-            player = next((p for p in self._players.values() if p.display_name == name), None)
+            player = next(
+                (p for p in self._players.values() if names_match(p.display_name, name)), None
+            )
             if player is None:
-                player = next((p for p in self._players.values() if p.username == name), None)
+                player = next(
+                    (
+                        p
+                        for p in self._players.values()
+                        if p.username is not None and names_match(p.username, name)
+                    ),
+                    None,
+                )
             if player is None:
                 player = self.register_player(_placeholder_player_id(name), name)
             player_id = player.player_id

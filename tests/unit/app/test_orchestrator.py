@@ -1444,3 +1444,356 @@ async def test_send_stats_shows_whitelisted_placeholder(tmp_path: Path) -> None:
         assert {row.player_name for row in ui.stats[-1].rows} == {"A", "| user_4"}
     finally:
         await orchestrator.shutdown()
+
+
+async def test_merge_normalized_placeholder_preserves_final_role_and_prediction(
+    tmp_path: Path,
+) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    game_id = state.game_id
+    real_id = 456
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    state.register_player(real_id, "Дмитрий")
+    state.register_player(placeholder_id, "| Дмитрий")
+    for pid, name in ((real_id, "Дмитрий"), (placeholder_id, "| Дмитрий")):
+        await orchestrator._persist_player(pid, name)
+    result.repos.game_players.set_final_role(
+        game_id=game_id,
+        player_id=placeholder_id,
+        final_role="Мафия",
+        survived=False,
+        is_winner=True,
+    )
+    result.repos.predictions.upsert_prediction(
+        game_id=game_id,
+        player_id=placeholder_id,
+        predicted_role="Мафия",
+        confidence=0.8,
+        reasoning="Тест",
+    )
+    await orchestrator._merge_placeholder_players(state)
+    row = result.repos.game_players.get_player_in_game(game_id=game_id, player_id=real_id)
+    assert row is not None and row["final_role"] == "Мафия"
+    assert row["survived"] == 0 and row["is_winner"] == 1
+    assert (
+        result.repos.game_players.get_player_in_game(game_id=game_id, player_id=placeholder_id)
+        is None
+    )
+    assert result.repos.players.get_player(placeholder_id) is None
+    assert [r["player_id"] for r in result.repos.predictions.list_predictions(game_id)] == [real_id]
+    await orchestrator.shutdown()
+
+
+async def test_merge_does_not_join_different_real_names(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    for pid, name in ((456, "Дмитрий"), (457, "Пётр")):
+        state.register_player(pid, name)
+        await orchestrator._persist_player(pid, name)
+    await orchestrator._merge_placeholder_players(state)
+    assert {r["player_id"] for r in result.repos.game_players.list_game_players(state.game_id)} == {
+        456,
+        457,
+    }
+    await orchestrator.shutdown()
+
+
+async def test_merge_ambiguous_real_players_warns_and_leaves_placeholder(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    for pid, name in ((456, "Дмитрий"), (457, "ДМИТРИЙ"), (placeholder_id, "| Дмитрий")):
+        state.register_player(pid, name)
+        await orchestrator._persist_player(pid, name)
+    logs: list[str] = []
+    sink = logger.add(lambda message: logs.append(str(message)), level="WARNING")
+    try:
+        await orchestrator._merge_placeholder_players(state)
+        assert {
+            r["player_id"] for r in result.repos.game_players.list_game_players(state.game_id)
+        } == {456, 457, placeholder_id}
+        assert any("ambiguous" in message and str(placeholder_id) in message for message in logs)
+    finally:
+        logger.remove(sink)
+        await orchestrator.shutdown()
+
+
+async def test_merge_finds_placeholder_after_real_speech_collapsed_state(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    state.register_player(placeholder_id, "| Дмитрий")
+    await orchestrator._persist_player(placeholder_id, "| Дмитрий")
+    result.repos.game_players.set_final_role(
+        game_id=state.game_id, player_id=placeholder_id, final_role="Мафия"
+    )
+    state.register_player(456, "Дмитрий")
+    await orchestrator._persist_player(456, "Дмитрий")
+    assert all(p.player_id != placeholder_id for p in state.players())
+    await orchestrator._merge_placeholder_players(state)
+    row = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=456)
+    assert row is not None and row["final_role"] == "Мафия"
+    assert result.repos.players.get_player(placeholder_id) is None
+    await orchestrator.shutdown()
+
+
+async def test_merge_uses_end_game_role_from_placeholder_state(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    state.register_player(456, "Дмитрий")
+    state.register_player(placeholder_id, "| Дмитрий")
+    # Изолируем старый случай, в котором итоговая роль есть лишь в агрегате.
+    role = result.registry.resolve_alias("Мафия")
+    assert role is not None
+    placeholder = state.player(placeholder_id).model_copy(
+        update={"final_role": role, "is_winner": True}
+    )
+    state._players[placeholder_id] = placeholder
+    for pid, name in ((456, "Дмитрий"), (placeholder_id, "| Дмитрий")):
+        await orchestrator._persist_player(pid, name)
+    await orchestrator._merge_placeholder_players(state)
+    real = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=456)
+    assert real is not None and real["final_role"] == "Мафия" and real["is_winner"] == 1
+    await orchestrator.shutdown()
+
+
+async def test_merge_ambiguous_database_only_real_player_blocks_merge(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    ph = _placeholder_player_id("| Дмитрий")
+    state.register_player(456, "Дмитрий")
+    state.register_player(ph, "| Дмитрий")
+    for pid, name in ((456, "Дмитрий"), (457, "ДМИТРИЙ"), (ph, "| Дмитрий")):
+        await orchestrator._persist_player(pid, name)
+    await orchestrator._merge_placeholder_players(state)
+    assert (
+        result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=ph)
+        is not None
+    )
+    await orchestrator.shutdown()
+
+
+async def test_merge_conflicting_final_roles_rolls_back(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    ph = _placeholder_player_id("| Дмитрий")
+    for pid, name in ((456, "Дмитрий"), (ph, "| Дмитрий")):
+        state.register_player(pid, name)
+        await orchestrator._persist_player(pid, name)
+    for pid, role in ((456, "Доктор"), (ph, "Мафия")):
+        result.repos.game_players.set_final_role(
+            game_id=state.game_id, player_id=pid, final_role=role
+        )
+    await orchestrator._merge_placeholder_players(state)
+    old = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=ph)
+    real = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=456)
+    assert old is not None and old["final_role"] == "Мафия"
+    assert real is not None and real["final_role"] == "Доктор"
+    await orchestrator.shutdown()
+
+
+@pytest.mark.parametrize("show_dead", [False, True])
+async def test_stats_filter_dead_before_confidence_order(tmp_path: Path, show_dead: bool) -> None:
+    result, _, _ = await make_result(tmp_path)
+    result.config = result.config.model_copy(
+        update={
+            "analysis": result.config.analysis.model_copy(
+                update={"show_dead": show_dead, "min_confidence_to_display": 0.1}
+            )
+        }
+    )
+    state = result.game_state
+    for pid, name, confidence in [(100, "Умерший", 0.9), (101, "Живой", 0.4)]:
+        state.register_player(pid, name)
+        result.repos.players.upsert_player(player_id=pid, username=None, display_name=name)
+        result.repos.predictions.upsert_prediction(
+            game_id=state.game_id,
+            player_id=pid,
+            predicted_role="Мафия",
+            confidence=confidence,
+            reasoning="test",
+        )
+    state.apply(
+        DeathEvent(
+            ts=EVENT_TS,
+            game_id=state.game_id,
+            payload=DeathPayload(victim_id=100, victim_name="Умерший", cause="lynch"),
+        )
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert [row.player_name for row in ui.stats[-1].rows] == (
+            ["Умерший", "Живой"] if show_dead else ["Живой"]
+        )
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_stats_threshold_preserves_player_with_dash(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    result.config = result.config.model_copy(
+        update={
+            "analysis": result.config.analysis.model_copy(update={"min_confidence_to_display": 0.5})
+        }
+    )
+    result.game_state.register_player(100, "Игрок")
+    result.repos.players.upsert_player(player_id=100, username=None, display_name="Игрок")
+    result.repos.predictions.upsert_prediction(
+        game_id=result.game_state.game_id,
+        player_id=100,
+        predicted_role="Мафия",
+        confidence=0.3,
+        reasoning="test",
+    )
+    ui = FakeWindowHost()
+    orchestrator = Orchestrator(bootstrap_result=result, window_host=ui)  # type: ignore[arg-type]
+    try:
+        await orchestrator._send_stats()
+        assert ui.stats[-1].rows == [StatsRow(player_name="Игрок", role="—", confidence=0.0)]
+    finally:
+        await orchestrator.shutdown()
+
+
+@pytest.mark.parametrize("in_flight", [False, True])
+async def test_duplicate_end_game_runs_retro_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, in_flight: bool
+) -> None:
+    from unittest.mock import Mock
+
+    from features.memory.retro import GameRetroReport
+
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.0)
+    retro = Mock(
+        return_value=GameRetroReport(
+            game_id=result.game_state.game_id,
+            total_predictions=0,
+            correct=0,
+            wrong=0,
+            unknown=0,
+            by_role={},
+        )
+    )
+    monkeypatch.setattr("features.memory.retro.retro_analyze", retro)
+    entered = asyncio.Event()
+    gate = asyncio.Event()
+    original = orchestrator._run_retro
+
+    async def controlled_retro() -> None:
+        entered.set()
+        await gate.wait()
+        await original()
+
+    monkeypatch.setattr(orchestrator, "_run_retro", controlled_retro)
+    event = EndGameEvent(
+        ts=EVENT_TS,
+        game_id=result.game_state.game_id,
+        payload=EndGamePayload(winners=[("Вася", "Мафия")]),
+    )
+    try:
+        await orchestrator._persist_event(event)
+        first = orchestrator._pending_retro_task
+        assert first is not None
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        if not in_flight:
+            gate.set()
+            await first
+        await orchestrator._persist_event(event)
+        gate.set()
+        await first
+        await asyncio.sleep(0.01)
+        assert retro.call_count == 1
+        assert orchestrator._retro_done == {event.game_id}
+    finally:
+        gate.set()
+        await orchestrator.shutdown()
+
+
+async def test_retro_new_game_and_late_end_are_isolated(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    from features.memory.retro import GameRetroReport
+
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.0)
+    retro = Mock(
+        return_value=GameRetroReport(
+            game_id=0, total_predictions=0, correct=0, wrong=0, unknown=0, by_role={}
+        )
+    )
+    monkeypatch.setattr("features.memory.retro.retro_analyze", retro)
+    old_id = result.game_state.game_id
+    old_event = EndGameEvent(
+        ts=EVENT_TS, game_id=old_id, payload=EndGamePayload(winners=[("A", "Мафия")])
+    )
+    try:
+        await orchestrator._persist_event(old_event)
+        first = orchestrator._pending_retro_task
+        assert first is not None
+        await first
+        new_state = await orchestrator._new_game_from_start()
+        assert new_state.game_id != old_id
+        before = set(orchestrator._retro_done)
+        await orchestrator._persist_event(old_event)
+        assert orchestrator._retro_done == before and retro.call_count == 1
+        event = old_event.model_copy(update={"game_id": new_state.game_id})
+        await orchestrator._persist_event(event)
+        second = orchestrator._pending_retro_task
+        assert second is not None
+        await second
+        assert orchestrator._retro_done == {old_id, new_state.game_id}
+        assert retro.call_count == 2
+        assert [c.kwargs["game_id"] for c in retro.call_args_list] == [old_id, new_state.game_id]
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_parallel_direct_schedule_retro_runs_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    retro = AsyncMock()
+    monkeypatch.setattr(orchestrator, "_run_retro", retro)
+    try:
+        await asyncio.gather(
+            orchestrator._schedule_retro(delay=0), orchestrator._schedule_retro(delay=0)
+        )
+        retro.assert_awaited_once()
+    finally:
+        await orchestrator.shutdown()
+
+
+async def test_late_end_without_prior_retro_does_not_mark_old_game(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    retro = AsyncMock()
+    monkeypatch.setattr(orchestrator, "_run_retro", retro)
+    old_id = result.game_state.game_id
+    try:
+        await orchestrator._new_game_from_start()
+        await orchestrator._persist_event(
+            EndGameEvent(ts=EVENT_TS, game_id=old_id, payload=EndGamePayload(winners=[]))
+        )
+        assert orchestrator._retro_done == set()
+        assert orchestrator._pending_retro_task is None
+        retro.assert_not_awaited()
+    finally:
+        await orchestrator.shutdown()

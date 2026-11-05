@@ -1168,3 +1168,11 @@ class TestClubAliveListComposition:
             assert not name.startswith(
                 ("👨", "🧟", "🕵", "🤵", "🧙", "💣", "🤞", "💃", "👮", "🤦", "🐺")
             )
+
+
+@pytest.mark.parametrize("text", ["| A убит", "| A был убит"])
+def test_death_single_letter_decorated_name(text: str, registry: RoleRegistry) -> None:
+    result = parse_bot_message(text, registry=registry)
+    assert result is not None
+    assert result.kind is BotMessageKind.DEATH
+    assert result.player_name == "| A"

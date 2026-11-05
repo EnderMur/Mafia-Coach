@@ -42,8 +42,8 @@ infra/db/repositories/ (SQLite: events, predictions, game_players)
 features/ui/ (WindowHost → subprocess: stats_window, reasoning_window)
 ```
 
-`MessageScanner` — единственное stateful-звено `features/`: он владеет буфером,
-debounce-таймером и маппингом `name_to_id`. Оркестратор (`app/orchestrator.py`)
+`MessageScanner` владеет буфером и debounce-таймером; маппинг имён
+и регистрации принадлежат `GameState`. Оркестратор (`app/orchestrator.py`)
 владеет ресурсами (БД, Telegram, UI) и подключает их к scanner через callback'и
 (`on_event`, `on_player_registered`, `on_reasoning`, `on_flush_complete`).
 Парсер и резолвер — чистые функции от входных данных.
@@ -141,14 +141,15 @@ debounce-таймером и маппингом `name_to_id`. Оркестрат
 
 ## 5. GAME_START → reset
 
-`PhaseChangeEvent(to_phase=REGISTRATION)` → `GameState.apply`:
+`PhaseChangeEvent(to_phase=REGISTRATION)` при текущей фазе NIGHT, DAY, VOTE
+или END закрывает предыдущую партию и создаёт новый `game_id` и `GameState`.
+При REGISTRATION или UNKNOWN новый `game_id` не создаётся. Регистрации и
+сопоставления имён принадлежат состоянию партии и сбрасываются вместе с ним.
+Перед заменой ожидаются выполняющийся анализ и ретроспектива предыдущей партии.
 
-- `_players = {}`, `_day_number = 0`, `_role_count = None`, `_total_players = None`.
-- Log `INFO "new game detected"` (канал `game_state`).
-- Scanner очищает `_registered_ids`, чтобы известные Telegram-пользователи могли
-  зарегистрироваться в новой партии заново.
-- Запись в `games` при этом НЕ создаётся: сброс происходит внутри текущего
-  `game_id` (см. §7).
+Номер дня без явного значения бота увеличивается только при переходе в NIGHT:
+регистрация — 0; NIGHT 1 / DAY 1 / VOTE 1 — день 1, следующая NIGHT — день 2.
+Положительный номер, переданный ботом, применяется к любой игровой фазе.
 
 ## 6. Триггеры
 
@@ -170,10 +171,34 @@ debounce-таймером и маппингом `name_to_id`. Оркестрат
 - `/attach`: при `game_id == 0` создаёт игру и новый `GameState`; повторный
   attach в v1 сохраняет текущую партию (state не делится по чатам).
 - `/reset`: новая запись `games` + новый `GameState` + перезапуск scanner.
-- `GAME_START`: сброс state внутри того же `game_id` (§5).
-- `END_GAME`: фаза → END, retro (§3). `games.finish_game` в MVP автоматически
-  не вызывается — `ended_at` остаётся NULL; факт завершения фиксируется фазой
-  и retro-отчётом.
+- `GAME_START`: при текущей фазе NIGHT/DAY/VOTE/END закрывает прежнюю игру,
+  записывая только `ended_at`, и создаёт новую; в REGISTRATION/UNKNOWN новую
+  игру не создаёт.
+- `END_GAME`: сохраняет `ended_at` и `winner_faction`, затем запускает retro.
+  Разрешённые роли всех победителей одной фракции дают `town`, `mafia` или
+  `neutral`; несколько фракций — `mixed`; пустой список или хотя бы одна
+  неразрешённая роль — `unknown`.
+- `winner_faction = NULL` означает отсутствие END_GAME: открытая партия ещё
+  продолжается, закрытая — заброшена. Поздний END_GAME с чужим `game_id`
+  игнорируется без записи события и запуска retro.
+- `ended_at` выставляется при END_GAME либо закрытии на GAME_START.
+
+| Состояние | ended_at | winner_faction |
+|---|---|---|
+| Открытая, END_GAME ещё не было | NULL | NULL |
+| Закрытая без END_GAME | время закрытия | NULL |
+| Завершённая с END_GAME | время завершения | town / mafia / neutral / mixed / unknown |
+
+Защита от позднего END_GAME (проверка `event.game_id != current game_id`)
+применима только к источникам, сохраняющим game_id на момент генерации события.
+Сканер присваивает сырому сообщению Telegram текущий game_id, поэтому при
+backfill / задержке доставки после смены партии поздний END_GAME может записаться
+в текущую партию. В v1 это известное ограничение. Полное решение (сохранение
+`game_id` на момент получения сообщения) — задача v2, требует изменения
+контракта `MessageEvent`.
+
+Комментарий `winner_faction` в неизменяемой миграции `001_init.sql` отражает
+прежний контракт; действующая семантика поля описана выше.
 
 ## 8. Персистентность и конкурентность
 

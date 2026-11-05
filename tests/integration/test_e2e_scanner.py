@@ -354,10 +354,9 @@ async def test_e2e_scanner_full_cycle(
     assert llm_client.calls > 0
     predictions = predictions_repo.list_predictions(game_id)
     assert len(predictions) == 1
-    assert (
-        connection.execute("SELECT COUNT(*) FROM predictions_history").fetchone()[0]
-        == llm_client.calls
-    )
+    # The fake keeps predicting Vasya after his death; those predictions are dropped.
+    history_count = connection.execute("SELECT COUNT(*) FROM predictions_history").fetchone()[0]
+    assert 0 < history_count < llm_client.calls
     assert {row["player_id"] for row in predictions} == {VASYA}
     assert {row["predicted_role"] for row in predictions} == {"Мафия"}
 

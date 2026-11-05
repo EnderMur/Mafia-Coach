@@ -181,7 +181,7 @@ def test_alternative_role_alias_is_replaced_by_canonical_name() -> None:
 def test_unresolved_primary_role_drops_prediction() -> None:
     """An unknown primary role drops that prediction and reports a warning."""
     result, warnings = validate_response(
-        response_json([valid_prediction(suspected_role="Unknown")]),
+        response_json([valid_prediction(suspected_role="Unknown", alternative=None)]),
         known_player_ids=frozenset({100}),
         role_names_ru=frozenset({"Role A", "Role B"}),
     )
@@ -390,3 +390,95 @@ def test_has_strong_signal_classifies_reasons() -> None:
     assert not _has_strong_signal(["молчит"])
     assert not _has_strong_signal(["молчит", "пассивен", "нет данных"])
     assert _has_strong_signal(["голосовал против раскрытого дона"])
+
+
+@pytest.mark.parametrize("reasoning", ["", None])
+def test_response_allows_empty_or_null_reasoning(reasoning: str | None) -> None:
+    response = AnalysisResponse.model_validate(
+        {"analysis": [], "game_read": "Обзор", "reasoning": reasoning}
+    )
+    assert response.reasoning == reasoning
+
+
+def test_response_allows_missing_reasoning() -> None:
+    response = AnalysisResponse.model_validate({"analysis": [], "game_read": "Обзор"})
+    assert response.reasoning is None
+
+
+def test_llm_fixture_validates_and_contains_reasoning() -> None:
+    from pathlib import Path
+
+    fixtures = list(Path("tests/fixtures/llm").glob("*.json"))
+    assert fixtures
+    for fixture in fixtures:
+        response = AnalysisResponse.model_validate_json(fixture.read_text(encoding="utf-8"))
+        assert response.reasoning
+
+
+def test_invalid_primary_uses_canonical_alternative_and_logs_info() -> None:
+    from loguru import logger
+
+    logs: list[str] = []
+    sink = logger.add(lambda message: logs.append(str(message)), level="INFO")
+    try:
+        result, warnings = validate_response(
+            response_json(
+                [
+                    valid_prediction(
+                        suspected_role="not a role",
+                        confidence=0.4,
+                        alternative={"role": "alias-b", "confidence": 0.35},
+                    )
+                ]
+            ),
+            known_player_ids=frozenset({100}),
+            role_names_ru=frozenset({"Role A", "Role B"}),
+            role_alias_resolver=lambda value: {"alias-b": "Role B"}.get(value),
+        )
+    finally:
+        logger.remove(sink)
+    assert len(result.analysis) == 1
+    assert result.analysis[0].suspected_role == "Role B"
+    assert result.analysis[0].confidence == pytest.approx(0.35)
+    assert result.analysis[0].alternative is None
+    assert not warnings
+    assert any("100" in message and "Role B" in message for message in logs)
+
+
+@pytest.mark.parametrize("alternative", [None, {"role": "invalid", "confidence": 0.2}])
+def test_invalid_primary_and_unusable_alternative_are_dropped(
+    alternative: dict[str, Any] | None,
+) -> None:
+    result, warnings = validate_response(
+        response_json([valid_prediction(suspected_role="invalid", alternative=alternative)]),
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis == []
+    assert any("prediction dropped" in warning for warning in warnings)
+
+
+def test_unknown_placeholder_primary_uses_valid_alternative() -> None:
+    result, warnings = validate_response(
+        response_json(
+            [
+                valid_prediction(
+                    suspected_role="Неизвестно", alternative={"role": "Role B", "confidence": 0.3}
+                )
+            ]
+        ),
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis[0].suspected_role == "Role B"
+    assert result.analysis[0].alternative is None
+    assert warnings == []
+
+
+def test_unknown_placeholder_without_valid_alternative_remains_silent() -> None:
+    result, warnings = validate_response(
+        response_json([valid_prediction(suspected_role="Неизвестно", alternative=None)]),
+        known_player_ids=frozenset({100}),
+        role_names_ru=frozenset({"Role A", "Role B"}),
+    )
+    assert result.analysis == [] and warnings == []

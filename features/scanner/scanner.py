@@ -50,6 +50,7 @@ from domain.events import (
 )
 from domain.exceptions import TelegramFloodWaitError
 from domain.game_state import GameState, _placeholder_player_id
+from domain.names import name_match_keys, names_match
 from domain.phases import Phase
 from domain.roles import RoleRegistry
 from features.analyzer.analyzer import GameAnalyzer
@@ -153,6 +154,7 @@ class MessageScanner:
         on_reasoning: Callable[[str], Awaitable[None]] | None = None,
         on_player_registered: Callable[[int, str], Awaitable[None]] | None = None,
         on_flush_complete: Callable[[], Awaitable[None]] | None = None,
+        on_new_game: Callable[[], Awaitable[GameState]] | None = None,
     ) -> None:
         """Retain dependencies and initialize the empty scan state.
 
@@ -187,12 +189,14 @@ class MessageScanner:
         self._on_reasoning_callback = on_reasoning
         self._on_player_registered = on_player_registered
         self._on_flush_complete_callback = on_flush_complete
+        self._on_new_game = on_new_game
 
-        self._name_to_id: dict[str, int] = {}
-        self._registered_ids: set[int] = set()
+        self._message_lock = asyncio.Lock()
         self._registration_lock = asyncio.Lock()
         self._buffer: list[AnyEvent] = []
         self._debounce_task: asyncio.Task[None] | None = None
+        self._retry_task: asyncio.Task[None] | None = None
+        self._retry_attempts = 0
         self._flushing: bool = False
         self._started: bool = False
 
@@ -229,6 +233,13 @@ class MessageScanner:
         event-loop turn to unwind so no pending task is left behind.
         """
         self._cancel_debounce()
+        retry = self._retry_task
+        self._cancel_retry()
+        if retry is not None and retry is not asyncio.current_task():
+            try:
+                await retry
+            except asyncio.CancelledError:
+                pass
         await asyncio.sleep(0)
         if self._started:
             await self._telegram.remove_all_handlers()
@@ -387,7 +398,8 @@ class MessageScanner:
             event: Telethon new-message event.
         """
         try:
-            await self._process_event(event)
+            async with self._message_lock:
+                await self._process_event(event)
         except Exception as e:  # noqa: BLE001 — handler is a protective boundary
             logger.bind(channel=_LOGGER_CHANNEL).error(
                 "handler failed: {}: {}",
@@ -410,13 +422,13 @@ class MessageScanner:
         if (
             sender_id != self._bot_id
             and display_name is not None
-            and display_name not in self._name_to_id
+            and self._game_state.resolve_name(display_name) is None
         ):
             # Only players are addressable by nickname: the bot's own title must
             # never shadow a player name. First observed spelling wins — the bot
             # writes the nickname it saw at registration, so later renames of a
             # player must not break death/vote resolution.
-            self._name_to_id[display_name] = sender_id
+            self._game_state.register_name(display_name, sender_id)
 
         message = getattr(event, "message", None)
         text = getattr(message, "text", None) if message is not None else None
@@ -466,7 +478,7 @@ class MessageScanner:
             return
         events = resolve_bot_message(
             parse=parse,
-            name_to_id=self._name_to_id,
+            name_to_id=self._game_state.name_to_id,
             registry=self._registry,
             game_id=self._game_state.game_id,
             ts=ts,
@@ -476,16 +488,21 @@ class MessageScanner:
             return
         applied: list[AnyEvent] = []
         for event in events:
+            if (
+                isinstance(event, PhaseChangeEvent)
+                and event.payload.to_phase is Phase.REGISTRATION
+                and self._on_new_game is not None
+                and self._game_state.current_phase()
+                in {Phase.NIGHT, Phase.DAY, Phase.VOTE, Phase.END}
+            ):
+                self._cancel_debounce()
+                self._cancel_retry()
+                self._game_state = await self._on_new_game()
+                self._buffer.clear()
+                event = event.model_copy(update={"game_id": self._game_state.game_id})
             await self._ensure_event_player(event)
             if self._apply_safely(event):
                 applied.append(event)
-                if (
-                    isinstance(event, PhaseChangeEvent)
-                    and event.payload.to_phase is Phase.REGISTRATION
-                ):
-                    # The new GameState is empty; allow known Telegram users
-                    # to be registered again as members of this game.
-                    self._registered_ids.clear()
                 if isinstance(event, AliveListEvent):
                     await self._persist_alive_placeholders(event.payload.alive_player_names)
                 await self._emit(event)
@@ -552,14 +569,14 @@ class MessageScanner:
             if not display_name.strip():
                 return
             # Preserve the first observed owner of each spelling, including aliases.
-            self._name_to_id.setdefault(display_name, player_id)
+            self._game_state.register_name(display_name, player_id)
             canonical = _strip_role_prefix(display_name, self._registry)
             if canonical and canonical != display_name:
-                self._name_to_id.setdefault(canonical, player_id)
-            if player_id in self._registered_ids:
+                self._game_state.register_name(canonical, player_id)
+            if self._game_state.is_registered(player_id):
                 return
             self._game_state.register_player(player_id, display_name)
-            self._registered_ids.add(player_id)
+            self._game_state.mark_registered(player_id)
             logger.bind(channel=_LOGGER_CHANNEL).debug(
                 "player registered: id={} name={!r}",
                 player_id,
@@ -590,11 +607,31 @@ class MessageScanner:
     async def _persist_alive_placeholders(self, names: list[str]) -> None:
         """Publish name-only registrations for persistence and subsequent bot events."""
         for name in names:
-            pid = _placeholder_player_id(name)
-            # Do not create fake participation rows for already-known real users.
-            if not any(p.player_id == pid for p in self._game_state.players()):
+            placeholder_id = _placeholder_player_id(name)
+            real = next(
+                (
+                    player
+                    for player in self._game_state.players()
+                    if player.player_id > 0
+                    and (
+                        names_match(player.display_name, name)
+                        or (player.username is not None and names_match(player.username, name))
+                    )
+                ),
+                None,
+            )
+            if real is not None:
+                pid = real.player_id
+            else:
+                pid = placeholder_id
+                if not any(player.player_id == pid for player in self._game_state.players()):
+                    self._game_state.register_player(pid, name)
+            self._game_state.register_name(name, pid)
+            for key in name_match_keys(name):
+                self._game_state.register_name(key, pid)
+            # A name-only player still needs its participation row persisted.
+            if pid != placeholder_id:
                 continue
-            self._name_to_id.setdefault(name, pid)
             if self._on_player_registered is not None:
                 try:
                     await self._on_player_registered(pid, name)
@@ -685,6 +722,65 @@ class MessageScanner:
             return
         task.cancel()
 
+    def _cancel_retry(self) -> None:
+        """Stop the retry for this game without cancelling the calling task."""
+        task = self._retry_task
+        self._retry_task = None
+        self._retry_attempts = 0
+        if task is not None and not task.done() and task is not asyncio.current_task():
+            task.cancel()
+
+    def _schedule_retry(self, error: str | None) -> None:
+        """Schedule only transient transport failures, not connection or model errors."""
+        transient = (
+            "_TransientHTTP",
+            "HTTPStatusError",
+            "ReadTimeout",
+            "WriteTimeout",
+            "ReadError",
+            "RemoteProtocolError",
+        )
+        if not self._started or error is None or not any(name in error for name in transient):
+            self._cancel_retry()
+            return
+        client = getattr(self._analyzer, "_llm_client", None)
+        limit = min(3, max(1, int(getattr(client, "max_retries", 3))))
+        self._retry_attempts += 1
+        if self._retry_attempts >= limit:
+            logger.bind(channel=_LOGGER_CHANNEL).warning(
+                "retry budget exhausted: game_id={} attempts={}",
+                self._game_state.game_id,
+                self._retry_attempts,
+            )
+            self._cancel_retry()
+            return
+        if self._retry_task is None or self._retry_task.done():
+            backoff = float(getattr(client, "retry_backoff_sec", 2.0))
+            self._retry_task = asyncio.create_task(
+                self._retry_loop(self._game_state.game_id, backoff)
+            )
+
+    async def _retry_loop(self, game_id: int, backoff: float) -> None:
+        """Retry asynchronously, with at most one task for the current game."""
+        task = asyncio.current_task()
+        try:
+            while (
+                self._retry_task is task and self._started and self._game_state.game_id == game_id
+            ):
+                await asyncio.sleep(backoff * 2 ** max(0, self._retry_attempts - 1))
+                if (
+                    self._retry_task is not task
+                    or not self._started
+                    or self._game_state.game_id != game_id
+                ):
+                    return
+                if not self._flushing:
+                    await self._flush()
+        finally:
+            if self._retry_task is task:
+                self._retry_task = None
+                self._retry_attempts = 0
+
     async def _flush(self) -> None:
         """Hand the current game state to the analyzer and drain the buffer.
 
@@ -706,7 +802,7 @@ class MessageScanner:
             return
         phase = self._game_state.current_phase()
         has_alive_list = any(isinstance(event, AliveListEvent) for event in self._buffer)
-        if phase == Phase.REGISTRATION and not has_alive_list:
+        if phase == Phase.REGISTRATION and not has_alive_list and self._retry_task is None:
             logger.bind(channel=_LOGGER_CHANNEL).debug(
                 "flush skipped: phase=registration (game not started)",
             )
@@ -715,6 +811,7 @@ class MessageScanner:
             return
         if phase == Phase.END:
             logger.bind(channel=_LOGGER_CHANNEL).debug("flush skipped: phase=end")
+            self._cancel_retry()
             self._buffer.clear()
             self._cancel_debounce()
             return
@@ -743,11 +840,13 @@ class MessageScanner:
                         str(e),
                     )
             if not result.success or response is None:
+                self._schedule_retry(result.error)
                 logger.bind(channel=_LOGGER_CHANNEL).warning(
                     "flush failed: {}",
                     result.error,
                 )
             else:
+                self._cancel_retry()
                 logger.bind(channel=_LOGGER_CHANNEL).info(
                     "flush ok: {} predictions, {}s",
                     len(response.analysis),
@@ -818,7 +917,7 @@ class MessageScanner:
     @property
     def name_to_id(self) -> dict[str, int]:
         """Return a copy of the nickname → player id mapping."""
-        return dict(self._name_to_id)
+        return dict(self._game_state.name_to_id)
 
     @property
     def buffer_size(self) -> int:

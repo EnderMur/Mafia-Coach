@@ -172,7 +172,10 @@ CREATE TABLE games (
     started_at      TIMESTAMP,
     ended_at        TIMESTAMP,
     player_count    INTEGER,
-    winner_faction  TEXT                       -- town|mafia|neutral
+    winner_faction  TEXT                       -- town|mafia|neutral|mixed|unknown|NULL
+                                               -- NULL: END_GAME не было (закрытая партия заброшена)
+                                               -- mixed: победители из нескольких фракций
+                                               -- unknown: роль не распознана или нет победителей
 );
 
 -- Участие игрока в партии
@@ -252,7 +255,11 @@ CREATE TABLE player_style (
 }
 ```
 
-Все предсказания сохраняются в `predictions` со всеми полями, включая `reasoning`.
+`reasoning` в ответе может отсутствовать, быть `null` или пустой строкой.
+В `predictions.reasoning` сохраняется полный `AnalysisResponse.reasoning`; если
+он отсутствует или пуст, сохраняются `reasons` конкретного игрока, соединённые
+переводами строк. Причины по каждому игроку отдельно сохраняются в
+`predictions_history.reasoning` как строки, соединённые переводами строк.
 
 ---
 
@@ -328,6 +335,9 @@ CREATE TABLE player_style (
 
 На текущий момент открытых вопросов нет. Новые вопросы формулируются
 по итогам dogfooding и фиксируются здесь до решения владельцем.
+
+Зафиксированное ограничение v1: поздний END_GAME для сканера не детектируется
+(`game_id` присваивается текущий). См. `docs/architecture.md`.
 
 ### 13.2 Закрытые (шаг 12b)
 

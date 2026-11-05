@@ -439,3 +439,218 @@ async def test_e2e_end_game_auto_retro_with_persist_player(
     assert labels == {PLAYER_A: 1, PLAYER_B: 1}
 
     await orchestrator.shutdown()
+
+
+async def test_two_games_without_reset_keep_data_separate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """GAME_START создаёт отдельную партию и завершает ретроспективу предыдущей."""
+    monkeypatch.setattr("app.orchestrator._RETRO_DELAY_SEC", 0.01)
+    env = build_end_game_environment(tmp_path)
+    orch = env.orchestrator
+    scanner = orch._default_scanner(CHAT_ID_E2E)
+    orch._scanner = scanner
+    await scanner.start()
+    try:
+        start = "Город ветров начинает свою игру над жителями!"
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", start, 1))
+        assert orch._result.game_state.game_id == env.game_id
+        env.game_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=env.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.DAY, day_number=1
+                ),
+            )
+        )
+        for i, (pid, name) in enumerate(((PLAYER_A, "Вася"), (PLAYER_B, "Петя"))):
+            await scanner._on_event(
+                telegram_event(pid, name, "Я думаю, что это подозрительно", 2 + i)
+            )
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", END_GAME_TEXT, 5))
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", start, 6))
+        new_state = orch._result.game_state
+        assert new_state.game_id != env.game_id
+        previous = env.repos.games.get_game(env.game_id)
+        assert previous["ended_at"] is not None
+        assert previous["winner_faction"] == "mafia"
+        assert not new_state.players()
+        assert len(new_state.events_by_kind("phase_change")) == 1
+        assert new_state.events()[0].game_id == new_state.game_id
+        new_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=new_state.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.DAY, day_number=1
+                ),
+            )
+        )
+        await scanner._on_event(telegram_event(PLAYER_A, "Вася", "Во второй игре я мирный", 7))
+        old_player = env.repos.game_players.get_player_in_game(
+            game_id=env.game_id, player_id=PLAYER_A
+        )
+        new_player = env.repos.game_players.get_player_in_game(
+            game_id=new_state.game_id, player_id=PLAYER_A
+        )
+        assert old_player is not None and old_player["final_role"] == "Мафия"
+        assert new_player is not None and new_player["final_role"] is None
+        assert env.repos.predictions.list_predictions(env.game_id)
+        assert env.repos.predictions.list_predictions(new_state.game_id)
+        ids = env.conn.execute("SELECT DISTINCT game_id FROM events").fetchall()
+        assert {row[0] for row in ids} == {env.game_id, new_state.game_id}
+        assert all(event.game_id == new_state.game_id for event in new_state.events())
+    finally:
+        await scanner.shutdown()
+        env.conn.close()
+
+
+@pytest.mark.parametrize(
+    ("winners", "expected"),
+    [
+        ([("А", "Доктор"), ("Б", "Мирный")], "town"),
+        ([("А", "Дон"), ("Б", "Мафия")], "mafia"),
+        ([("А", "Маньяк")], "neutral"),
+        ([("А", "Доктор"), ("Б", "Маньяк")], "mixed"),
+        ([("А", "Мафия"), ("Б", "Неизвестная роль")], "unknown"),
+        ([], "unknown"),
+    ],
+)
+async def test_end_game_winner_faction(
+    tmp_path: Path, winners: list[tuple[str, str]], expected: str
+) -> None:
+    from domain.events import EndGamePayload
+
+    env = build_end_game_environment(tmp_path)
+    event = EndGameEvent(ts=BASE_TS, game_id=env.game_id, payload=EndGamePayload(winners=winners))
+    try:
+        await env.orchestrator._persist_event(event)
+        game = env.repos.games.get_game(env.game_id)
+        assert game["winner_faction"] == expected
+        assert game["ended_at"] is not None
+    finally:
+        await env.orchestrator.shutdown()
+
+
+async def test_start_closes_abandoned_game_and_resets_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from unittest.mock import Mock
+
+    retro = Mock()
+    monkeypatch.setattr("features.memory.retro.retro_analyze", retro)
+    env = build_end_game_environment(tmp_path)
+    orch = env.orchestrator
+    scanner = orch._default_scanner(CHAT_ID_E2E)
+    orch._scanner = scanner
+    await scanner.start()
+    try:
+        await scanner._on_event(telegram_event(PLAYER_A, "Вася", "Привет", 1))
+        env.game_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=env.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", "Город ветров начинает игру", 2))
+        row = env.repos.games.get_game(env.game_id)
+        assert row["ended_at"] is not None and row["winner_faction"] is None
+        state = orch._result.game_state
+        assert state.game_id != env.game_id
+        assert not state.players() and not state.registered_ids
+        assert state.resolve_name("Вася") is None
+        assert state.current_day() == 0 and state.current_phase() is Phase.REGISTRATION
+        retro.assert_not_called()
+    finally:
+        await orch.shutdown()
+
+
+async def test_duplicate_start_does_not_close_or_reset(tmp_path: Path) -> None:
+    env = build_end_game_environment(tmp_path)
+    orch = env.orchestrator
+    scanner = orch._default_scanner(CHAT_ID_E2E)
+    orch._scanner = scanner
+    await scanner.start()
+    try:
+        start = "Город ветров начинает игру"
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", start, 1))
+        await scanner._on_event(telegram_event(PLAYER_A, "Вася", "Привет", 2))
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", start, 3))
+        assert orch._result.game_state.game_id == env.game_id
+        assert env.repos.games.get_game(env.game_id)["ended_at"] is None
+        assert orch._result.game_state.player(PLAYER_A).display_name == "Вася"
+        assert scanner.name_to_id["Вася"] == PLAYER_A
+    finally:
+        await orch.shutdown()
+
+
+async def test_unknown_to_registration_keeps_bootstrap_game(tmp_path: Path) -> None:
+    env = build_end_game_environment(tmp_path)
+    orch = env.orchestrator
+    scanner = orch._default_scanner(CHAT_ID_E2E)
+    orch._scanner = scanner
+    await scanner.start()
+    try:
+        env.game_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=env.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.UNKNOWN, day_number=0
+                ),
+            )
+        )
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", "Город ветров начинает игру", 1))
+        assert orch._result.game_state.game_id == env.game_id
+        assert len(env.repos.games.list_games()) == 1
+    finally:
+        await orch.shutdown()
+
+
+async def test_late_end_game_is_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import Mock
+
+    from loguru import logger
+
+    from domain.events import EndGamePayload
+
+    env = build_end_game_environment(tmp_path)
+    orch = env.orchestrator
+    scanner = orch._default_scanner(CHAT_ID_E2E)
+    orch._scanner = scanner
+    await scanner.start()
+    retro = Mock()
+    monkeypatch.setattr("features.memory.retro.retro_analyze", retro)
+    logs: list[str] = []
+    sink = logger.add(lambda message: logs.append(str(message)), level="WARNING")
+    try:
+        env.game_state.apply(
+            PhaseChangeEvent(
+                ts=BASE_TS,
+                game_id=env.game_id,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+                ),
+            )
+        )
+        await scanner._on_event(telegram_event(BOT_ID, "Бот", "Город ветров начинает игру", 1))
+        old_events = env.repos.events.list_events(env.game_id)
+        current = orch._result.game_state
+        event = EndGameEvent(
+            ts=BASE_TS, game_id=env.game_id, payload=EndGamePayload(winners=[("А", "Мафия")])
+        )
+        await orch._persist_event(event)
+        assert env.repos.events.list_events(env.game_id) == old_events
+        assert env.repos.games.get_game(env.game_id)["winner_faction"] is None
+        assert orch._result.game_state is current and current.current_phase() is Phase.REGISTRATION
+        assert any(
+            f"event game_id={env.game_id}, current game_id={current.game_id}" in msg for msg in logs
+        )
+        retro.assert_not_called()
+    finally:
+        logger.remove(sink)
+        await orch.shutdown()

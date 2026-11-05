@@ -24,7 +24,7 @@ response is assembled after generation completes.
 | `analysis[].reasons` | list of strings | yes | Between one and five entries |
 | Primary and alternative confidence total | float | when alternative exists | At most 1.0 |
 | `game_read` | string | yes | Non-empty summary |
-| `reasoning` | string | yes | Non-empty explanation |
+| `reasoning` | string or null | no | Full explanation; empty, null, or absent is permitted |
 
 The response and nested prediction models are immutable and reject undeclared
 fields. The `analysis` collection may be empty when no usable predictions remain.
@@ -35,9 +35,12 @@ JSON is parsed and validated against the Pydantic schema. Schema errors are
 returned to the caller for retry handling.
 
 1. Confidence values outside the supported range are clamped with a warning.
-2. Unknown role names are passed to the optional alias resolver. Unresolved
-   primary roles cause that prediction to be dropped; unresolved alternatives
-   are removed while retaining the primary prediction.
+2. Unknown role names are passed to the optional alias resolver. If the primary
+   remains unresolved but the alternative resolves, its canonical role and
+   confidence become primary, `alternative` is cleared, and INFO is logged.
+   Otherwise an unresolved primary drops the prediction with a warning (the
+   `неизвестно` placeholder remains silent); an unresolved alternative is
+   removed while retaining a valid primary.
 3. Predictions for player identifiers outside the active game are dropped.
 4. If primary and alternative confidence total exceeds one beyond floating
    point tolerance, both values are normalized proportionally and a warning is
@@ -77,18 +80,17 @@ no hard-coded «Мирный житель — 1 из 30» claim.
 Role notes are filtered to roles actually present in the composition, so a small
 local model is not distracted by 21 role descriptions when only 14 roles are in
 the game. `GameAnalyzer` additionally loads the previous predictions from
-SQLite, reverts unjustified role flips and fills missing composition slots;
-corrections are exposed as `AnalysisResult.warnings`. The response JSON schema
-(`AnalysisResponse`) is unchanged.
+SQLite, reverts unjustified role flips and fills missing composition slots only
+when role quotas sum to the number of alive players. A mismatch is logged and
+reported in `AnalysisResult.warnings`; missing slots remain unfilled.
 
 ## Reasoning channel
 
-Reasoning for the Reasoning Window and `logs/reasoning.log` is taken ONLY from
-`delta.reasoning_content` (vLLM/Qwen-style) or `delta.reasoning` (some LM Studio
-builds). `delta.content` is used exclusively to accumulate the final JSON and is
-NEVER passed to the reasoning channel. If the loaded model does not emit
-dedicated reasoning (a non-thinking model), the channel remains empty; this is
-expected behavior, not an error.
+Reasoning for the Reasoning Window and `logs/reasoning.log` comes from
+`delta.reasoning_content` or `delta.reasoning`. If no reasoning was streamed,
+the analyzer falls back to the JSON `reasoning` field. Raw `delta.content` is
+not forwarded to the reasoning channel. If neither source has reasoning,
+the channel remains empty.
 
 The HTTP-request budget for one `analyze()` or `analyze_stream()` call is limited
 to `max_retries` (≤ 3) and includes schema fallback and validation retry. A 404
@@ -107,10 +109,15 @@ request transport, and streaming orchestration are implemented in later layers.
   Drift is caught by `test_default_response_schema_matches_contract` in
   `tests/unit/features/analyzer/`. **Whenever `AnalysisResponse` changes,
   update `DEFAULT_RESPONSE_SCHEMA_JSON`.**
-- `predictions.reasoning` in the database stores `PlayerPrediction.reasons`
-  joined with `\n`, not the model's full chain of thought. The full chain of thought
-  is written to `logs/reasoning.log` through `channel="reasoning"` (one line per
-  cycle, truncated to `reasoning_max_chars`).
+- `predictions.reasoning` хранит полный `AnalysisResponse.reasoning` без
+  усечения. Если он пуст, равен `null` или отсутствует, сохраняются
+  `PlayerPrediction.reasons` соответствующего игрока через `\n`.
+  `predictions_history.reasoning` отдельно сохраняет причины игрока через `\n`.
+  Канал `logs/reasoning.log` использует ограничение `reasoning_max_chars`.
+
+  Например, при `reasoning = "Общий анализ партии"` и `reasons = ["аргумент"]`
+  текущая запись содержит `"Общий анализ партии"`, а история — `"аргумент"`.
+  При пустом или отсутствующем `reasoning` текущая запись содержит `"аргумент"`.
 - `analysis_failed` is only a log marker (`channel="llm"`, level `ERROR`), with
   no dedicated table. If a mechanism to retry an analysis later is needed, add a
   `status` column to `predictions` in step 12 or later.
