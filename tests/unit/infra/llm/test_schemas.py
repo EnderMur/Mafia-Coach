@@ -600,9 +600,7 @@ def test_pattern_ids_one_vs_descriptions_two_is_normalized() -> None:
     assert prediction.pattern_ids == ["#2"]
     assert prediction.pattern_descriptions == ["desc a"]
     assert len(prediction.pattern_ids) == len(prediction.pattern_descriptions)
-    assert any(
-        "100" in warning and "1" in warning and "2" in warning for warning in warnings
-    )
+    assert any("100" in warning and "1" in warning and "2" in warning for warning in warnings)
 
 
 @pytest.mark.parametrize(
@@ -614,11 +612,7 @@ def test_empty_or_invalid_pattern_list_forces_both_empty(
 ) -> None:
     """If either pattern list is empty (or not a list), both become empty."""
     raw = response_json(
-        [
-            valid_prediction(
-                pattern_ids=pattern_ids, pattern_descriptions=pattern_descriptions
-            )
-        ]
+        [valid_prediction(pattern_ids=pattern_ids, pattern_descriptions=pattern_descriptions)]
     )
     result, _warnings = validate_response(
         raw,
@@ -632,9 +626,7 @@ def test_empty_or_invalid_pattern_list_forces_both_empty(
 def test_model_validator_still_rejects_mismatched_pattern_lists() -> None:
     """The equality invariant stays in the model; only raw data is normalized."""
     raw = json.loads(
-        response_json(
-            [valid_prediction(pattern_ids=["#2"], pattern_descriptions=["a", "b"])]
-        )
+        response_json([valid_prediction(pattern_ids=["#2"], pattern_descriptions=["a", "b"])])
     )
     with pytest.raises(ValidationError, match="same length"):
         AnalysisResponse.model_validate(raw)
@@ -667,9 +659,7 @@ def test_pattern_alignment_also_applies_to_null_role() -> None:
 
 def test_null_role_without_messages_or_votes_is_not_dropped() -> None:
     """FIX-LOG-ANALYSIS C: null + no data → role=null, 0.0, 'нет данных'."""
-    raw = response_json(
-        [valid_prediction(suspected_role=None, confidence=0.42, reason="не знаю")]
-    )
+    raw = response_json([valid_prediction(suspected_role=None, confidence=0.42, reason="не знаю")])
     result, warnings = validate_response(
         raw,
         known_player_ids=frozenset({100}),

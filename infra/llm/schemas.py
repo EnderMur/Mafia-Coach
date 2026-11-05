@@ -406,9 +406,7 @@ def _normalize_null_roles(
         for item in analysis
         if isinstance(item, dict) and isinstance(item.get("suspected_role"), str)
     }
-    fallback_role: str | None = next(
-        (role for role in catalogue if role not in used_roles), None
-    )
+    fallback_role: str | None = next((role for role in catalogue if role not in used_roles), None)
     if fallback_role is None and catalogue:
         fallback_role = catalogue[0]
 

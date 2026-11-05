@@ -1505,9 +1505,7 @@ async def test_null_role_with_messages_is_filled_from_bot_composition(
 
     llm = FakeLLMClient()
     llm.set_response(validated)
-    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(
-        state, persist=False
-    )
+    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state, persist=False)
     assert result.success and result.response is not None
     assert len(result.response.analysis) == 1
     prediction = result.response.analysis[0]
