@@ -1444,3 +1444,158 @@ async def test_send_stats_shows_whitelisted_placeholder(tmp_path: Path) -> None:
         assert {row.player_name for row in ui.stats[-1].rows} == {"A", "| user_4"}
     finally:
         await orchestrator.shutdown()
+
+
+async def test_merge_normalized_placeholder_preserves_final_role_and_prediction(
+    tmp_path: Path,
+) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    game_id = state.game_id
+    real_id = 456
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    state.register_player(real_id, "Дмитрий")
+    state.register_player(placeholder_id, "| Дмитрий")
+    for pid, name in ((real_id, "Дмитрий"), (placeholder_id, "| Дмитрий")):
+        await orchestrator._persist_player(pid, name)
+    result.repos.game_players.set_final_role(
+        game_id=game_id,
+        player_id=placeholder_id,
+        final_role="Мафия",
+        survived=False,
+        is_winner=True,
+    )
+    result.repos.predictions.upsert_prediction(
+        game_id=game_id,
+        player_id=placeholder_id,
+        predicted_role="Мафия",
+        confidence=0.8,
+        reasoning="Тест",
+    )
+    await orchestrator._merge_placeholder_players(state)
+    row = result.repos.game_players.get_player_in_game(game_id=game_id, player_id=real_id)
+    assert row is not None and row["final_role"] == "Мафия"
+    assert row["survived"] == 0 and row["is_winner"] == 1
+    assert (
+        result.repos.game_players.get_player_in_game(game_id=game_id, player_id=placeholder_id)
+        is None
+    )
+    assert result.repos.players.get_player(placeholder_id) is None
+    assert [r["player_id"] for r in result.repos.predictions.list_predictions(game_id)] == [real_id]
+    await orchestrator.shutdown()
+
+
+async def test_merge_does_not_join_different_real_names(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    for pid, name in ((456, "Дмитрий"), (457, "Пётр")):
+        state.register_player(pid, name)
+        await orchestrator._persist_player(pid, name)
+    await orchestrator._merge_placeholder_players(state)
+    assert {r["player_id"] for r in result.repos.game_players.list_game_players(state.game_id)} == {
+        456,
+        457,
+    }
+    await orchestrator.shutdown()
+
+
+async def test_merge_ambiguous_real_players_warns_and_leaves_placeholder(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    for pid, name in ((456, "Дмитрий"), (457, "ДМИТРИЙ"), (placeholder_id, "| Дмитрий")):
+        state.register_player(pid, name)
+        await orchestrator._persist_player(pid, name)
+    logs: list[str] = []
+    sink = logger.add(lambda message: logs.append(str(message)), level="WARNING")
+    try:
+        await orchestrator._merge_placeholder_players(state)
+        assert {
+            r["player_id"] for r in result.repos.game_players.list_game_players(state.game_id)
+        } == {456, 457, placeholder_id}
+        assert any("ambiguous" in message and str(placeholder_id) in message for message in logs)
+    finally:
+        logger.remove(sink)
+        await orchestrator.shutdown()
+
+
+async def test_merge_finds_placeholder_after_real_speech_collapsed_state(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    state.register_player(placeholder_id, "| Дмитрий")
+    await orchestrator._persist_player(placeholder_id, "| Дмитрий")
+    result.repos.game_players.set_final_role(
+        game_id=state.game_id, player_id=placeholder_id, final_role="Мафия"
+    )
+    state.register_player(456, "Дмитрий")
+    await orchestrator._persist_player(456, "Дмитрий")
+    assert all(p.player_id != placeholder_id for p in state.players())
+    await orchestrator._merge_placeholder_players(state)
+    row = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=456)
+    assert row is not None and row["final_role"] == "Мафия"
+    assert result.repos.players.get_player(placeholder_id) is None
+    await orchestrator.shutdown()
+
+
+async def test_merge_uses_end_game_role_from_placeholder_state(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    placeholder_id = _placeholder_player_id("| Дмитрий")
+    state.register_player(456, "Дмитрий")
+    state.register_player(placeholder_id, "| Дмитрий")
+    # Изолируем старый случай, в котором итоговая роль есть лишь в агрегате.
+    role = result.registry.resolve_alias("Мафия")
+    assert role is not None
+    placeholder = state.player(placeholder_id).model_copy(
+        update={"final_role": role, "is_winner": True}
+    )
+    state._players[placeholder_id] = placeholder
+    for pid, name in ((456, "Дмитрий"), (placeholder_id, "| Дмитрий")):
+        await orchestrator._persist_player(pid, name)
+    await orchestrator._merge_placeholder_players(state)
+    real = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=456)
+    assert real is not None and real["final_role"] == "Мафия" and real["is_winner"] == 1
+    await orchestrator.shutdown()
+
+
+async def test_merge_ambiguous_database_only_real_player_blocks_merge(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    ph = _placeholder_player_id("| Дмитрий")
+    state.register_player(456, "Дмитрий")
+    state.register_player(ph, "| Дмитрий")
+    for pid, name in ((456, "Дмитрий"), (457, "ДМИТРИЙ"), (ph, "| Дмитрий")):
+        await orchestrator._persist_player(pid, name)
+    await orchestrator._merge_placeholder_players(state)
+    assert (
+        result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=ph)
+        is not None
+    )
+    await orchestrator.shutdown()
+
+
+async def test_merge_conflicting_final_roles_rolls_back(tmp_path: Path) -> None:
+    result, _, _ = await make_result(tmp_path)
+    orchestrator = Orchestrator(bootstrap_result=result, enable_ui=False)
+    state = result.game_state
+    ph = _placeholder_player_id("| Дмитрий")
+    for pid, name in ((456, "Дмитрий"), (ph, "| Дмитрий")):
+        state.register_player(pid, name)
+        await orchestrator._persist_player(pid, name)
+    for pid, role in ((456, "Доктор"), (ph, "Мафия")):
+        result.repos.game_players.set_final_role(
+            game_id=state.game_id, player_id=pid, final_role=role
+        )
+    await orchestrator._merge_placeholder_players(state)
+    old = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=ph)
+    real = result.repos.game_players.get_player_in_game(game_id=state.game_id, player_id=456)
+    assert old is not None and old["final_role"] == "Мафия"
+    assert real is not None and real["final_role"] == "Доктор"
+    await orchestrator.shutdown()

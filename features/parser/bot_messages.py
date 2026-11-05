@@ -421,6 +421,11 @@ _ALIVE_LINE_RE: Final[re.Pattern[str]] = re.compile(
 
 # --- death ----------------------------------------------------------------
 
+_RE_DECORATED_SHORT_DEATH: Final[re.Pattern[str]] = re.compile(
+    r"^\s*(?P<name>\|\s*\w)\s+(?:был[а]?\s+)?убит[а]?[.!]?\s*$",
+    re.IGNORECASE,
+)
+
 _RE_DEATH_NIGHT: Final[re.Pattern[str]] = re.compile(
     r"(?i)(?:кто[\-\s]?то\s+(?:был[а]?\s+)?убит"
     r"|кто[\-\s]?то\s+погиб"
@@ -993,6 +998,15 @@ def _parse_death(text: str) -> BotMessageParse | None:
     # notification, NOT a death (checked before any death pattern).
     if _RE_PROTECTION.search(text):
         return None
+
+    short_death = _RE_DECORATED_SHORT_DEATH.fullmatch(text)
+    if short_death is not None:
+        return BotMessageParse(
+            kind=BotMessageKind.DEATH,
+            death_cause="night_kill",
+            player_name=short_death.group("name"),
+            raw_text=text,
+        )
 
     cause: str | None = None
     if _RE_DEATH_LYNCH.search(text):

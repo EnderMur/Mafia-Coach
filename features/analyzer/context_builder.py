@@ -620,15 +620,21 @@ DEFAULT_RESPONSE_SCHEMA_JSON: Final[str] = """
       "type": "string"
     },
     "reasoning": {
-      "minLength": 1,
-      "title": "Reasoning",
-      "type": "string"
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Reasoning"
     }
   },
   "required": [
     "analysis",
-    "game_read",
-    "reasoning"
+    "game_read"
   ],
   "title": "AnalysisResponse",
   "type": "object"

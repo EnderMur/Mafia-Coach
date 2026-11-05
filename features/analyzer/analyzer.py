@@ -159,8 +159,8 @@ class GameAnalyzer:
         When ``previous_predictions`` is omitted, the last persisted predictions
         are loaded from SQLite so the model sees its own earlier decisions
         (otherwise it "forgets" a role and flips it without a reason). A bot
-        composition is enforced afterwards: every alive player gets exactly one
-        role and no role exceeds its reported count.
+        composition is enforced afterwards: quotas cap roles and missing slots
+        are filled only when their total matches the current alive headcount.
         """
         start = time.perf_counter()
         if previous_predictions is None:
@@ -229,11 +229,16 @@ class GameAnalyzer:
 
         # Keep earlier decisions sticky and enforce the bot's exact role slots
         # even when the local model skipped players or exceeded a counter.
-        correction_warnings: list[str] = []
+        live_predictions, live_warnings = self._filter_current_predictions(
+            response.analysis, game_state
+        )
+        if live_warnings:
+            response = response.model_copy(update={"analysis": live_predictions})
         response, correction_warnings = self._postprocess_response(
             response,
             context=context,
             previous_predictions=previous_predictions,
+            game_state=game_state,
         )
 
         reasoning_full = "".join(reasoning_buffer)
@@ -254,9 +259,17 @@ class GameAnalyzer:
                 reasoning_truncated[:200],
             )
 
-        warnings: list[str] = list(correction_warnings)
+        warnings: list[str] = [*live_warnings, *correction_warnings]
         if persist:
+            retained = []
             for prediction in response.analysis:
+                current, dropped_warnings = self._filter_current_predictions(
+                    [prediction], game_state
+                )
+                warnings.extend(dropped_warnings)
+                if not current:
+                    continue
+                retained.append(prediction)
                 try:
                     await asyncio.to_thread(
                         self._predictions_repo.upsert_prediction,
@@ -264,7 +277,7 @@ class GameAnalyzer:
                         player_id=prediction.player_id,
                         predicted_role=prediction.suspected_role,
                         confidence=prediction.confidence,
-                        reasoning="\n".join(prediction.reasons),
+                        reasoning=response.reasoning or "\n".join(prediction.reasons),
                     )
                 except Exception as error:  # noqa: BLE001 — persistence is defensive
                     warnings.append(f"persistence_failed: {error}")
@@ -282,6 +295,9 @@ class GameAnalyzer:
                 except Exception as error:  # noqa: BLE001 — history is optional
                     warnings.append(f"history_failed: {error}")
                     logger.bind(channel="llm").warning("history_failed: {}", str(error))
+
+            if retained != response.analysis:
+                response = response.model_copy(update={"analysis": retained})
 
         return AnalysisResult(
             response=response,
@@ -326,12 +342,32 @@ class GameAnalyzer:
                 continue
         return snapshots
 
+    @staticmethod
+    def _filter_current_predictions(
+        predictions: list[PlayerPrediction], game_state: GameState
+    ) -> tuple[list[PlayerPrediction], list[str]]:
+        """Drop predictions for players missing or dead in the current game state."""
+        current = {player.player_id: player for player in game_state.players()}
+        kept: list[PlayerPrediction] = []
+        warnings: list[str] = []
+        for prediction in predictions:
+            player = current.get(prediction.player_id)
+            if player is not None and player.alive:
+                kept.append(prediction)
+                continue
+            status = "missing" if player is None else "dead"
+            warning = f"prediction_dropped: player {prediction.player_id} is {status}"
+            warnings.append(warning)
+            logger.bind(channel="llm").warning("{}", warning)
+        return kept, warnings
+
     def _postprocess_response(
         self,
         response: AnalysisResponse,
         *,
         context: LLMContext,
         previous_predictions: list[PredictionSnapshot],
+        game_state: GameState,
     ) -> tuple[AnalysisResponse, list[str]]:
         """Keep role continuity, then enforce the bot's exact composition."""
         warnings: list[str] = []
@@ -366,7 +402,9 @@ class GameAnalyzer:
                 adjusted.append(prediction)
 
         if context.role_count:
-            adjusted, composition_warnings = self._enforce_composition(adjusted, context)
+            adjusted, composition_warnings = self._enforce_composition(
+                adjusted, context, game_state
+            )
             warnings.extend(composition_warnings)
 
         # Preserve object identity for unmodified responses (tests and callers
@@ -379,8 +417,9 @@ class GameAnalyzer:
         self,
         predictions: list[PlayerPrediction],
         context: LLMContext,
+        game_state: GameState,
     ) -> tuple[list[PlayerPrediction], list[str]]:
-        """Return one prediction per alive player, with exact role quotas.
+        """Cap role quotas and fill missing predictions only for a complete composition.
 
         The model may skip silent players, repeat ``Мафия`` too often, or name a
         role that is not in the bot's composition. Those entries are corrected
@@ -388,7 +427,7 @@ class GameAnalyzer:
         """
         warnings: list[str] = []
         quota = dict(context.role_count or {})
-        alive = [player for player in context.players if player.alive]
+        alive = game_state.alive_players()
         alive_ids = [player.player_id for player in alive]
         alive_set = set(alive_ids)
         names_by_id = {player.player_id: player.display_name for player in alive}
@@ -422,6 +461,16 @@ class GameAnalyzer:
                 if role != prediction.suspected_role
                 else prediction
             )
+
+        total_slots = sum(quota.values())
+        if total_slots != len(alive_set):
+            warning = (
+                f"composition_mismatch: role slots={total_slots}, "
+                f"alive players={len(alive_set)}; deterministic filling skipped"
+            )
+            warnings.append(warning)
+            logger.bind(channel="llm").warning("{}", warning)
+            return [kept[pid] for pid in alive_ids if pid in kept], warnings
 
         remaining: list[str] = []
         for role, count in quota.items():

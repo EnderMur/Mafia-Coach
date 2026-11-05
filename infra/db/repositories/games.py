@@ -27,14 +27,19 @@ class GamesRepository:
 
     def finish_game(self, *, game_id: int, winner_faction: str) -> None:
         """Finish a game with a validated winning faction."""
-        try:
-            faction = Faction(winner_faction)
-        except ValueError as error:
-            raise ConfigError(f"invalid winner faction: {winner_faction}") from error
-
+        if winner_faction not in {faction.value for faction in Faction} | {"mixed", "unknown"}:
+            raise ConfigError(f"invalid winner faction: {winner_faction}")
         cursor = self._conn.execute(
             "UPDATE games SET ended_at = CURRENT_TIMESTAMP, winner_faction = ? WHERE id = ?",
-            (faction.value, game_id),
+            (winner_faction, game_id),
+        )
+        if cursor.rowcount == 0:
+            raise ConfigError(f"game {game_id} not found")
+
+    def close_game(self, *, game_id: int) -> None:
+        """Close a previous game without changing its winner."""
+        cursor = self._conn.execute(
+            "UPDATE games SET ended_at = CURRENT_TIMESTAMP WHERE id = ?", (game_id,)
         )
         if cursor.rowcount == 0:
             raise ConfigError(f"game {game_id} not found")

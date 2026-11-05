@@ -64,7 +64,7 @@ class AnalysisResponse(BaseModel):
 
     analysis: list[PlayerPrediction]
     game_read: str = Field(min_length=1)
-    reasoning: str = Field(min_length=1)
+    reasoning: str | None = None
 
 
 def validate_response(
@@ -102,6 +102,29 @@ def validate_response(
             prediction.suspected_role, role_names_ru, role_alias_resolver
         )
         if canonical_role is None:
+            alternative = prediction.alternative
+            canonical_alternative = (
+                _resolve_role(alternative.role, role_names_ru, role_alias_resolver)
+                if alternative is not None
+                else None
+            )
+            if alternative is not None and canonical_alternative is not None:
+                logger.bind(channel="llm").info(
+                    "unknown role {!r} for player {}; using alternative {!r}",
+                    prediction.suspected_role,
+                    prediction.player_id,
+                    canonical_alternative,
+                )
+                validated_predictions.append(
+                    prediction.model_copy(
+                        update={
+                            "suspected_role": canonical_alternative,
+                            "confidence": alternative.confidence,
+                            "alternative": None,
+                        }
+                    )
+                )
+                continue
             if "неизвест" in prediction.suspected_role.lower():
                 logger.bind(channel="llm").debug(
                     "unknown role placeholder for player {}; prediction dropped",

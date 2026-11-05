@@ -14,11 +14,12 @@ from loguru import logger
 from app.bootstrap import BootstrapResult, shutdown_result
 from domain.events import AnyEvent, EndGameEvent
 from domain.exceptions import ConfigError
-from domain.game_state import GameState
-from domain.names import names_match
+from domain.game_state import GameState, Player
+from domain.names import name_match_keys, names_match
 from features.scanner.scanner import MessageScanner
 from features.ui.protocol import ReasoningMessage, StatsMessage, StatsRow
 from features.ui.window_host import WindowHost
+from infra.db.connection import transaction
 
 _LOGGER_CHANNEL: str = "orchestrator"
 _ATTACH_PROMPT: str = "Введите номер чата для подключения (или пустую строку для отмены): "
@@ -128,7 +129,6 @@ class Orchestrator:
         self._quit_event = asyncio.Event()
         self._command_task: asyncio.Task[None] | None = None
         self._shutdown_complete = False
-        self._registered_player_ids: set[int] = set()
         self._player_persistence_lock = asyncio.Lock()
         # Serializes every sqlite3 access handed to ``asyncio.to_thread``: a
         # single ``sqlite3.Connection`` is not usable from two threads at once
@@ -139,6 +139,11 @@ class Orchestrator:
         # END_GAME retro is deferred, not run inline with event persistence.
         self._pending_retro: bool = False
         self._pending_retro_task: asyncio.Task[None] | None = None
+
+    @property
+    def _registered_player_ids(self) -> set[int]:
+        """Per-game cache of persisted players."""
+        return self._result.game_state.persisted_ids
 
     def _default_scanner(self, chat_id: int) -> MessageScanner:
         """Build the production scanner with persistence and UI callbacks wired in."""
@@ -157,7 +162,28 @@ class Orchestrator:
             on_event=self._persist_event,
             on_reasoning=self._send_reasoning,
             on_flush_complete=self._send_stats,
+            on_new_game=self._new_game_from_start,
         )
+
+    async def _new_game_from_start(self) -> GameState:
+        """Finish pending work for the old game and create a fresh aggregate."""
+        pending = self._pending_retro_task
+        if pending is not None and not pending.done():
+            await pending
+        scanner = self._scanner
+        while scanner is not None and scanner.is_flushing:
+            await asyncio.sleep(0.05)
+        if self._chat_id is None:
+            raise RuntimeError("Невозможно создать партию без подключённого чата")
+        async with self._db_lock:
+            await asyncio.to_thread(
+                self._result.repos.games.close_game, game_id=self._result.game_state.game_id
+            )
+            game_id = await asyncio.to_thread(
+                self._result.repos.games.create_game, chat_id=self._chat_id, player_count=0
+            )
+        self._result.game_state = self._result.game_state.reset_for_new_game(game_id)
+        return self._result.game_state
 
     async def run(self) -> None:
         """Start the configured/selected chat and wait for quit or stdin EOF.
@@ -346,7 +372,32 @@ class Orchestrator:
         """
         try:
             async with self._db_lock:
+                if (
+                    isinstance(event, EndGameEvent)
+                    and event.game_id != self._result.game_state.game_id
+                ):
+                    logger.bind(channel=_LOGGER_CHANNEL).warning(
+                        "late END_GAME ignored: event game_id={}, current game_id={}",
+                        event.game_id,
+                        self._result.game_state.game_id,
+                    )
+                    return
                 await asyncio.to_thread(self._result.repos.events.insert_event, event)
+                if isinstance(event, EndGameEvent):
+                    roles = [
+                        self._result.registry.resolve_alias(role_name.strip())
+                        for _, role_name in event.payload.winners
+                    ]
+                    if not roles or any(role is None for role in roles):
+                        winner_faction = "unknown"
+                    else:
+                        factions = {role.faction.value for role in roles if role is not None}
+                        winner_faction = next(iter(factions)) if len(factions) == 1 else "mixed"
+                    await asyncio.to_thread(
+                        self._result.repos.games.finish_game,
+                        game_id=event.game_id,
+                        winner_faction=winner_faction,
+                    )
         except Exception as error:  # noqa: BLE001 — defensive callback boundary
             logger.bind(channel=_LOGGER_CHANNEL).error(
                 "persist event failed: {}: {}",
@@ -396,60 +447,118 @@ class Orchestrator:
             self._pending_retro = False
 
     async def _merge_placeholder_players(self, game_state: GameState) -> None:
-        """Collapse ``placeholder + real`` pairs that share a ``display_name``.
+        """Merge unambiguous normalized name groups, preserving ground truth."""
+        players = {player.player_id: player for player in game_state.players()}
+        names = {pid: player.display_name for pid, player in players.items()}
 
-        ``ALIVE_LIST`` registers every name with a synthetic negative id before
-        speech reveals the real Telegram id, so one person can exist twice in
-        ``game_state``, ``players`` and ``game_players``. The real id keeps the
-        row: predictions and participation move over, the placeholder rows are
-        deleted (``players.delete_player`` refuses positive ids).
+        # A placeholder can already have disappeared from GameState when its
+        # real player spoke, while the older participation row remains in SQLite.
+        async with self._db_lock:
+            rows = await asyncio.to_thread(
+                self._result.repos.game_players.list_game_players, game_state.game_id
+            )
+            for row in rows:
+                pid = int(row["player_id"])
+                if pid in names:
+                    continue
+                db_player = await asyncio.to_thread(self._result.repos.players.get_player, pid)
+                if db_player is not None and db_player["username"]:
+                    names[pid] = str(db_player["username"])
 
-        Best-effort: a failed pair is logged and the remaining pairs still run,
-        because retro must not be blocked by cleanup.
-        """
-        by_display: dict[str, list[int]] = {}
-        for p in game_state.players():
-            by_display.setdefault(p.display_name, []).append(p.player_id)
-
-        for display_name, pids in by_display.items():
-            if len(pids) <= 1:
+        # The comparison is not necessarily transitive: connect all overlapping
+        # key sets and reject the entire component if it contains multiple reals.
+        remaining = set(names)
+        while remaining:
+            first = min(remaining)
+            group = {first}
+            remaining.remove(first)
+            keys = set(name_match_keys(names[first]))
+            while True:
+                adjacent = {pid for pid in remaining if keys & name_match_keys(names[pid])}
+                if not adjacent:
+                    break
+                for pid in adjacent:
+                    keys.update(name_match_keys(names[pid]))
+                group.update(adjacent)
+                remaining.difference_update(adjacent)
+            reals = [pid for pid in group if pid > 0]
+            placeholders = [pid for pid in group if pid < 0]
+            if not reals or not placeholders:
                 continue
-            real = [pid for pid in pids if pid > 0]
-            placeholders = [pid for pid in pids if pid < 0]
-            if not real or not placeholders:
+            if len(reals) != 1:
+                logger.bind(channel=_LOGGER_CHANNEL).warning(
+                    "ambiguous normalized names: placeholders={} real_ids={}",
+                    sorted(placeholders),
+                    sorted(reals),
+                )
                 continue
-            keeper = real[0]
-            for ph in placeholders:
+            keeper = reals[0]
+            keeper_player = players.get(keeper)
+            if keeper_player is not None:
+                await self._persist_player(keeper, keeper_player.display_name)
+            for ph in sorted(placeholders):
+                placeholder = players.get(ph)
+                if placeholder is not None:
+                    await self._persist_player(ph, placeholder.display_name)
+
+                def merge(ph: int, keeper: int, placeholder: Player | None) -> None:
+                    with transaction(self._result.conn):
+                        repo = self._result.repos.game_players
+                        old = repo.get_player_in_game(game_id=game_state.game_id, player_id=ph)
+                        real = repo.get_player_in_game(game_id=game_state.game_id, player_id=keeper)
+                        if old is None or real is None:
+                            raise ConfigError("missing participation row for merge")
+                        final_role = (
+                            placeholder.final_role.name_ru
+                            if placeholder is not None and placeholder.final_role is not None
+                            else old["final_role"]
+                        )
+                        if final_role is not None:
+                            if real["final_role"] is not None and real["final_role"] != final_role:
+                                raise ConfigError("conflicting final roles for merge")
+                            repo.set_final_role(
+                                game_id=game_state.game_id,
+                                player_id=keeper,
+                                final_role=str(final_role),
+                                survived=(
+                                    None
+                                    if real["survived"] is not None
+                                    else bool(old["survived"])
+                                    if old["survived"] is not None
+                                    else placeholder.alive
+                                    if placeholder is not None
+                                    and placeholder.final_role is not None
+                                    else None
+                                ),
+                                is_winner=(
+                                    None
+                                    if real["is_winner"] is not None
+                                    else bool(old["is_winner"])
+                                    if old["is_winner"] is not None
+                                    else placeholder.is_winner
+                                    if placeholder is not None
+                                    else None
+                                ),
+                            )
+                        self._result.repos.predictions.merge_player(
+                            from_player_id=ph, to_player_id=keeper, game_id=game_state.game_id
+                        )
+                        repo.delete_player(game_id=game_state.game_id, player_id=ph)
+                        self._result.repos.players.delete_player(player_id=ph)
+
                 try:
                     async with self._db_lock:
-                        await asyncio.to_thread(
-                            self._result.repos.predictions.merge_player,
-                            from_player_id=ph,
-                            to_player_id=keeper,
-                            game_id=game_state.game_id,
-                        )
-                        await asyncio.to_thread(
-                            self._result.repos.game_players.delete_player,
-                            game_id=game_state.game_id,
-                            player_id=ph,
-                        )
-                        await asyncio.to_thread(
-                            self._result.repos.players.delete_player,
-                            player_id=ph,
-                        )
-                except Exception as e:  # noqa: BLE001 — merge is best-effort
+                        await asyncio.to_thread(merge, ph, keeper, placeholder)
+                except Exception as error:  # noqa: BLE001 — best-effort merge
                     logger.bind(channel=_LOGGER_CHANNEL).warning(
                         "merge placeholder {} → {} ({}) failed: {}: {}",
                         ph,
                         keeper,
-                        display_name,
-                        type(e).__name__,
-                        str(e),
+                        names[ph],
+                        type(error).__name__,
+                        str(error),
                     )
                 else:
-                    # Keep the dropped id marked as persisted: ``_run_retro``
-                    # persists every missing player afterwards, and re-inserting
-                    # the placeholder would undo this merge (dangling rows).
                     self._registered_player_ids.add(ph)
 
     async def _persist_final_roles(self, game_state: GameState, game_id: int) -> None:
@@ -724,7 +833,6 @@ class Orchestrator:
                     self._result.repos.games.create_game, chat_id=chat_id, player_count=0
                 )
             self._result.game_state = GameState(game_id=gid, registry=self._result.registry)
-            self._registered_player_ids.clear()
             await self._start_scanner(chat_id)
         except Exception as error:  # noqa: BLE001 — command boundary
             print(f"Reset failed: {error}", flush=True)

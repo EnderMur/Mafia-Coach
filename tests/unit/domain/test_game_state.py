@@ -236,21 +236,48 @@ def test_phase_change_updates_phase_and_day(game: GameState) -> None:
     assert game.current_day() == 1
 
 
-def test_phase_change_to_day_increments_day(game: GameState) -> None:
-    """Переход в день без явного номера инкрементит счётчик дней (0 → 1)."""
-    game.apply(make_phase_change(to_phase=Phase.DAY, day_number=0))
-    assert game.current_phase() == Phase.DAY
-    assert game.current_day() == 1
+def test_day_count_follows_night_day_vote_cycles(game: GameState) -> None:
+    """Регистрация — 0, затем ночь, день и голосование принадлежат одному циклу."""
+    assert game.current_day() == 0
+    for source, target, expected in (
+        (Phase.REGISTRATION, Phase.NIGHT, 1),
+        (Phase.NIGHT, Phase.DAY, 1),
+        (Phase.DAY, Phase.VOTE, 1),
+        (Phase.VOTE, Phase.NIGHT, 2),
+        (Phase.NIGHT, Phase.DAY, 2),
+        (Phase.DAY, Phase.VOTE, 2),
+    ):
+        game.apply(make_phase_change(from_phase=source, to_phase=target, day_number=0))
+        assert game.current_day() == expected
 
 
-def test_phase_change_to_night_increments_day(game: GameState) -> None:
-    """Любой переход в DAY/NIGHT/VOTE инкрементит день, а не только в DAY."""
-    game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=0))  # день 1
-    game.apply(
-        make_phase_change(from_phase=Phase.NIGHT, to_phase=Phase.VOTE, day_number=0)  # день 2
-    )
-    assert game.current_phase() == Phase.VOTE
-    assert game.current_day() == 2
+def test_second_night_day_vote_are_day_two(game: GameState) -> None:
+    game.apply(make_phase_change(to_phase=Phase.VOTE, day_number=1))
+    for source, target in (
+        (Phase.VOTE, Phase.NIGHT),
+        (Phase.NIGHT, Phase.DAY),
+        (Phase.DAY, Phase.VOTE),
+    ):
+        game.apply(make_phase_change(from_phase=source, to_phase=target, day_number=0))
+        assert game.current_day() == 2
+
+
+def test_explicit_night_number_is_not_incremented(game: GameState) -> None:
+    game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=7))
+    assert game.current_day() == 7
+
+
+def test_registration_resets_day_to_zero(game: GameState) -> None:
+    game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=5))
+    game.apply(make_phase_change(from_phase=Phase.NIGHT, to_phase=Phase.REGISTRATION, day_number=0))
+    assert game.current_day() == 0
+
+
+def test_explicit_day_is_used_for_night_and_vote(game: GameState) -> None:
+    game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=3))
+    assert game.current_day() == 3
+    game.apply(make_phase_change(from_phase=Phase.NIGHT, to_phase=Phase.VOTE, day_number=7))
+    assert game.current_day() == 7
 
 
 def test_phase_change_with_explicit_day_number(game: GameState) -> None:
@@ -282,25 +309,14 @@ def test_phase_change_to_same_phase_is_rejected(game: GameState) -> None:
     assert len(game.events()) == 1
 
 
-def test_game_start_after_end_resets(game: GameState) -> None:
-    """A new-game marker resets an ended game while retaining event history."""
-    for player_id in (1, 2, 3):
-        game.register_player(player_id, f"Player {player_id}")
+def test_new_game_after_end_does_not_mutate_old_state(game: GameState) -> None:
+    game.register_player(1, "Игрок")
     game.apply(make_phase_change(to_phase=Phase.END, day_number=0))
+    new_game = game.reset_for_new_game(2)
     assert game.current_phase() is Phase.END
-    assert len(game.players()) == 3
-
-    start_event = make_phase_change(
-        from_phase=Phase.END,
-        to_phase=Phase.REGISTRATION,
-        day_number=0,
-    )
-    game.apply(start_event)
-
-    assert game.current_phase() is Phase.REGISTRATION
-    assert game.players() == ()
-    assert game.current_day() == 0
-    assert game.events()[-1] == start_event
+    assert len(game.players()) == 1
+    assert new_game.current_phase() is Phase.REGISTRATION
+    assert new_game.players() == ()
 
 
 def test_game_start_when_registration_no_players(game: GameState) -> None:
@@ -318,25 +334,13 @@ def test_game_start_when_registration_no_players(game: GameState) -> None:
     assert game.events() == (start_event,)
 
 
-def test_game_start_drops_players(game: GameState) -> None:
-    """A new game clears the previous game's players from any active phase."""
-    for player_id in (1, 2, 3):
-        game.register_player(player_id, f"Player {player_id}")
+def test_new_game_drops_previous_players(game: GameState) -> None:
+    game.register_player(1, "Игрок")
     game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=2))
-    assert game.current_phase() is Phase.NIGHT
-    assert len(game.players()) == 3
-
-    game.apply(
-        make_phase_change(
-            from_phase=Phase.NIGHT,
-            to_phase=Phase.REGISTRATION,
-            day_number=0,
-        )
-    )
-
-    assert game.current_phase() is Phase.REGISTRATION
-    assert game.players() == ()
-    assert game.current_day() == 0
+    new_game = game.reset_for_new_game(2)
+    assert new_game.players() == ()
+    assert new_game.current_day() == 0
+    assert game.player(1).display_name == "Игрок"
 
 
 def test_message_event_is_recorded_without_changing_players(game: GameState) -> None:
@@ -665,21 +669,11 @@ def test_last_alive_list_names_whitelist(game: GameState) -> None:
 
 
 def test_last_alive_list_names_reset_on_new_game(game: GameState) -> None:
-    """E. Новый GAME_START очищает whitelist вместе с остальным состоянием."""
+    """Новая партия не наследует whitelist живых игроков."""
     game.apply(make_alive_list(["A", "B"]))
-    game.apply(
-        PhaseChangeEvent(
-            ts=event_time(),
-            game_id=1,
-            payload=PhaseChangePayload(
-                from_phase=Phase.END,
-                to_phase=Phase.REGISTRATION,
-                day_number=0,
-            ),
-        )
-    )
-
-    assert game.last_alive_list_names == frozenset()
+    new_game = game.reset_for_new_game(2)
+    assert new_game.last_alive_list_names == frozenset()
+    assert game.last_alive_list_names == frozenset({"A", "B"})
 
 
 def test_alive_list_matches_decorated_nicknames(game: GameState) -> None:
@@ -700,3 +694,47 @@ def test_alive_list_matches_decorated_nicknames(game: GameState) -> None:
     assert game.player(2).alive is True
     assert game.player(3).alive is False
     assert game.last_alive_list_names == frozenset({"| Дмитрий", "🕷️ᵗᵏ| Shinichiro🌝🖤"})
+
+
+def test_end_game_matches_decorated_display_name(game: GameState) -> None:
+    game.register_player(123, "Дмитрий")
+    game.apply(make_end_game(winners=[("| Дмитрий", "Мафия")]))
+    assert len(game.players()) == 1
+    role = game.player(123).final_role
+    assert role is not None
+    assert role.name_ru == "Мафия"
+
+
+def test_end_game_matches_decorated_username(game: GameState) -> None:
+    game.register_player(123, "Другое имя", username="Дмитрий")
+    game.apply(make_end_game(losers=[("| Дмитрий", "Мирный житель")]))
+    assert len(game.players()) == 1
+    role = game.player(123).final_role
+    assert role is not None
+    assert role.name_ru == "Мирный житель"
+
+
+def test_reset_for_new_game_clears_all_state(game: GameState) -> None:
+    game.register_name("Вася", 123)
+    game.mark_registered(123)
+    game.register_player(123, "Вася")
+    game.apply(make_phase_change(to_phase=Phase.NIGHT, day_number=0))
+    new_game = game.reset_for_new_game(2)
+    assert new_game.game_id == 2
+    assert not new_game.players() and not new_game.events()
+    assert new_game.resolve_name("Вася") is None
+    assert not new_game.registered_ids
+    assert new_game.current_day() == 0 and new_game.current_phase() is Phase.REGISTRATION
+
+
+def test_late_end_game_warns_and_does_not_change_state(
+    game: GameState, log_records: list[Record]
+) -> None:
+    event = EndGameEvent(
+        ts=event_time(), game_id=2, payload=EndGamePayload(winners=[("А", "Мафия")])
+    )
+    with pytest.raises(ConfigError):
+        game.apply(event)
+    assert game.current_phase() is Phase.REGISTRATION
+    assert game.events() == ()
+    assert any("event game_id=2, current game_id=1" in record["message"] for record in log_records)

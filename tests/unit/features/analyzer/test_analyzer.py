@@ -344,7 +344,7 @@ async def test_analyze_persists_predictions(
     jinja_env: jinja2.Environment,
     memory_database: tuple[sqlite3.Connection, PredictionsRepository],
 ) -> None:
-    """Every returned prediction is persisted with reasons joined by newlines."""
+    """Current prediction stores full reasoning; per-player reasons remain in history."""
     connection, repository = memory_database
     player_ids = [100, 101]
     game_id = create_game_with_players(connection, player_ids)
@@ -357,7 +357,8 @@ async def test_analyze_persists_predictions(
                 make_prediction(100, roles[0].name_ru, reasons=["first reason", "second reason"]),
                 make_prediction(101, roles[1].name_ru, confidence=0.4),
             ]
-        )
+        ).model_copy(update={"reasoning": "JSON reasoning " * 500}),
+        reasoning="Different streamed reasoning",
     )
     analyzer = make_analyzer(fake_llm, repository, registry, jinja_env)
 
@@ -369,7 +370,12 @@ async def test_analyze_persists_predictions(
     assert rows[0]["player_id"] == 100
     assert rows[0]["predicted_role"] == roles[0].name_ru
     assert rows[0]["confidence"] == pytest.approx(0.7)
-    assert rows[0]["reasoning"] == "first reason\nsecond reason"
+    assert rows[0]["reasoning"] == "JSON reasoning " * 500
+    history = connection.execute(
+        "SELECT reasoning FROM predictions_history WHERE game_id = ? AND player_id = ?",
+        (game_id, 100),
+    ).fetchone()
+    assert history is not None and history["reasoning"] == "first reason\nsecond reason"
     assert rows[1]["player_id"] == 101
 
 
@@ -995,3 +1001,219 @@ async def test_analyzer_fills_full_composition_and_caps_quotas(
         for row in repository.list_predictions(game_id)
     }
     assert persisted == roles
+
+
+@pytest.mark.parametrize("reasoning", ["", None, "missing"])
+async def test_analyze_missing_reasoning_falls_back_to_player_reasons(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    reasoning: str | None,
+) -> None:
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100,))
+    prediction = make_prediction(100, registry.all_roles()[0].name_ru, reasons=["причина", "довод"])
+    raw: dict[str, Any] = {"analysis": [prediction], "game_read": "Обзор"}
+    if reasoning != "missing":
+        raw["reasoning"] = reasoning
+    response = AnalysisResponse.model_validate(raw)
+    fake_llm = FakeLLMClient()
+    fake_llm.set_response(response)
+    result = await make_analyzer(fake_llm, repository, registry, jinja_env).analyze(state)
+    assert result.success
+    assert repository.list_predictions(game_id)[0]["reasoning"] == "причина\nдовод"
+    assert (
+        connection.execute("SELECT reasoning FROM predictions_history").fetchone()[0]
+        == "причина\nдовод"
+    )
+
+
+async def test_incomplete_composition_never_fills_slots_and_logs_warning(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    connection, repository = memory_database
+    ids = [100, 101, 102, 103, 104]
+    game_id = create_game_with_players(connection, ids)
+    state = make_game_state(registry, game_id=game_id, player_ids=tuple(ids))
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=game_id,
+            payload=AliveListPayload(
+                alive_player_names=[f"Player {i}" for i in ids],
+                role_count={"Мафия": 2},
+                total_players=5,
+            ),
+        )
+    )
+    llm = FakeLLMClient()
+    llm.set_response(make_response([make_prediction(100, "Мафия")]))
+    logs: list[str] = []
+    sink = logger.add(lambda message: logs.append(str(message)), level="WARNING")
+    try:
+        result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state)
+    finally:
+        logger.remove(sink)
+    assert result.response is not None
+    assert [p.player_id for p in result.response.analysis] == [100]
+    assert [r["player_id"] for r in repository.list_predictions(game_id)] == [100]
+    assert any("composition_mismatch" in w and "2" in w and "5" in w for w in result.warnings)
+    assert any("composition_mismatch" in msg and "2" in msg and "5" in msg for msg in logs)
+
+
+@pytest.mark.parametrize("quota", [None, {}, {"Мафия": 0}])
+def test_composition_empty_quota_does_not_fill(
+    quota: dict[str, int] | None,
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+) -> None:
+    from features.analyzer.context_builder import build_context
+
+    state = make_game_state(registry, player_ids=(100,))
+    context = build_context(game_state=state, registry=registry, max_messages=20).model_copy(
+        update={"role_count": quota}
+    )
+    analyzer = make_analyzer(FakeLLMClient(), memory_database[1], registry, jinja_env)
+    predictions, _ = analyzer._enforce_composition([], context, state)
+    assert predictions == []
+
+
+@pytest.mark.parametrize("death_before_request", [True, False])
+async def test_dead_during_llm_response_is_not_persisted(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+    death_before_request: bool,
+) -> None:
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100, 101])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    llm = FakeLLMClient()
+    death = DeathEvent(
+        ts=BASE_TS,
+        game_id=game_id,
+        payload=DeathPayload(victim_id=100, victim_name="Player 100"),
+    )
+    if death_before_request:
+        state.apply(death)
+
+    async def respond(**kwargs: Any) -> AnalysisResponse:
+        if not death_before_request:
+            state.apply(death)
+        return make_response([make_prediction(100, "Мафия"), make_prediction(101, "Мафия")])
+
+    monkeypatch.setattr(llm, "analyze_stream", respond)
+    logs: list[str] = []
+    sink = logger.add(lambda message: logs.append(str(message)), level="WARNING")
+    try:
+        result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state)
+    finally:
+        logger.remove(sink)
+    assert result.response is not None
+    assert [p.player_id for p in result.response.analysis] == [101]
+    assert [r["player_id"] for r in repository.list_predictions(game_id)] == [101]
+    assert any("100" in msg and "dead" in msg for msg in logs)
+
+
+async def test_dead_during_llm_gets_no_deterministic_composition_slot(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100, 101])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    state.apply(
+        AliveListEvent(
+            ts=BASE_TS,
+            game_id=game_id,
+            payload=AliveListPayload(
+                alive_player_names=["Player 100", "Player 101"],
+                role_count={"Мафия": 1, "Мирный житель": 1},
+                total_players=2,
+            ),
+        )
+    )
+    llm = FakeLLMClient()
+
+    async def respond(**kwargs: Any) -> AnalysisResponse:
+        state.apply(
+            DeathEvent(
+                ts=BASE_TS,
+                game_id=game_id,
+                payload=DeathPayload(victim_id=100, victim_name="Player 100"),
+            )
+        )
+        return make_response([])
+
+    monkeypatch.setattr(llm, "analyze_stream", respond)
+    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state)
+    assert result.response is not None and result.response.analysis == []
+    assert repository.list_predictions(game_id) == []
+    assert any("composition_mismatch" in warning for warning in result.warnings)
+
+
+async def test_player_removed_during_llm_is_dropped_with_warning(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [-1])
+    state = make_game_state(registry, game_id=game_id, player_ids=(-1,))
+    llm = FakeLLMClient()
+
+    async def respond(**kwargs: Any) -> AnalysisResponse:
+        state.register_player(101, "Player -1")
+        return make_response([make_prediction(-1, "Мафия")])
+
+    monkeypatch.setattr(llm, "analyze_stream", respond)
+    logs: list[str] = []
+    sink = logger.add(lambda message: logs.append(str(message)), level="WARNING")
+    try:
+        result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state)
+    finally:
+        logger.remove(sink)
+    assert result.response is not None and result.response.analysis == []
+    assert repository.list_predictions(game_id) == []
+    assert any("-1" in msg and "missing" in msg for msg in logs)
+
+
+async def test_death_during_persistence_drops_remaining_prediction(
+    registry: RoleRegistry,
+    jinja_env: jinja2.Environment,
+    memory_database: tuple[sqlite3.Connection, PredictionsRepository],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    connection, repository = memory_database
+    game_id = create_game_with_players(connection, [100, 101])
+    state = make_game_state(registry, game_id=game_id, player_ids=(100, 101))
+    llm = FakeLLMClient()
+    llm.set_response(make_response([make_prediction(100, "Мафия"), make_prediction(101, "Мафия")]))
+    to_thread = asyncio.to_thread
+
+    async def spy(func: Any, *args: Any, **kwargs: Any) -> Any:
+        if func.__name__ == "insert_history" and kwargs.get("player_id") == 100:
+            state.apply(
+                DeathEvent(
+                    ts=BASE_TS,
+                    game_id=game_id,
+                    payload=DeathPayload(victim_id=101, victim_name="Player 101"),
+                )
+            )
+        return await to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr("features.analyzer.analyzer.asyncio.to_thread", spy)
+    result = await make_analyzer(llm, repository, registry, jinja_env).analyze(state)
+    assert result.response is not None
+    assert [p.player_id for p in result.response.analysis] == [100]
+    assert [row["player_id"] for row in repository.list_predictions(game_id)] == [100]

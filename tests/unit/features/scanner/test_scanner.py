@@ -385,13 +385,19 @@ async def test_live_game_start_re_registers_players(
         )
     )
 
+    new_state = GameState(game_id=GAME_ID + 1, registry=registry)
+
+    async def on_new_game() -> GameState:
+        return new_state
+
+    scanner._on_new_game = on_new_game
     await scanner._on_event(bot_event("Город ветров начинает игру"))
 
-    assert game_state.current_phase() is Phase.REGISTRATION
-    assert game_state.players() == ()
+    assert new_state.current_phase() is Phase.REGISTRATION
+    assert new_state.players() == ()
     await scanner._on_event(player_event(VASYA, "Вася", "Мы снова играем вместе"))
-    assert len(game_state.players()) == 1
-    assert game_state.player(VASYA).display_name == "Вася"
+    assert len(new_state.players()) == 1
+    assert new_state.player(VASYA).display_name == "Вася"
 
 
 async def test_on_event_callback_invoked_for_player_speech(
@@ -1010,14 +1016,14 @@ async def test_bot_last_words_registers_unknown_player(
 ) -> None:
     """29. A player known only by nickname is introduced from the bot message."""
     scanner, _analyzer, _telegram = build_scanner(game_state=game_state, registry=registry)
-    scanner._name_to_id["Лена"] = LENA
+    game_state.register_name("Лена", LENA)
 
     await scanner._on_event(
         bot_event("Кто-то из жителей слышал, как Лена кричал перед смертью:\nПрощайте")
     )
 
     assert game_state.player(LENA).display_name == "Лена"
-    assert scanner._registered_ids == {LENA}
+    assert game_state.registered_ids == {LENA}
 
 
 async def test_bot_vote_does_not_register_players(
@@ -1028,7 +1034,7 @@ async def test_bot_vote_does_not_register_players(
     scanner, _analyzer, _telegram = build_scanner(game_state=game_state, registry=registry)
     await scanner._on_event(player_event(VASYA, "Вася", "Я мирный житель"))
     await scanner._on_event(player_event(PETYA, "Петя", "И я мирный житель"))
-    registered_before = set(scanner._registered_ids)
+    registered_before = set(game_state.registered_ids)
 
     await scanner._on_event(bot_event("Вася голосовал за: Петя"))
 
@@ -1038,7 +1044,7 @@ async def test_bot_vote_does_not_register_players(
     assert isinstance(vote, VoteEvent)
     assert vote.payload.voter_id == VASYA
     assert vote.payload.target_id == PETYA
-    assert scanner._registered_ids == registered_before
+    assert game_state.registered_ids == registered_before
 
 
 async def test_role_reveal_marks_known_player(
@@ -1067,7 +1073,7 @@ async def test_register_player_rejects_blank_name(
     await scanner._register_player(VASYA, "   ")
 
     assert game_state.players() == ()
-    assert scanner._registered_ids == set()
+    assert game_state.registered_ids == set()
 
 
 async def test_shutdown_without_start_is_noop(
@@ -1722,7 +1728,7 @@ async def test_alive_list_calls_on_player_registered(game_state, registry):
     scanner._on_player_registered = callback
     await scanner._on_event(bot_event("Живые игроки:\n1. Never Wrote\nВсего: 1"))
     callback.assert_awaited_once_with(_placeholder_player_id("Never Wrote"), "Never Wrote")
-    assert scanner._name_to_id["Never Wrote"] == _placeholder_player_id("Never Wrote")
+    assert game_state.resolve_name("Never Wrote") == _placeholder_player_id("Never Wrote")
 
 
 async def test_flush_allows_alive_list_in_registration_phase(
@@ -1743,3 +1749,122 @@ async def test_flush_allows_alive_list_in_registration_phase(
 
     assert analyzer.calls == 1
     assert scanner.buffer_size == 0
+
+
+async def test_alive_decorated_name_resolves_existing_player_and_death(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    await scanner._on_event(player_event(VASYA, "A", "Я мирный"))
+    await scanner._on_event(bot_event("Живые игроки:\n1. | A\nВсего: 1"))
+    assert {p.player_id for p in game_state.players()} == {VASYA}
+    assert scanner.name_to_id["A"] == VASYA
+    assert scanner.name_to_id["| A"] == VASYA
+    assert scanner.name_to_id["a"] == VASYA
+    await scanner._on_event(bot_event("| A убит"))
+    deaths = game_state.events_by_kind("death")
+    assert len(deaths) == 1
+    assert isinstance(deaths[0], DeathEvent)
+    assert deaths[0].payload.victim_id == VASYA
+    assert not game_state.player(VASYA).alive
+
+
+async def test_alive_placeholder_registers_raw_and_normalized_names(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    from domain.game_state import _placeholder_player_id
+
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    callback = AsyncMock()
+    scanner._on_player_registered = callback
+    await scanner._on_event(bot_event("Живые игроки:\n1. | Дмитрий\nВсего: 1"))
+    pid = _placeholder_player_id("| Дмитрий")
+    assert scanner.name_to_id["| Дмитрий"] == pid
+    assert scanner.name_to_id["дмитрий"] == pid
+    callback.assert_awaited_once_with(pid, "| Дмитрий")
+
+
+async def test_alive_normalized_keys_do_not_override_previous_mapping(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    game_state.register_name("дмитрий", VASYA)
+    await scanner._on_event(bot_event("Живые игроки:\n1. | Дмитрий\nВсего: 1"))
+    assert scanner.name_to_id["дмитрий"] == VASYA
+
+
+@pytest.mark.parametrize("phase", [Phase.REGISTRATION, Phase.UNKNOWN])
+async def test_registration_without_new_game_keeps_names(
+    phase: Phase, game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    on_new_game = AsyncMock()
+    scanner._on_new_game = on_new_game
+    await scanner._on_event(player_event(1, "Вася", "Я играю"))
+    if phase is Phase.UNKNOWN:
+        game_state.apply(
+            PhaseChangeEvent(
+                ts=TS,
+                game_id=GAME_ID,
+                payload=PhaseChangePayload(
+                    from_phase=Phase.REGISTRATION, to_phase=Phase.UNKNOWN, day_number=0
+                ),
+            )
+        )
+    await scanner._on_event(bot_event("Город ветров начинает игру"))
+    on_new_game.assert_not_awaited()
+    assert game_state.resolve_name("Вася") == 1
+    assert game_state.is_registered(1)
+    assert scanner.name_to_id["Вася"] == 1
+    assert game_state.game_id == GAME_ID
+
+
+@pytest.mark.parametrize("phase", [Phase.NIGHT, Phase.DAY, Phase.VOTE, Phase.END])
+async def test_new_game_clears_names_and_registrations(
+    phase: Phase, game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    await scanner._on_event(player_event(1, "Вася", "Я играю"))
+    await scanner._on_event(player_event(2, "Петя", "Я тоже"))
+    game_state.apply(
+        PhaseChangeEvent(
+            ts=TS,
+            game_id=GAME_ID,
+            payload=PhaseChangePayload(from_phase=Phase.REGISTRATION, to_phase=phase, day_number=0),
+        )
+    )
+    new_state = game_state.reset_for_new_game(GAME_ID + 1)
+    scanner._on_new_game = AsyncMock(return_value=new_state)
+    await scanner._on_event(bot_event("Город ветров начинает игру"))
+    assert scanner.name_to_id == {}
+    assert new_state.resolve_name("Вася") is None
+    assert new_state.resolve_name("Петя") is None
+    assert not new_state.is_registered(1) and not new_state.is_registered(2)
+    assert new_state.game_id != game_state.game_id
+
+
+async def test_same_name_in_next_game_resolves_new_person(
+    game_state: GameState, registry: RoleRegistry
+) -> None:
+    scanner, _, _ = build_scanner(game_state=game_state, registry=registry)
+    await scanner._on_event(player_event(1, "Вася", "Я играю"))
+    game_state.apply(
+        PhaseChangeEvent(
+            ts=TS,
+            game_id=GAME_ID,
+            payload=PhaseChangePayload(
+                from_phase=Phase.REGISTRATION, to_phase=Phase.NIGHT, day_number=0
+            ),
+        )
+    )
+    new_state = game_state.reset_for_new_game(GAME_ID + 1)
+    scanner._on_new_game = AsyncMock(return_value=new_state)
+    await scanner._on_event(bot_event("Город ветров начинает игру"))
+    await scanner._on_event(player_event(2, "Вася", "Я другой игрок"))
+    await scanner._on_event(bot_event("Сегодня повешен Вася"))
+    deaths = new_state.events_by_kind("death")
+    assert len(deaths) == 1 and isinstance(deaths[0], DeathEvent)
+    assert deaths[0].payload.victim_id == 2
+    assert new_state.resolve_name("Вася") == 2
+    assert not new_state.is_registered(1)
+    assert game_state.player(1).alive
