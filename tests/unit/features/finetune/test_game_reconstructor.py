@@ -8,6 +8,7 @@ from pathlib import Path
 from domain.events import (
     AliveListEvent,
     AliveListPayload,
+    AnyEvent,
     DeathEvent,
     DeathPayload,
     MessageEvent,
@@ -42,7 +43,7 @@ def test_reconstruct_applies_all_events() -> None:
     state = make_game_state()
     state.register_player(101, "Вася")
     state.register_player(102, "Петя")
-    events = [
+    events: list[AnyEvent] = [
         AliveListEvent(
             ts=BASE_TS,
             game_id=1,
@@ -81,7 +82,7 @@ def test_reconstruct_applies_all_events() -> None:
 
 def test_reconstruct_registers_alive_list_placeholders() -> None:
     """Alive-list names become placeholder players in the reconstructed state."""
-    events = [
+    events: list[AnyEvent] = [
         AliveListEvent(
             ts=BASE_TS,
             game_id=1,
@@ -103,7 +104,7 @@ def test_reconstruct_registers_alive_list_placeholders() -> None:
 
 def test_reconstruct_skips_broken_phase_transitions() -> None:
     """A phase event that fails validation is skipped, not fatal."""
-    events = [
+    events: list[AnyEvent] = [
         PhaseChangeEvent(
             ts=BASE_TS,
             game_id=1,
@@ -132,7 +133,7 @@ def test_reconstruct_skips_broken_phase_transitions() -> None:
 
 def test_reconstruct_skips_unknown_role_reveals() -> None:
     """A reveal with an unregistered role name is skipped without aborting."""
-    events = [
+    events: list[AnyEvent] = [
         AliveListEvent(
             ts=BASE_TS,
             game_id=1,
@@ -168,7 +169,7 @@ def test_reconstruct_empty_events() -> None:
 
 def test_reconstruct_does_not_raise_on_unknown_role() -> None:
     """UnknownRoleError from apply() is swallowed by the tolerant loop."""
-    events = [
+    events: list[AnyEvent] = [
         RoleRevealEvent(
             ts=BASE_TS,
             game_id=1,

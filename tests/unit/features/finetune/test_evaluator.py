@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -47,7 +48,7 @@ def _make_record(
 
 
 def _model_output(player_id: int, role: str | None, confidence: float = 0.8) -> str:
-    payload: dict = {
+    payload: dict[str, Any] = {
         "analysis": [
             {
                 "player_id": player_id,

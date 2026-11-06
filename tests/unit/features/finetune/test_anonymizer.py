@@ -8,6 +8,7 @@ from pathlib import Path
 from domain.events import (
     AliveListEvent,
     AliveListPayload,
+    AnyEvent,
     MessageEvent,
     MessagePayload,
     PhaseChangeEvent,
@@ -103,7 +104,7 @@ def test_alias_map_remap_id() -> None:
 def test_alias_map_collect_events() -> None:
     """Event payload identities are indexed."""
     aliases = PlayerAliasMap()
-    events = [
+    events: list[AnyEvent] = [
         MessageEvent(
             ts=BASE_TS,
             game_id=1,
@@ -123,7 +124,7 @@ def test_alias_map_collect_events() -> None:
 def test_alias_map_ambiguous_names_get_distinct_aliases() -> None:
     """Two players sharing a display name never merge."""
     aliases = PlayerAliasMap()
-    events = [
+    events: list[AnyEvent] = [
         MessageEvent(
             ts=BASE_TS,
             game_id=1,

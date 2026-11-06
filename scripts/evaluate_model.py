@@ -123,8 +123,11 @@ def _build_predict_fn(
     Raises :class:`TrainingError` if torch/transformers/peft are not installed.
     """
     try:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        import torch  # type: ignore[import-not-found]
+        from transformers import (  # type: ignore[import-not-found]
+            AutoModelForCausalLM,
+            AutoTokenizer,
+        )
     except ImportError as error:
         raise TrainingError(
             f"torch/transformers не установлены: {error}.pip install -e '.[finetune]'"
@@ -135,7 +138,7 @@ def _build_predict_fn(
 
     if adapter:
         try:
-            from peft import PeftModel
+            from peft import PeftModel  # type: ignore[import-not-found]
         except ImportError as error:
             raise TrainingError(
                 f"peft не установлен: {error}.pip install -e '.[finetune]'"
@@ -150,7 +153,7 @@ def _build_predict_fn(
         inputs = tokenizer(prompt, return_tensors="pt")
         with torch.no_grad():
             outputs = model.generate(**inputs, max_new_tokens=max_new_tokens)
-        return tokenizer.decode(outputs[0], skip_special_tokens=True)
+        return tokenizer.decode(outputs[0], skip_special_tokens=True)  # type: ignore[no-any-return]
 
     return predict
 
