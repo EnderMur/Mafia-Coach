@@ -203,5 +203,7 @@ configs/settings.yaml
 # Личные паттерны пользователя
 configs/club_patterns.txt
 !configs/club_patterns.example.txt
+configs/club_patterns.yaml
+!configs/club_patterns.example.yaml
 .DS_Store
 Thumbs.db
