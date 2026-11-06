@@ -289,9 +289,30 @@ CREATE TABLE player_style (
   - построения датасета для fine-tune.
 
 ### 9.4 Fine-tune (постфактум)
-- **Не в рамках v1.** Отдельный оффлайн-пайплайн (LoRA, Unsloth/Axolotl).
-- Формат датасета — ChatML/SFT: `messages` с системным промптом (правила + роль)
-  и `assistant` ответом (JSON предсказаний). `reasoning` используется отдельным каналом.
+- **Не в рамках партии.** Отдельный оффлайн-пайплайн: выгрузка датасета из SQLite
+  → LoRA/QLoRA дообучение → адаптер в LM Studio. Запускается вручную, не
+  влияет на игру. Документ: `docs/finetune.md`.
+- **Шаг 1 — подготовка датасета.** `scripts/prepare_finetune_dataset.py`:
+  для каждой предсказательной строки (`predictions` или `predictions_history`)
+  решает ground truth (`game_players.final_role`), реконструирует состояние
+  партии в момент предсказания (события с `ts <= prediction.ts`, толерантно),
+  рендерит тот же контекст, что живой analyzer, и пишет `[system, user,
+  assistant]`-строку JSONL в `data/datasets/`. Правильные предсказания
+  сохраняют ответ модели (`reasoning`, паттерны); неправильные — истинную
+  роль, исправленную причину, `reasoning: null`. Только примеры с
+  разрешимым ground truth остаются. `--anonymize` заменяет структурированные
+  id/имена на `player_N` (свободный текст не трогается).
+- **Шаг 2 — дообучение.** `scripts/finetune_lora.py`: default backend —
+  Unsloth (QLoRA 4-bit + LoRA), fallback — PEFT/TRL (`--backend peft`).
+  Хиперпараметры из секции `finetune:` в `configs/settings.yaml`
+  (`app/config.py::FinetuneSection`), перекрываются CLI-аргументами. Адаптер
+  сохраняется в `data/adapters/YYYY-MM-DD_HH-MM/` + `training_report.json`;
+  CLI выводит инструкцию по загрузке в LM Studio (UI model manager, не через
+  API). Тяжёлые зависимости — в optional-группе `finetune`
+  (`pip install -e ".[finetune]"`).
+- **Формат датасета** — ChatML/SFT: `messages` с системным промптом
+  (правила + роль) и `assistant` ответом (JSON предсказаний). `reasoning`
+  используется отдельным каналом.
 - Цель: дообучить модель на стиле и паттернах, характерных для этого клуба.
 
 ---

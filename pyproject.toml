@@ -32,7 +32,16 @@ dev = [
     "pre-commit",
     "types-PyYAML",
 ]
-training = []
+finetune = [
+    "torch>=2.2",
+    "unsloth>=0.4",
+    "trl>=0.12",
+    "datasets>=2.20",
+    "peft>=0.12",
+    "accelerate>=0.30",
+    "bitsandbytes>=0.43",
+    "pyarrow>=15",
+]
 
 [tool.ruff]
 line-length = 100

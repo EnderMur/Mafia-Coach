@@ -97,6 +97,12 @@ mafia_coach/
 │       ├── stats_window.py       # таблица предсказаний (output-only через IPC)
 │       ├── reasoning_window.py   # поток рассуждений (output-only через IPC)
 │       └── window_host.py        # запуск двух процессов-консолей на Windows
+│   └── finetune/                 # оффлайн-пайплайн дообучения (не в игровом процессе)
+│       ├── models.py             # DatasetRecord, Message, PredictionRow, TrainingOptions
+│       ├── game_reconstructor.py # толерантная реконструкция GameState из событий
+│       ├── dataset_builder.py    # build_example: контекст → [system, user, assistant]
+│       ├── anonymizer.py         # PlayerAliasMap, anonymize_context, anonymize_payload
+│       └── trainer.py            # train_lora (unsloth/peft), lmstudio_instructions
 │
 ├── configs/
 │   ├── settings.yaml
@@ -108,12 +114,18 @@ mafia_coach/
 ├── data/
 │   ├── sessions/                # *.session от Telethon (в .gitignore)
 │   ├── db/                      # SQLite-файл (в .gitignore)
-│   └── datasets/                # будущие датасеты для fine-tune (в .gitignore)
+│   ├── datasets/                # датасеты для fine-tune (в .gitignore)
+│   └── adapters/                # промотанные адаптеры LoRA (в .gitignore)
 │
 ├── logs/                        # loguru (в .gitignore)
 ├── scripts/
 │   ├── make_session.py          # одноразовое создание Telethon-сессии (читает settings.yaml)
-│   ├── export_dataset.py        # выгрузка в JSONL для fine-tune
+│   ├── dump_chat.py             # read-only выгрузка истории чата в data/dumps/
+│   ├── make_fixture.py          # анонимизированный тестовый fixture из дампа
+│   ├── prepare_finetune_dataset.py  # БД → ChatML/SFT датасет (reconstruction + ground truth)
+│   ├── finetune_lora.py         # LoRA/QLoRA-дообучение (unsloth/peft), адаптер в data/adapters/
+│   ├── export_dataset.py        # сырая выгрузка в JSONL для анализа (не трогать: унаследовано)
+│   ├── audit_pii.py             # аудит git history/index/fixtures на PII перед Public
 │   └── run_windows.py           # запуск двух консолей вручную
 ├── tests/
 │   ├── unit/
@@ -122,7 +134,8 @@ mafia_coach/
 ├── docs/
 │   ├── architecture.md
 │   ├── parser_spec.md
-│   └── llm_contract.md
+│   ├── llm_contract.md
+│   └── finetune.md               # пайплайн дообучения: датасет, обучение, LM Studio
 ├── .gitignore
 ├── .pre-commit-config.yaml
 ├── pyproject.toml
@@ -407,7 +420,7 @@ repos:
 
 ## 14. Зафиксированные решения и оставшиеся вопросы
 
-### 13.1 Зафиксированные решения
+### 14.1 Зафиксированные решения
 1. **Имя модели в LM Studio:** `qwen/qwen3.5-9b` (при развёртывании сверяется с ответом `GET /v1/models`).
 2. **Сессия Telethon:** хранится в `data/sessions/mafia_coach.session`, создаётся через утилиту `scripts/make_session.py`, считывающую `api_id` и `api_hash` напрямую из `configs/settings.yaml`.
 3. **Управление и выбор чата:** ввод команд (`/attach`, `/status`, `/quit`) — строго через основное консольное окно оркестратора (`main.py`). Окна `Stats Window` и `Reasoning Window` — `output-only` по лёгкому IPC.
@@ -417,7 +430,8 @@ repos:
 7. **Игровой бот:** указывается пользователем через `telegram.bot_username` или `telegram.bot_id`. Бот не редактирует сообщения (парсер слушает только `events.NewMessage`).
 8. **База данных:** чистый `sqlite3` (без SQLAlchemy). Сырые события (`events`) сохраняются в SQLite сразу по мере получения; `predictions` — по готовности ответа LLM.
 9. **Конфигурация логов:** централизована внутри `configs/settings.yaml` (отдельный файл `logging.yaml` упразднён).
+10. **Оффлайн-пайплайн дообучения:** два независимых CLI — `scripts/prepare_finetune_dataset.py` (БД → ChatML/SFT датасет с reconstruction и ground truth, `--source current|history`, `--only-correct`, `--anonymize`) и `scripts/finetune_lora.py` (LoRA/QLoRA через Unsloth по умолчанию, PEFT — fallback; хиперпараметры из `finetune:` в `settings.yaml`, CLI перекрывает). Адаптеры сохраняются в `data/adapters/YYYY-MM-DD_HH-MM/` + `training_report.json`; загрузка в LM Studio — только через UI (API не принимает адаптер). Тяжёлые зависимости — в optional-группе `finetune` (`pip install -e ".[finetune]"`), ленивые импорты, игровой процесс от этого не зависит. Исходный датасет готов к публикации только после `--anonymize` и `scripts/audit_pii.py`.
 
-### 13.2 Открытые вопросы к владельцу (уточнять по мере необходимости)
+### 14.2 Открытые вопросы к владельцу (уточнять по мере необходимости)
 1. **Кастомные эвристики клуба:** требуется ли жесткий справочник специфических для данного сообщества сокращений и игровых паттернов в `domain/rules.py`?
 2. **Ручной ввод поправок:** планируется ли в будущих версиях ручная корректировка ролей через консоль оркестратора (например, `/mark <player> <role>`)?

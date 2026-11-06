@@ -44,6 +44,28 @@ analysis:
   # В режиме batch_debounce фазовые события (смерти, фазы, голосования)
   # принудительно сбрасывают буфер и вызывают LLM немедленно.
 
+# ── Дообучение (LoRA/QLoRA) — оффлайн, не влияет на игру ────────────────────
+# Запускается отдельно: python scripts/prepare_finetune_dataset.py →
+# python scripts/finetune_lora.py. Требует pip install -e ".[finetune]".
+finetune:
+  enabled: false                    # только для документации; скрипт запускается явно
+  base_model: "qwen/qwen3.5-9b"     # та же модель, что в llm.model
+  method: "qlora"                   # lora | qlora (4-bit)
+  backend: "unsloth"                # unsloth | peft (fallback, если модель не поддерживается Unsloth)
+  rank: 16                          # размерность LoRA
+  alpha: 32                         # масштабирование (alpha / rank = 2)
+  dropout: 0.05
+  learning_rate: 2.0e-4
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  max_seq_length: 4096
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  output_dir: "data/adapters"       # адаптеры в data/adapters/YYYY-MM-DD_HH-MM/
+  dataset_path: "data/datasets/sft_train.jsonl"
+  max_examples: null                # null = без лимита; N = первые N примеров
+
 # ── UI ─────────────────────────────────────────────────────────────────────
 ui:
   stats_window: true

@@ -17,7 +17,7 @@
 - Продуктовые требования: [`PROJECT_CONTEXT.md`](PROJECT_CONTEXT.md)
 - Правила разработки и контракты: [`AI_INSTRUCTIONS.md`](AI_INSTRUCTIONS.md)
 - Пометка AI-generated: [`AI_DISCLOSURE.md`]
-- Оговорки об ИИ-происхождении кода: [§12 «Происхождение кода и ограничения»](#12-происхождение-кода-и-ограничения)
+- Оговорки об ИИ-происхождении кода: [§13 «Происхождение кода и ограничения»](#13-происхождение-кода-и-ограничения)
 
 ---
 
@@ -31,11 +31,12 @@
 6. [Проверка работоспособности](#6-проверка-работоспособности)
 7. [Пример вывода](#7-пример-вывода)
 8. [Контракт с LLM (JSON)](#8-контракт-с-llm-json)
-9. [Структура проекта](#9-структура-проекта)
-10. [Устранение неполадок](#10-устранение-неполадок)
-11. [Ограничения](#11-ограничения)
-12. [Происхождение кода и ограничения](#12-происхождение-кода-и-ограничения)
-13. [Публикация и лицензия](#13-публикация-и-лицензия)
+9. [Дообучение модели](#9-дообучение-модели)
+10. [Структура проекта](#10-структура-проекта)
+11. [Устранение неполадок](#11-устранение-неполадок)
+12. [Ограничения](#12-ограничения)
+13. [Происхождение кода и ограничения](#13-происхождение-кода-и-ограничения)
+14. [Публикация и лицензия](#14-публикация-и-лицензия)
 
 ---
 
@@ -98,7 +99,7 @@ cp configs/settings.example.yaml configs/settings.yaml
 
 ### Если нет `pyproject.toml` / `pip install -e .` не работает
 
-Пакет объявлен в `pyproject.toml` (см. [структуру](#9-структура-проекта)). Если файла
+Пакет объявлен в `pyproject.toml` (см. [структуру](#10-структура-проекта)). Если файла
 в вашей копии нет, используйте `requirements.txt`:
 
 ```powershell
@@ -172,6 +173,26 @@ ui:
   stats_window: true
   reasoning_window: true
   language: "ru"
+
+# ── Дообучение (оффлайн, см. §9) ───────────────────────────────────────────
+finetune:
+  enabled: false                    # только для документации; запуск вручную
+  base_model: "qwen/qwen3.5-9b"     # та же модель, что в llm.model
+  method: "qlora"                   # lora | qlora (4-bit)
+  backend: "unsloth"                # unsloth | peft
+  rank: 16                          # размерность LoRA
+  alpha: 32                         # alpha / rank = 2
+  dropout: 0.05
+  learning_rate: 2.0e-4
+  epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 8
+  max_seq_length: 4096
+  warmup_ratio: 0.03
+  weight_decay: 0.0
+  output_dir: "data/adapters"       # data/adapters/YYYY-MM-DD_HH-MM/
+  dataset_path: "data/datasets/sft_train.jsonl"
+  max_examples: null                # null = без лимита
 
 # ── Логи ───────────────────────────────────────────────────────────────────
 logging:
@@ -618,7 +639,67 @@ retro: total=23 correct=3 wrong=11 unknown=9 (3/14 = 21% accuracy).
 
 ---
 
-## 9. Структура проекта
+## 9. Дообучение модели
+
+Оффлайн-пайплайн: выгрузка датасета из SQLite → LoRA/QLoRA-дообучение
+локальной модели → адаптер в LM Studio. Запускается отдельно, **не влияет
+на игру**. Подробно — [`docs/finetune.md`](docs/finetune.md).
+
+### 9.1 Подготовка датасета
+
+```bash
+python scripts/prepare_finetune_dataset.py \
+    --db data/db/mafia.db \
+    --out data/datasets/sft_train.jsonl
+```
+
+Для каждой предсказательной строки из БД (`predictions` или
+`predictions_history` с `--source history`):
+
+1. Ground truth — `game_players.final_role` по `(game_id, player_id)`.
+   Без неё пример отбрасывается.
+2. Корректность — `predictions.correct` (с `--only-correct` оставляем только
+   верные).
+3. Реконструкция состояния партии в момент предсказания — события с
+   `ts <= prediction.ts` применяются к чистому `GameState`
+   (`features/finetune/game_reconstructor.py`, толерантно: сломанные события
+   пропускаются с WARNING).
+4. Контекст — тот же `build_context`, что у живого analyzer; ответ
+   (assistant) — корректный JSON: при правильном предсказании — ответ
+   модели, при неправильном — истинная роль, исправленная причина,
+   `reasoning: null`, паттерны сбрасываются.
+
+Формат датасета — ChatML/SFT: `[system, user, assistant]` в `.jsonl`
+(можно `--parquet`). `--anonymize` заменяет структурированные id/имена на
+`player_N` (свободный текст не трогается).
+
+### 9.2 Дообучение
+
+```bash
+pip install -e ".[finetune]"          # тяжёлые зависимости (torch, unsloth, …)
+python scripts/finetune_lora.py \
+    --dataset data/datasets/sft_train.jsonl \
+    --base-model qwen/qwen3.5-9b \
+    --method qlora
+```
+
+- Backend: `unsloth` (по умолчанию, QLoRA 4-bit + LoRA) или `peft` (fallback,
+  через transformers + PEFT + TRL).
+- Хиперпараметры — секция `finetune:` в `configs/settings.yaml`
+  (`app/config.py::FinetuneSection`), перекрываются CLI-аргументами
+  (`--method`, `--backend`, `--epochs`, `--base-model` и т.д.).
+- Адаптер сохраняется в `data/adapters/YYYY-MM-DD_HH-MM/` с
+  `training_report.json`; CLI выводит инструкцию по загрузке в LM Studio.
+
+### 9.3 Загрузка в LM Studio
+
+LM Studio → «My Models» → базовая модель → «Add LoRA» → папка адаптера →
+«Start Server». OpenAI-совместимый API LM Studio не принимает адаптер через
+параметры запроса — только через UI model manager.
+
+---
+
+## 10. Структура проекта
 
 ```
 mafia-coach/
@@ -637,7 +718,8 @@ mafia-coach/
 │   ├── parser/             classifier.py, bot_messages.py, speech.py
 │   ├── analyzer/           context_builder.py, heuristic_hints.py, analyzer.py
 │   ├── memory/             player_profile.py, style_extractor.py, retro.py
-│   └── ui/                 stats_window.py, reasoning_window.py, window_host.py
+│   ├── ui/                 stats_window.py, reasoning_window.py, window_host.py
+│   └── finetune/           models.py, game_reconstructor.py, dataset_builder.py, anonymizer.py, trainer.py
 ├── configs/
 │   ├── settings.example.yaml   шаблон (коммитится)
 │   ├── settings.yaml           ваши значения (в .gitignore)
@@ -647,13 +729,15 @@ mafia-coach/
 │   ├── make_session.py         одноразовое создание Telethon-сессии (читает settings.yaml)
 │   ├── dump_chat.py            read-only выгрузка истории чата в data/dumps/
 │   ├── make_fixture.py         анонимизированный тестовый fixture из дампа
-│   ├── export_dataset.py       выгрузка JSONL для fine-tune
+│   ├── prepare_finetune_dataset.py  БД → ChatML/SFT датасет (см. §9)
+│   ├── finetune_lora.py        LoRA/QLoRA-дообучение (см. §9)
+│   ├── export_dataset.py       сырая выгрузка в JSONL для анализа (не трогать)
 │   ├── audit_pii.py            аудит git history/index/fixtures на PII перед Public
 │   └── run_windows.py          запуск двух консолей вручную
-├── data/                   sessions/, db/, datasets/, dumps/, tmp/ — всё в .gitignore
+├── data/                   sessions/, db/, datasets/, adapters/, dumps/, tmp/ — всё в .gitignore
 ├── logs/                   app.log, reasoning.log — в .gitignore
 ├── tests/                  unit/, integration/, fixtures/
-├── docs/                   architecture.md, parser_spec.md, llm_contract.md
+├── docs/                   architecture.md, parser_spec.md, llm_contract.md, finetune.md
 ├── pyproject.toml          пакет, зависимости, конфиги ruff/mypy/pytest
 ├── requirements.txt        альтернатива для установки без -e
 ├── .pre-commit-config.yaml
@@ -667,7 +751,7 @@ mafia-coach/
 
 ---
 
-## 10. Устранение неполадок
+## 11. Устранение неполадок
 
 | Симптом | Причина | Что делать |
 |---|---|---|
@@ -699,7 +783,7 @@ mafia-coach/
 
 ---
 
-## 11. Ограничения
+## 12. Ограничения
 
 - Только Windows (второе окно требует `CREATE_NEW_CONSOLE`).
 - Только русский язык в UI и промптах.
@@ -716,7 +800,7 @@ mafia-coach/
 
 ---
 
-## 12. Происхождение кода и ограничения
+## 13. Происхождение кода и ограничения
 
 **Весь код, конфиги, промпты, тесты и документация сгенерированы ИИ.** Владелец
 формулировал требования и правила, реализацию писал ИИ-агент; человек не писал
@@ -744,7 +828,7 @@ mafia-coach/
 
 ---
 
-## 13. Публикация и лицензия
+## 14. Публикация и лицензия
 
 - **Лицензия:** MIT — файл [`LICENSE`](LICENSE) в корне. Если нужна другая
   (Apache-2.0 для патентной защиты, AGPL для copyleft, или закрытая), замените файл
