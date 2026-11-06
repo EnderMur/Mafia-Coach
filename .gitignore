@@ -183,12 +183,14 @@ cython_debug/
 data/sessions/*
 data/db/*
 data/datasets/*
+data/adapters/*
 data/dumps/*
 data/tmp/*
 logs/*
 !data/sessions/.gitkeep
 !data/db/.gitkeep
 !data/datasets/.gitkeep
+!data/adapters/.gitkeep
 !data/dumps/.gitkeep
 !data/tmp/.gitkeep
 !logs/.gitkeep

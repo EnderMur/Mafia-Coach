@@ -49,3 +49,7 @@ class TelegramFloodWaitError(DomainError):
 
 class TelegramAccessError(DomainError):
     """Telegram refused access (private chat, admin rights, kicked from chat, etc.)."""
+
+
+class TrainingError(DomainError):
+    """Raised when offline fine-tune training fails or its dependencies are missing."""
