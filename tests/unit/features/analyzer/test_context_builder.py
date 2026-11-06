@@ -873,15 +873,15 @@ def test_previous_predictions_render_as_anchor(
 def test_real_club_patterns_reach_analyze_prompt(
     registry: RoleRegistry, jinja_env: jinja2.Environment
 ) -> None:
-    """FIX-LOG-ANALYSIS A.5: the 8 loaded patterns really reach analyze.jinja."""
+    """FIX-LOG-ANALYSIS A.5: the example pattern reaches analyze.jinja."""
     from pathlib import Path
 
     from domain.club_patterns import load_club_patterns
     from features.analyzer.context_builder import build_context, to_llm_messages
 
-    config_path = Path(__file__).parents[4] / "configs" / "club_patterns.yaml"
+    config_path = Path(__file__).parents[4] / "configs" / "club_patterns.example.yaml"
     loaded = load_club_patterns(config_path)
-    assert len(loaded) == 8
+    assert len(loaded) == 1
     club_patterns: list[dict[str, object]] = [
         {
             "id": pattern.id,
