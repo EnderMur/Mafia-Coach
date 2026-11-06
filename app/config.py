@@ -84,6 +84,35 @@ class AnalysisSection(BaseModel):
     show_dead: bool = False
 
 
+class FinetuneSection(BaseModel):
+    """Offline LoRA/QLoRA fine-tune settings (separate from live gameplay).
+
+    Consumed by ``scripts/finetune_lora.py``; never read during a game.
+    ``base_model`` defaults to the LM Studio model id, ``output_dir`` to
+    ``data/adapters`` (one ``YYYY-MM-DD_HH-MM`` subdirectory per run).
+    """
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    enabled: bool = False
+    base_model: str = Field(min_length=1)
+    method: Literal["lora", "qlora"] = "qlora"
+    backend: Literal["unsloth", "peft"] = "unsloth"
+    rank: int = Field(ge=1, le=256, default=16)
+    alpha: int = Field(ge=1, le=512, default=32)
+    dropout: float = Field(ge=0.0, le=1.0, default=0.05)
+    learning_rate: float = Field(gt=0.0, default=2e-4)
+    epochs: int = Field(ge=1, le=100, default=3)
+    batch_size: int = Field(ge=1, le=128, default=2)
+    gradient_accumulation_steps: int = Field(ge=1, le=1024, default=8)
+    max_seq_length: int = Field(ge=256, le=32768, default=4096)
+    warmup_ratio: float = Field(ge=0.0, le=1.0, default=0.03)
+    weight_decay: float = Field(ge=0.0, le=1.0, default=0.0)
+    output_dir: str = "data/adapters"
+    dataset_path: str = "data/datasets/sft_train.jsonl"
+    max_examples: int | None = Field(default=None, ge=1)
+
+
 class UISection(BaseModel):
     """Optional output-window settings."""
 
@@ -118,6 +147,9 @@ class AppConfig(BaseModel):
     analysis: AnalysisSection = Field(default_factory=AnalysisSection)
     ui: UISection = Field(default_factory=UISection)
     logging: LoggingSection = Field(default_factory=LoggingSection)
+    finetune: FinetuneSection = Field(
+        default_factory=lambda: FinetuneSection(base_model="qwen/qwen3.5-9b")
+    )
 
 
 def load_config(path: str | Path) -> AppConfig:
