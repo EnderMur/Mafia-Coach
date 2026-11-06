@@ -48,7 +48,7 @@ from infra.llm.schemas import (
 )
 
 ROLES_PATH = Path(__file__).parents[4] / "configs" / "roles.yaml"
-PATTERNS_PATH = Path(__file__).parents[4] / "configs" / "club_patterns.yaml"
+PATTERNS_PATH = Path(__file__).parents[4] / "configs" / "club_patterns.example.yaml"
 BASE_TS = datetime(2026, 1, 1, tzinfo=UTC)
 
 
@@ -1148,8 +1148,23 @@ def test_composition_empty_quota_does_not_fill(
 
 
 def load_real_patterns() -> ClubPatterns:
-    """Load the repository's real club-patterns configuration."""
-    return load_club_patterns(PATTERNS_PATH)
+    """Load the example and add a synthetic direct-claim pattern for tests."""
+    example = load_club_patterns(PATTERNS_PATH)
+    return ClubPatterns.model_validate(
+        {
+            "patterns": [
+                *example.patterns,
+                {
+                    "id": "#2",
+                    "trigger": "Игрок заявил, что он мирный житель",
+                    "conclusion_role": "Мирный житель",
+                    "confidence_tier": 0.9,
+                    "requires_confirmation": False,
+                    "description": "Заявление о мирной роли",
+                },
+            ]
+        }
+    )
 
 
 async def test_pattern_direct_claim_gives_role_conf09_pattern_ids(
