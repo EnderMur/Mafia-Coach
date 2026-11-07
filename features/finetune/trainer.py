@@ -193,7 +193,7 @@ def _train_peft(*, options: TrainingOptions, dataset: Any, output_dir: Path) -> 
     model = AutoModelForCausalLM.from_pretrained(
         options.base_model,
         quantization_config=quantization_config,
-        device_map="auto" if quantization_config is not None else None,
+        device_map="cuda:0" if quantization_config is not None else None,
     )
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
