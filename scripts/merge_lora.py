@@ -1,3 +1,4 @@
+# mypy: disable-error-code="unused-ignore, attr-defined, import-not-found, misc"
 """Смержить PEFT LoRA адаптер с базовой моделью для LM Studio.
 
 LM Studio 0.3.20+ убрал/спрятал кнопку "Add LoRA" для GGUF-моделей.
@@ -41,6 +42,48 @@ from domain.exceptions import TrainingError
 
 LOG_CHANNEL = "finetune.merge"
 _DEFAULT_OUTPUT_BASE = "data/merged"
+
+# Workaround для бага transformers+bitsandbytes: 'frozenset' object has no attribute 'discard'
+# (встречается на 4.45-4.49 + bitsandbytes multi-backend, когда available_devices = frozenset)
+# Патчим функцию до первого from_pretrained, чтобы не падало даже на RTX 3060 / Windows
+try:
+    from transformers.integrations import bitsandbytes as _bnb_integ  # type: ignore[import-not-found]
+
+    _orig_validate = getattr(_bnb_integ, "_validate_bnb_multi_backend_availability", None)
+    if _orig_validate is not None:  # pragma: no cover
+
+        def _patched_validate_bnb_multi_backend_availability(raise_exception: bool = True):  # type: ignore[no-untyped-def]
+            try:
+                return _orig_validate(raise_exception=raise_exception)  # type: ignore[misc]
+            except AttributeError as exc:
+                if "frozenset" in str(exc) and "discard" in str(exc):
+                    # fallback: считаем что CUDA доступен, IPEX не нужен
+                    try:
+                        import torch  # type: ignore[import-not-found]
+
+                        if torch.cuda.is_available():
+                            return True
+                    except Exception as exc2:  # noqa: BLE001
+                        logger.debug("patched validate fallback failed: {}", exc2)
+                    return False
+                raise
+
+        _bnb_integ._validate_bnb_multi_backend_availability = (  # type: ignore[attr-defined]
+            _patched_validate_bnb_multi_backend_availability
+        )
+
+        # иногда баг прямо в get_available_devices -> frozenset
+        _orig_get = getattr(_bnb_integ, "get_available_devices", None)
+        if _orig_get is not None:  # pragma: no cover
+
+            def _patched_get_available_devices():  # type: ignore[no-untyped-def]
+                res = _orig_get()  # type: ignore[misc]
+                # _validate мутирует set, поэтому отдаём mutable set
+                return set(res) if isinstance(res, frozenset) else res
+
+            _bnb_integ.get_available_devices = _patched_get_available_devices  # type: ignore[attr-defined]
+except Exception as exc:  # noqa: BLE001
+    logger.debug("bitsandbytes patch skipped: {}", exc)
 
 
 def _resolve_base_model(adapter_dir: Path, cli_base: str | None) -> str:
