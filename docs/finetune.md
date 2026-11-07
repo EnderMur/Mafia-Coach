@@ -317,6 +317,37 @@ Avg confidence (wrong)          0.345      0.298
 > OpenAI-совместимый API LM Studio не принимает адаптер через параметры
 > запроса — загрузка только через UI model manager.
 
+### 5.1 Если кнопки Add LoRA нет (LM Studio 0.3.20+)
+
+В новых сборках LM Studio кнопку убрали для GGUF-моделей. Адаптер с `adapter_model.safetensors`
+напрямую не загрузить — нужно **смержить** его с базой один раз:
+
+```powershell
+pip install transformers peft accelerate torch --upgrade
+python scripts/merge_lora.py --adapter data/adapters/2026-11-07_04-19
+# base_model берётся из adapter_config.json; можно переопределить --base-model Qwen/Qwen2.5-7B-Instruct
+```
+
+Скрипт создаст `data/merged/<base>-mafia-merged_TIMESTAMP/` — это уже обычная HF-модель
+без LoRA. Дальше два варианта:
+
+**Вариант A — загрузить как HF (проще, без конвертации):**
+1. В LM Studio: `My Models` → клик по пути к папке моделей вверху → `Открыть в проводнике`
+2. Создай `C:\Users\<you>\.lmstudio\models\local\mafia-<base>\` и скопируй туда всё из `data/merged/...`
+3. Перезапусти LM Studio — появится `local/mafia-<base>` → `Load` → `Start Server`
+4. В `configs/settings.yaml` укажи `llm.model: "local/mafia-<base>"`
+
+**Вариант B — конвертировать в GGUF (экономия VRAM, рекомендуется для Qwen):**
+```bash
+git clone https://github.com/ggerganov/llama.cpp && cd llama.cpp
+python convert_hf_to_gguf.py ../Mafia-Coach/data/merged/xxx --outfile mafia.gguf
+# затем в LM Studio: lms import mafia.gguf
+# или вручную: скопируй mafia.gguf в .lmstudio/models/local/mafia-xxx/model.gguf (два уровня папок!)
+```
+
+Проверка: `curl http://localhost:1234/v1/models` должен вернуть имя смерженной модели.
+Подробнее см. вывод `python scripts/merge_lora.py --help`.
+
 ## 6. Конфигурация
 
 `configs/settings.example.yaml`:
