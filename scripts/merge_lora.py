@@ -19,9 +19,12 @@ LM Studio 0.3.20+ убрал/спрятал кнопку "Add LoRA" для GGUF-
     # 3. Результат: data/merged/qwen2.5-7b-mafia-merged/
     #    Импортируй его в LM Studio (см. вывод скрипта)
 
-По умолчанию — на CPU/ОЗУ (безопасно для 8Гб VRAM). Для скорости добавь --gpu:
+По умолчанию — на CPU/ОЗУ (HF 7B = ~15 ГБ, поэтому на 8-16 ГБ ОЗУ вылетает).
+Для LM Studio 7B весит 5 ГБ потому что там GGUF Q4_K_M — HF всегда тяжелее.
+Если ОЗУ мало (вылетает), используй квантование: --load-in-4bit (~5-6 ГБ) или --load-in-8bit (~8-9 ГБ).
+Для скорости на большой карте добавь --gpu:
     python scripts/merge_lora.py --adapter data/adapters/xxx --gpu
-Требует RAM ~ 1.2x размера модели. На 7B — около 16 Гб RAM/VRAM.
+Требует RAM ~ 1.2x размера модели в выбранном режиме. На 7B HF fp16 — ~16 Гб, 4-bit — ~6 Гб.
 """
 
 from __future__ import annotations
@@ -116,6 +119,21 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="переопределить accelerate device_map (напр. 'auto', 'cuda', 'cpu'). По умолчанию cpu, с --gpu -> auto",
     )
+    parser.add_argument(
+        "--load-in-4bit",
+        action="store_true",
+        help="квантовать базу в 4-bit NF4 (~5-6 ГБ ОЗУ вместо 15 ГБ для 7B). Требует bitsandbytes. Для 8-16 ГБ ОЗУ",
+    )
+    parser.add_argument(
+        "--load-in-8bit",
+        action="store_true",
+        help="квантовать базу в 8-bit (~8-9 ГБ ОЗУ для 7B). Требует bitsandbytes",
+    )
+    parser.add_argument(
+        "--low-memory",
+        action="store_true",
+        help="алиас для --load-in-4bit (совместимость)",
+    )
     args = parser.parse_args(argv)
 
     adapter_dir = Path(args.adapter)
@@ -128,6 +146,16 @@ def main(argv: list[str] | None = None) -> int:
     ):
         logger.bind(channel=LOG_CHANNEL).error(
             "в {} нет adapter_model.safetensors/.bin — это точно папка адаптера?", adapter_dir
+        )
+        return 1
+
+    # алиас
+    if args.low_memory:
+        args.load_in_4bit = True
+
+    if args.load_in_4bit and args.load_in_8bit:
+        logger.bind(channel=LOG_CHANNEL).error(
+            "нельзя одновременно --load-in-4bit и --load-in-8bit"
         )
         return 1
 
@@ -183,6 +211,33 @@ def main(argv: list[str] | None = None) -> int:
         model_kwargs: dict[str, Any] = {"trust_remote_code": True, "low_cpu_mem_usage": True}
         if torch_dtype != "auto":
             model_kwargs["torch_dtype"] = torch_dtype
+
+        # квантование для слабых машин (5-6 ГБ вместо 15 ГБ)
+        use_quant = args.load_in_4bit or args.load_in_8bit
+        if use_quant:
+            try:
+                from transformers import BitsAndBytesConfig
+            except ImportError as exc:
+                logger.bind(channel=LOG_CHANNEL).error(
+                    "для --load-in-4bit/8bit нужен bitsandbytes: pip install bitsandbytes --upgrade ({})",
+                    exc,
+                )
+                return 1
+            if args.load_in_4bit:
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_quant_type="nf4",
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_compute_dtype=torch.float16,
+                )
+                logger.bind(channel=LOG_CHANNEL).info("режим 4-bit NF4: ~5-6 ГБ ОЗУ для 7B")
+            else:
+                model_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+                logger.bind(channel=LOG_CHANNEL).info("режим 8-bit: ~8-9 ГБ ОЗУ для 7B")
+            # квантованную модель нужно раскидывать через accelerate
+            if "device_map" not in model_kwargs:
+                model_kwargs["device_map"] = "auto"
+
         # по умолчанию — CPU (безопасно), с --gpu — на VRAM
         requested_map: str | None = None
         if args.device_map is not None:
@@ -191,6 +246,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.gpu:
             requested_map = "auto"
             model_kwargs["device_map"] = "auto"
+        elif use_quant and "device_map" not in model_kwargs:
+            # квантование уже выставило auto выше
+            requested_map = str(model_kwargs.get("device_map", "auto"))
         # иначе device_map не ставим — грузим на CPU, потом peft сам разберётся
 
         # диагностика GPU перед загрузкой
