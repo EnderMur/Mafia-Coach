@@ -697,6 +697,10 @@ LM Studio → «My Models» → базовая модель → «Add LoRA» →
 «Start Server». OpenAI-совместимый API LM Studio не принимает адаптер через
 параметры запроса — только через UI model manager.
 
+> **Нет кнопки `Add LoRA` (LM Studio 0.3.20+)?** Кнопку убрали для GGUF. Смержь адаптер вручную:
+> `pip install transformers peft accelerate torch && python scripts/merge_lora.py --adapter data/adapters/YYYY-MM-DD_HH-MM`
+> → `data/merged/...` → скопируй в `.lmstudio/models/local/mafia-.../` → перезапусти LM Studio. Подробности: `docs/finetune.md §5.1`.
+
 ---
 
 ## 10. Структура проекта
