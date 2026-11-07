@@ -164,9 +164,22 @@ def _train_unsloth(*, options: TrainingOptions, dataset: Any, output_dir: Path) 
     return _finalize_report("unsloth", options, dataset, output_dir, metrics)
 
 
+def _compute_warmup_steps(*, dataset_size: int, options: TrainingOptions) -> int:
+    """Convert ``warmup_ratio`` to ``warmup_steps`` for TRL SFTConfig.
+
+    ``SFTConfig`` in trl>5.2 no longer accepts ``warmup_ratio``.
+    """
+    # total_steps = (len(dataset) // (batch_size * grad_accum)) * epochs
+    total_steps = (
+        dataset_size // (options.batch_size * options.gradient_accumulation_steps)
+    ) * options.epochs
+    return max(1, int(total_steps * options.warmup_ratio))
+
+
 def _train_peft(*, options: TrainingOptions, dataset: Any, output_dir: Path) -> FinetuneReport:
     """Run QLoRA/LoRA through transformers + PEFT + TRL (fallback backend)."""
     try:
+        import torch  # type: ignore[import-not-found]
         from peft import LoraConfig, TaskType, get_peft_model  # type: ignore[import-not-found]
         from transformers import (  # type: ignore[import-not-found]
             AutoModelForCausalLM,
@@ -190,11 +203,21 @@ def _train_peft(*, options: TrainingOptions, dataset: Any, output_dir: Path) -> 
     tokenizer = AutoTokenizer.from_pretrained(options.base_model)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    logger.bind(channel=LOG_CHANNEL).info(
+        "loading model {} (peft) on cuda:0, quantized={}",
+        options.base_model,
+        quantization_config is not None,
+    )
+    # device_map="cuda:0" — всегда грузим модель в GPU, не в ОЗУ (и LoRA, и QLoRA)
     model = AutoModelForCausalLM.from_pretrained(
         options.base_model,
         quantization_config=quantization_config,
-        device_map="cuda:0" if quantization_config is not None else None,
+        device_map="cuda:0",
     )
+    # для LoRA без квантования явно переводим модель на GPU и в bf16
+    if quantization_config is None:
+        model = model.to("cuda:0")
+        model = model.to(torch.bfloat16)
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,
         r=options.rank,
@@ -203,18 +226,30 @@ def _train_peft(*, options: TrainingOptions, dataset: Any, output_dir: Path) -> 
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
     )
     model = get_peft_model(model, lora_config)
+    # warmup_steps вместо warmup_ratio: SFTConfig в trl>5.2 больше не принимает warmup_ratio
+    warmup_steps = _compute_warmup_steps(dataset_size=len(dataset), options=options)
+    logger.bind(channel=LOG_CHANNEL).info(
+        "peft SFTConfig: warmup_steps={} gradient_checkpointing=True bf16=True",
+        warmup_steps,
+    )
     training_args = SFTConfig(
         output_dir=str(output_dir),
         num_train_epochs=options.epochs,
         per_device_train_batch_size=options.batch_size,
         gradient_accumulation_steps=options.gradient_accumulation_steps,
         learning_rate=options.learning_rate,
-        warmup_ratio=options.warmup_ratio,
+        warmup_steps=warmup_steps,
         weight_decay=options.weight_decay,
         logging_steps=10,
         save_strategy="no",
         max_length=options.max_seq_length,
+        gradient_checkpointing=True,  # экономия VRAM на RTX 3060
+        optim="paged_adamw_8bit",  # 8-bit Adam из bitsandbytes
+        fp16=False,
+        bf16=True,  # Qwen2.5 корректно работает в bf16
+        report_to="none",
     )
+    # TODO: проверить на trl>5.2 — processing_class вместо tokenizer
     trainer = SFTTrainer(
         model=model,
         args=training_args,
