@@ -19,8 +19,9 @@ LM Studio 0.3.20+ убрал/спрятал кнопку "Add LoRA" для GGUF-
     # 3. Результат: data/merged/qwen2.5-7b-mafia-merged/
     #    Импортируй его в LM Studio (см. вывод скрипта)
 
+По умолчанию — на CPU/ОЗУ (безопасно для 8Гб VRAM). Для скорости добавь --gpu:
+    python scripts/merge_lora.py --adapter data/adapters/xxx --gpu
 Требует RAM ~ 1.2x размера модели. На 7B — около 16 Гб RAM/VRAM.
-Мерж идёт на CPU, если нет CUDA — будет медленно, но сработает.
 """
 
 from __future__ import annotations
@@ -105,6 +106,16 @@ def main(argv: list[str] | None = None) -> int:
         default="auto",
         help="тип весов при загрузке",
     )
+    parser.add_argument(
+        "--gpu",
+        action="store_true",
+        help="грузить на VRAM (device_map=auto). Быстрее в 3-5 раз, но нужно 16+ Гб VRAM для 7B",
+    )
+    parser.add_argument(
+        "--device-map",
+        default=None,
+        help="переопределить accelerate device_map (напр. 'auto', 'cuda', 'cpu'). По умолчанию cpu, с --gpu -> auto",
+    )
     args = parser.parse_args(argv)
 
     adapter_dir = Path(args.adapter)
@@ -172,7 +183,12 @@ def main(argv: list[str] | None = None) -> int:
         model_kwargs: dict[str, Any] = {"trust_remote_code": True, "low_cpu_mem_usage": True}
         if torch_dtype != "auto":
             model_kwargs["torch_dtype"] = torch_dtype
-        # device_map не ставим — грузим на CPU, потом peft сам разберётся
+        # по умолчанию — CPU (безопасно), с --gpu — на VRAM
+        if args.device_map is not None:
+            model_kwargs["device_map"] = args.device_map
+        elif args.gpu:
+            model_kwargs["device_map"] = "auto"
+        # иначе device_map не ставим — грузим на CPU, потом peft сам разберётся
         base = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
     except Exception as exc:  # noqa: BLE001
         logger.bind(channel=LOG_CHANNEL).error("не удалось загрузить базу {}: {}", base_model, exc)
