@@ -184,11 +184,50 @@ def main(argv: list[str] | None = None) -> int:
         if torch_dtype != "auto":
             model_kwargs["torch_dtype"] = torch_dtype
         # по умолчанию — CPU (безопасно), с --gpu — на VRAM
+        requested_map: str | None = None
         if args.device_map is not None:
+            requested_map = args.device_map
             model_kwargs["device_map"] = args.device_map
         elif args.gpu:
+            requested_map = "auto"
             model_kwargs["device_map"] = "auto"
         # иначе device_map не ставим — грузим на CPU, потом peft сам разберётся
+
+        # диагностика GPU перед загрузкой
+        if requested_map is not None:
+            try:
+                cuda_ok = torch.cuda.is_available()
+                if not cuda_ok:
+                    logger.bind(channel=LOG_CHANNEL).warning(
+                        "--gpu/--device-map запрошен ({}), но torch.cuda.is_available()==False. "
+                        "Проверь: pip show torch должен быть +cuXXX и nvidia-smi видит карту. "
+                        "Откатываюсь на CPU — будет в ОЗУ, но смержится.",
+                        requested_map,
+                    )
+                else:
+                    props = torch.cuda.get_device_properties(0)
+                    free, _total = (
+                        torch.cuda.mem_get_info(0)
+                        if hasattr(torch.cuda, "mem_get_info")
+                        else (0, 0)
+                    )
+                    logger.bind(channel=LOG_CHANNEL).info(
+                        "CUDA {} (VRAM {:.1f} ГБ, свободно ~{:.1f} ГБ), device_map={}",
+                        torch.cuda.get_device_name(0),
+                        props.total_memory / (1024**3),
+                        free / (1024**3) if free else 0.0,
+                        requested_map,
+                    )
+                    # на GPU без явного dtype fp32 сожрёт всю VRAM — форсим fp16
+                    if torch_dtype == "auto":
+                        model_kwargs["torch_dtype"] = torch.float16
+                        logger.bind(channel=LOG_CHANNEL).info(
+                            "dtype auto -> float16 для экономии VRAM (переопредели --dtype bf16/fp32 если нужно)"
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.bind(channel=LOG_CHANNEL).warning("не удалось проверить CUDA: {}", exc)
+
+        logger.bind(channel=LOG_CHANNEL).info("from_pretrained kwargs: {}", model_kwargs)
         base = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
     except Exception as exc:  # noqa: BLE001
         logger.bind(channel=LOG_CHANNEL).error("не удалось загрузить базу {}: {}", base_model, exc)
@@ -205,12 +244,29 @@ def main(argv: list[str] | None = None) -> int:
         logger.bind(channel=LOG_CHANNEL).error("не удалось загрузить адаптер: {}", exc)
         return 1
 
+    # логируем куда реально разложилась база
+    try:
+        hf_map = getattr(base, "hf_device_map", None) or getattr(model, "hf_device_map", None)
+        if hf_map:
+            logger.bind(channel=LOG_CHANNEL).info("hf_device_map после загрузки: {}", hf_map)
+        elif hasattr(base, "device"):
+            logger.bind(channel=LOG_CHANNEL).info(
+                "модель на устройстве: {}", getattr(base, "device", "unknown")
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.bind(channel=LOG_CHANNEL).debug("не удалось получить hf_device_map: {}", exc)
+
     # 3. мерж
     logger.bind(channel=LOG_CHANNEL).info("мёржу веса (merge_and_unload) ... это займёт 1-5 минут")
     try:
         merged = model.merge_and_unload()
     except Exception as exc:  # noqa: BLE001
         logger.bind(channel=LOG_CHANNEL).error("ошибка мержа: {}", exc)
+        if "CUDA out of memory" in str(exc):
+            logger.bind(channel=LOG_CHANNEL).error(
+                "VRAM кончилась — 7B в fp16 нужно ~15 ГБ. Запусти без --gpu (на ОЗУ) или с квантованием: "
+                "--device-map cpu или закрой LM Studio/браузер"
+            )
         return 1
 
     # 4. сохраняем
