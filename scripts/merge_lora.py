@@ -43,26 +43,44 @@ from domain.exceptions import TrainingError
 LOG_CHANNEL = "finetune.merge"
 _DEFAULT_OUTPUT_BASE = "data/merged"
 
-# Workaround для бага transformers+bitsandbytes: 'frozenset' object has no attribute 'discard'
-# (встречается на 4.45-4.49 + bitsandbytes multi-backend, когда available_devices = frozenset)
-# Патчим функцию до первого from_pretrained, чтобы не падало даже на RTX 3060 / Windows
+# Workaround для багов transformers+bitsandbytes: 'frozenset' discard и 'available_devices=None'
+# (встречается на 4.45-4.49 + bitsandbytes multi-backend на RTX 3060 / Windows / CPU torch)
 try:
     from transformers.integrations import bitsandbytes as _bnb_integ  # type: ignore[import-not-found]
 
+    # патчим _validate чтобы не падал на frozenset и на None
     _orig_validate = getattr(_bnb_integ, "_validate_bnb_multi_backend_availability", None)
     if _orig_validate is not None:  # pragma: no cover
 
         def _patched_validate_bnb_multi_backend_availability(raise_exception: bool = True):  # type: ignore[no-untyped-def]
             try:
                 return _orig_validate(raise_exception=raise_exception)  # type: ignore[misc]
-            except AttributeError as exc:
-                if "frozenset" in str(exc) and "discard" in str(exc):
-                    # fallback: считаем что CUDA доступен, IPEX не нужен
+            except (AttributeError, ValueError, TypeError) as exc:
+                msg = str(exc)
+                # 1) классический баг: frozenset discard
+                # 2) новый: available_devices=None -> "None of the available devices ... are supported"
+                if (
+                    "frozenset" in msg
+                    and "discard" in msg
+                    or "available_devices" in msg
+                    and "None" in msg
+                ):
                     try:
                         import torch  # type: ignore[import-not-found]
 
                         if torch.cuda.is_available():
+                            logger.warning(
+                                "bitsandbytes backend check упал ({}), но CUDA видна — форсирую cuda",
+                                msg,
+                            )
                             return True
+                        else:
+                            logger.warning(
+                                "bitsandbytes backend недоступен ({}). torch без +cuXXX, CUDA не видна. "
+                                "Фолбэк на CPU/offload будет позже.",
+                                msg,
+                            )
+                            return False
                     except Exception as exc2:  # noqa: BLE001
                         logger.debug("patched validate fallback failed: {}", exc2)
                     return False
@@ -72,14 +90,30 @@ try:
             _patched_validate_bnb_multi_backend_availability
         )
 
-        # иногда баг прямо в get_available_devices -> frozenset
+        # иногда баг прямо в get_available_devices -> frozenset или None
         _orig_get = getattr(_bnb_integ, "get_available_devices", None)
         if _orig_get is not None:  # pragma: no cover
 
             def _patched_get_available_devices():  # type: ignore[no-untyped-def]
-                res = _orig_get()  # type: ignore[misc]
-                # _validate мутирует set, поэтому отдаём mutable set
-                return set(res) if isinstance(res, frozenset) else res
+                try:
+                    res = _orig_get()  # type: ignore[misc]
+                except Exception:  # noqa: BLE001
+                    res = None
+                if res is None:
+                    # bitsandbytes не нашёл бекенд — отдаём то что есть у torch
+                    try:
+                        import torch  # type: ignore[import-not-found]
+
+                        if torch.cuda.is_available():
+                            return {"cuda"}
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug("patched get_available_devices fallback: {}", exc)
+                    return set()
+                if isinstance(res, frozenset):
+                    return set(res)
+                if isinstance(res, (set, list, tuple)):
+                    return set(res)
+                return res
 
             _bnb_integ.get_available_devices = _patched_get_available_devices  # type: ignore[attr-defined]
 except Exception as exc:  # noqa: BLE001
@@ -329,12 +363,63 @@ def main(argv: list[str] | None = None) -> int:
                 logger.bind(channel=LOG_CHANNEL).warning("не удалось проверить CUDA: {}", exc)
 
         logger.bind(channel=LOG_CHANNEL).info("from_pretrained kwargs: {}", model_kwargs)
-        base = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
+        try:
+            base = AutoModelForCausalLM.from_pretrained(base_model, **model_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            msg = str(exc)
+            # bitsandbytes без CUDA-бекенда (torch CPU) — главная причина вылета на RTX 3060 с torch 2.15 CPU
+            if "available_devices" in msg and "bitsandbytes" in msg and use_quant:
+                logger.bind(channel=LOG_CHANNEL).warning(
+                    "bitsandbytes 4-bit не поддерживается: {} — пробую фолбэк без квантования (offload на диск)",
+                    msg,
+                )
+                # пробуем без квантования, но с оффлоадом на диск (медленнее, но не требует 15 ГБ ОЗУ целиком)
+                fallback_kwargs: dict[str, Any] = {
+                    k: v for k, v in model_kwargs.items() if k != "quantization_config"
+                }
+                # форсим fp16 чтобы хоть немного сэкономить
+                if (
+                    fallback_kwargs.get("torch_dtype") == "auto"
+                    or "torch_dtype" not in fallback_kwargs
+                ):
+                    fallback_kwargs["torch_dtype"] = torch.float16
+                fallback_kwargs["device_map"] = "auto"
+                fallback_kwargs["offload_folder"] = "offload"
+                fallback_kwargs["offload_state_dict"] = True
+                fallback_kwargs["low_cpu_mem_usage"] = True
+                logger.bind(channel=LOG_CHANNEL).info("фолбэк kwargs: {}", fallback_kwargs)
+                try:
+                    base = AutoModelForCausalLM.from_pretrained(base_model, **fallback_kwargs)
+                    logger.bind(channel=LOG_CHANNEL).info(
+                        "фолбэк удался — мерж пойдёт через оффлоад на диск (медленнее, закрой LM Studio/браузер)"
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    logger.bind(channel=LOG_CHANNEL).error(
+                        "фолбэк тоже не удался: {} — проверь ОЗУ/диск и попробуй без --load-in-4bit (нужно 16 ГБ) "
+                        "или поставь torch+CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu124",
+                        exc2,
+                    )
+                    logger.bind(channel=LOG_CHANNEL).error(
+                        "не удалось загрузить базу {}: {}", base_model, exc
+                    )
+                    return 1
+            else:
+                logger.bind(channel=LOG_CHANNEL).error(
+                    "не удалось загрузить базу {}: {}", base_model, exc
+                )
+                logger.bind(channel=LOG_CHANNEL).error(
+                    "проверь id модели и интернет. Для Qwen3.5 из конфига пример: Qwen/Qwen2.5-7B-Instruct"
+                )
+                if use_quant and "bitsandbytes" in msg.lower():
+                    logger.bind(channel=LOG_CHANNEL).error(
+                        "Подсказка: torch у тебя CPU ({}) без CUDA, поэтому bitsandbytes 4-bit не работает. "
+                        "Поставь torch с CUDA: pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124 --force-reinstall "
+                        "или мержи без флага (нужно 16 ГБ ОЗУ) или с --load-in-8bit без bitsandbytes через offload.",
+                        torch.__version__,
+                    )
+                return 1
     except Exception as exc:  # noqa: BLE001
-        logger.bind(channel=LOG_CHANNEL).error("не удалось загрузить базу {}: {}", base_model, exc)
-        logger.bind(channel=LOG_CHANNEL).error(
-            "проверь id модели и интернет. Для Qwen3.5 из конфига пример: Qwen/Qwen2.5-7B-Instruct"
-        )
+        logger.bind(channel=LOG_CHANNEL).error("ошибка подготовки загрузки: {}", exc)
         return 1
 
     # 2. навешиваем LoRA
