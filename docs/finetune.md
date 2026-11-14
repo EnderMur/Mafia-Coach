@@ -615,8 +615,8 @@ $env:FINETUNE_LOCAL_FILES_ONLY = "1"
 
 Скрипт логирует `mode` и число токенов:
 
-- `count_only`: публичный сервер не вернул `_debug_info.rendered_template` либо
-  отклонил debug-флаг; локальная длина `apply_chat_template(..., tokenize=True,
+- `count_only` (в результате `count_only=True`): публичный сервер не вернул
+  `_debug_info.rendered_template` либо отклонил debug-флаг; локальная длина `apply_chat_template(..., tokenize=True,
   add_generation_prompt=True)` равна `prompt_eval_count` реального `/api/chat`.
   **Это слабая проверка:** равное количество токенов не доказывает совпадение
   их ID, рендера или шаблона. При несовпадении количества проверка завершается

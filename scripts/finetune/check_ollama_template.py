@@ -105,7 +105,13 @@ def compare_ollama_prompt(
             "Ollama не предоставил debug-рендер: совпало только число токенов; "
             "совпадение шаблона и ID не доказано"
         )
-        return {"model": model, "prompt_tokens": len(training_ids), "mode": "count_only"}
+        # Равное число токенов не доказывает совпадение шаблона/ID — это ослабленная проверка.
+        return {
+            "model": model,
+            "prompt_tokens": len(training_ids),
+            "mode": "count_only",
+            "count_only": True,
+        }
 
     # В некоторых версиях Ollama доступны дополнительный debug и legacy context.
     generate = {
@@ -120,7 +126,12 @@ def compare_ollama_prompt(
     generate_debug = _rendered(_optional_debug(client, "/api/generate", generate))
     if generate_debug is None:
         logger.warning("Debug /api/generate недоступен: проверены только рендер и число токенов")
-        return {"model": model, "prompt_tokens": len(training_ids), "mode": "render_and_count"}
+        return {
+            "model": model,
+            "prompt_tokens": len(training_ids),
+            "mode": "render_and_count",
+            "count_only": False,
+        }
     if generate_debug != rendered:
         raise ValueError("Контрольный запрос Ollama изменил промпт")
     result = _post(client, "/api/generate", generate)
@@ -129,7 +140,12 @@ def compare_ollama_prompt(
     context, count = result.get("context"), result.get("prompt_eval_count")
     if context is None:
         logger.warning("Ollama не вернул context: проверены только рендер и число токенов")
-        return {"model": model, "prompt_tokens": len(training_ids), "mode": "render_and_count"}
+        return {
+            "model": model,
+            "prompt_tokens": len(training_ids),
+            "mode": "render_and_count",
+            "count_only": False,
+        }
     if (
         not isinstance(context, list)
         or not all(type(i) is int for i in context)
@@ -140,7 +156,12 @@ def compare_ollama_prompt(
         raise RuntimeError("Некорректные context или prompt_eval_count от Ollama")
     if count != len(training_ids) or context[:count] != training_ids:
         raise ValueError("Токены Ollama отличаются от токенов обучения (включая BOS/усечение)")
-    return {"model": model, "prompt_tokens": count, "mode": "render_and_tokens"}
+    return {
+        "model": model,
+        "prompt_tokens": count,
+        "mode": "render_and_tokens",
+        "count_only": False,
+    }
 
 
 def warn_if_no_cuda() -> None:

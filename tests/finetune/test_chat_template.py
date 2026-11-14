@@ -148,6 +148,7 @@ def test_server_comparison_success_and_render_drift():
         result = compare_ollama_prompt(client, "model", Tokenizer(), messages, 100)
         assert result["prompt_tokens"] == 2
         assert result["mode"] == "render_and_tokens"
+        assert result["count_only"] is False
 
     def bad_render(request):
         return httpx.Response(200, json={"_debug_info": {"rendered_template": "other"}})
@@ -192,6 +193,7 @@ def test_public_ollama_fallback_and_think_false():
     with httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test") as client:
         result = compare_ollama_prompt(client, "model", Tokenizer(), messages, 100)
     assert result["mode"] == "count_only"
+    assert result["count_only"] is True
     assert result["prompt_tokens"] == 2
     assert len(requests) == 2
     assert all(path == "/api/chat" and body["think"] is False for path, body in requests)
@@ -354,6 +356,7 @@ def test_render_mode_without_generate_debug():
     with httpx.Client(transport=httpx.MockTransport(handler), base_url="http://test") as client:
         result = compare_ollama_prompt(client, "model", Tokenizer(), messages, 100)
     assert result["mode"] == "render_and_count"
+    assert result["count_only"] is False
 
 
 def test_run_with_public_ollama_base_tokenizer_and_no_cuda(tmp_path, monkeypatch):
@@ -420,5 +423,6 @@ def test_run_with_public_ollama_base_tokenizer_and_no_cuda(tmp_path, monkeypatch
     }
     result = check_ollama_template.run(config, "http://test", "model", sample)
     assert result["mode"] == "count_only" and result["ollama_version"] == "test"
+    assert result["count_only"] is True
     assert calls == [("Qwen/Qwen3.5-9B", {"local_files_only": False})]
     assert any("CUDA не обнаружена" in warning for warning in warnings)
