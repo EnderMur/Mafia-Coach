@@ -133,17 +133,28 @@ class GameState:
                     or placeholder.is_winner is not None
                 ):
                     existing = placeholder
+        effective_display_name = display_name
+        if (
+            existing is not None
+            and display_name == f"user_{player_id}"
+            and existing.display_name != f"user_{player_id}"
+        ):
+            # Telegram may temporarily expose only the synthetic user_<id>
+            # name; keep an already observed human-readable name for matching
+            # subsequent ALIVE_LIST snapshots.
+            effective_display_name = existing.display_name
+
         if existing is None:
             player = Player(
                 player_id=player_id,
                 username=username,
-                display_name=display_name,
+                display_name=effective_display_name,
             )
         else:
             player = Player(
                 player_id=player_id,
                 username=username,
-                display_name=display_name,
+                display_name=effective_display_name,
                 alive=existing.alive,
                 known_role=existing.known_role,
                 revealed=existing.revealed,
