@@ -1,2 +1,4 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+infra/llm/prompts/finetune_chat.jinja text eol=lf
+infra/llm/prompts/finetune_ollama.gotmpl text eol=lf

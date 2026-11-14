@@ -209,3 +209,17 @@ configs/club_patterns.yaml
 !configs/club_patterns.example.yaml
 .DS_Store
 Thumbs.db
+
+# Локальные результаты обучения и конвертации
+data/merged/
+data/finetune_export/
+tools/llama.cpp/
+*.gguf
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+*.jsonl
+*.parquet
+*.arrow
+*.bin

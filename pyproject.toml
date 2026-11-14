@@ -69,6 +69,11 @@ disallow_incomplete_defs = false
 disallow_untyped_calls = false
 
 [[tool.mypy.overrides]]
+module = ["scripts.finetune.train_lora", "scripts.finetune.export", "scripts.finetune.check_ollama_template"]
+ignore_missing_imports = true
+disable_error_code = ["misc", "import-not-found"]
+
+[[tool.mypy.overrides]]
 module = ["scripts.merge_lora"]
 ignore_missing_imports = true
 warn_unused_ignores = false
@@ -91,8 +96,9 @@ exclude_lines = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["integration: ручная проверка с работающим внешним раннером"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.setuptools.packages.find]
-include = ["app*", "domain*", "infra*", "features*"]
+include = ["app*", "domain*", "infra*", "features*", "scripts*"]

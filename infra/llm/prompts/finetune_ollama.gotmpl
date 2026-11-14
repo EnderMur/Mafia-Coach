@@ -1,0 +1,1 @@
+{{- range .Messages }}{{- "<|im_start|>" }}{{- .Role }}{{- "\n" }}{{- .Content }}{{- "<|im_end|>\n" }}{{- end }}{{- "<|im_start|>assistant\n" }}{{- .Response }}{{- if .Response }}{{- "<|im_end|>\n" }}{{- end }}
