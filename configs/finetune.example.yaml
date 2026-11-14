@@ -1,0 +1,27 @@
+# Пути относительно корня репозитория; веса и данные не коммитить.
+base_model: Qwen/Qwen3.5-9B
+method: qlora # qlora или lora
+chat_template: infra/llm/prompts/finetune_chat.jinja
+ollama_template: infra/llm/prompts/finetune_ollama.gotmpl
+dataset_dir: data/datasets/finetune
+adapter_dir: data/adapters/finetune
+export_dir: data/finetune_export
+llama_cpp_dir: tools/llama.cpp
+# Классы изолируются по сообществу; каждое сообщество принадлежит одному сплиту.
+train_communities: [клуб_а, клуб_б]
+val_communities: [клуб_в]
+test_communities: [клуб_г]
+max_class_fraction: 0.70
+seed: 42
+rank: 16
+alpha: 32
+dropout: 0.05
+learning_rate: 0.0002
+epochs: 3
+batch_size: 1
+gradient_accumulation_steps: 8
+max_seq_length: 4096
+# Примерные пороги для первичного скрининга, не доказательство качества.
+max_val_loss: 2.0
+max_val_train_gap: 0.5
+max_val_loss_increase: 0.2
