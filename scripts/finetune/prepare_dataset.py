@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import random
 import sqlite3
@@ -47,28 +48,79 @@ def build_record(conn: sqlite3.Connection, annotation: dict[str, Any]) -> dict[s
     registry = load_roles(ROOT / "configs/roles.yaml")
     game_id, cutoff = int(annotation["game_id"]), int(annotation["cutoff_event_id"])
     rows = conn.execute(
-        "SELECT id, ts, kind, payload_json FROM events WHERE game_id=? AND id<=? ORDER BY id",
+        "SELECT id, ts, kind, payload_json FROM events WHERE game_id=? AND id<=?",
         (game_id, cutoff),
     ).fetchall()
-    if not rows or rows[-1][0] != cutoff or rows[-1][2] not in PUBLIC:
-        raise ValueError("Граница должна указывать на публичное событие партии")
+    cutoff_row = next((row for row in rows if row[0] == cutoff), None)
+    if cutoff_row is None or cutoff_row[2] not in PUBLIC:
+        raise ValueError(
+            f"Игра {game_id}: граница event_id={cutoff} должна указывать "
+            "на публичное событие партии"
+        )
+
+    timed_rows = []
+    for event_id, ts, kind, payload_json in rows:
+        try:
+            current_ts = datetime.fromisoformat(ts)
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                f"Игра {game_id}: некорректный timestamp события event_id={event_id}: {ts!r}"
+            ) from error
+        if current_ts.tzinfo is None or current_ts.utcoffset() is None:
+            raise ValueError(
+                f"Игра {game_id}: у события event_id={event_id} timestamp без часового пояса"
+            )
+        timed_rows.append((current_ts, event_id, ts, kind, payload_json))
+
+    # Порядок SQLite по id не гарантирует хронологию. Сравнение datetime
+    # учитывает смещения часовых поясов; event_id даёт устойчивый tie-breaker.
+    timed_rows.sort(key=lambda row: (row[0], row[1]))
+    for previous, current in itertools.pairwise(timed_rows):
+        if current[0] < previous[0]:
+            raise ValueError(
+                f"Игра {game_id}: нарушена хронология между событиями "
+                f"event_id={previous[1]} и event_id={current[1]}"
+            )
+
     state = GameState(game_id=game_id, registry=registry)
     previous_ts = None
-    for _, ts, kind, payload_json in rows:
-        current_ts = datetime.fromisoformat(ts)
-        if current_ts.tzinfo is None or (previous_ts is not None and current_ts < previous_ts):
-            raise ValueError("События должны иметь упорядоченное время с часовым поясом")
-        previous_ts = current_ts
+    previous_event_id = None
+    for current_ts, event_id, ts, kind, payload_json in timed_rows:
         if kind == "end_game":
-            raise ValueError("Снимок после завершения игры запрещён")
+            raise ValueError(
+                f"Игра {game_id}: снимок после завершения игры (event_id={event_id}) запрещён"
+            )
         if kind not in PUBLIC:
             continue
         cls, allowed = PUBLIC[kind]
         payload = json.loads(payload_json)
         public = {key: payload[key] for key in allowed if key in payload}
+        if kind == "message":
+            author_id = public.get("author_id")
+            author = next(
+                (player for player in state.players() if player.player_id == author_id), None
+            )
+            if author is not None and not author.alive:
+                logger.debug(
+                    "Пропущено сообщение после смерти игрока: game_id={}, event_id={}, author_id={}",
+                    game_id,
+                    event_id,
+                    author_id,
+                )
+                # Пропуск не изменяет previous_ts и не передаёт событие агрегату.
+                continue
+        if previous_ts is not None and current_ts < previous_ts:
+            raise ValueError(
+                f"Игра {game_id}: нарушена хронология между событиями "
+                f"event_id={previous_event_id} и event_id={event_id}"
+            )
+        previous_ts = current_ts
+        previous_event_id = event_id
         event = cls.model_validate({"ts": ts, "game_id": game_id, "payload": public})
         if kind == "phase_change" and public.get("to_phase") == "end":
-            raise ValueError("Снимок после завершения игры запрещён")
+            raise ValueError(
+                f"Игра {game_id}: снимок после завершения игры (event_id={event_id}) запрещён"
+            )
         if kind == "message":
             state.register_player(public["author_id"], public["author_name"])
         elif kind == "role_reveal":

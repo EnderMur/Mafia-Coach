@@ -132,6 +132,100 @@ def test_public_allowlist_and_schema(tmp_path):
     assert set(rec) == {"messages"}
 
 
+def test_message_from_dead_player_is_skipped_before_apply(tmp_path):
+    db = tmp_path / "dead-player.db"
+    make_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM events WHERE game_id=1")
+        events = [
+            (
+                10,
+                "2026-01-01T00:00:00+00:00",
+                "message",
+                {"author_id": 1, "author_name": "Аня", "text": "Первая реплика."},
+            ),
+            (
+                11,
+                "2026-01-01T00:01:00+00:00",
+                "death",
+                {"victim_id": 1, "victim_name": "Аня", "cause": "lynch"},
+            ),
+            (
+                12,
+                "2026-01-01T00:02:00+00:00",
+                "message",
+                {
+                    "author_id": 1,
+                    "author_name": "Аня",
+                    "text": "__Результат проверки: мирный.__",
+                },
+            ),
+        ]
+        conn.executemany(
+            "INSERT INTO events VALUES (?, 1, ?, ?, ?)",
+            [
+                (event_id, ts, kind, json.dumps(payload, ensure_ascii=False))
+                for event_id, ts, kind, payload in events
+            ],
+        )
+        record = build_record(
+            conn,
+            {"game_id": 1, "cutoff_event_id": 12, "response": answer("Доктор")},
+        )
+
+    input_text = json.dumps(record["messages"][:-1], ensure_ascii=False)
+    assert "Первая реплика." in input_text
+    assert "Результат проверки" not in input_text
+
+
+def test_nonmonotonic_event_rows_are_sorted_by_timestamp_then_id(tmp_path):
+    db = tmp_path / "out-of-order.db"
+    make_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM events WHERE game_id=1")
+        events = [
+            (10, "2026-01-01T00:02:00+00:00", "Поздняя реплика."),
+            (11, "2026-01-01T00:01:00+00:00", "Ранняя реплика."),
+            (12, "2026-01-01T00:01:00+00:00", "Реплика с тем же временем."),
+        ]
+        conn.executemany(
+            "INSERT INTO events VALUES (?, 1, ?, 'message', ?)",
+            [
+                (
+                    event_id,
+                    ts,
+                    json.dumps(
+                        {"author_id": 1, "author_name": "Аня", "text": text},
+                        ensure_ascii=False,
+                    ),
+                )
+                for event_id, ts, text in events
+            ],
+        )
+        record = build_record(
+            conn,
+            {"game_id": 1, "cutoff_event_id": 12, "response": answer("Доктор")},
+        )
+
+    prompt_messages = json.dumps(record["messages"][:-1], ensure_ascii=False)
+    first = prompt_messages.index("Ранняя реплика.")
+    tied = prompt_messages.index("Реплика с тем же временем.")
+    last = prompt_messages.index("Поздняя реплика.")
+    assert first < tied < last
+
+
+def test_mock_game_builds_a_valid_training_record(tmp_path):
+    db, _, annotations = fixture_data(tmp_path)
+    with sqlite3.connect(db) as conn:
+        record = build_record(conn, annotations[0])
+
+    assert len(record["messages"]) == 3
+    assert record["messages"][0]["role"] == "system"
+    assert record["messages"][1]["role"] == "user"
+    assert record["messages"][2]["role"] == "assistant"
+    AnalysisResponse.model_validate_json(record["messages"][2]["content"])
+
+
 def test_prepare_splits_balance_and_validate(tmp_path):
     _, config, annotations = fixture_data(tmp_path)
     report = prepare(config, annotations)
