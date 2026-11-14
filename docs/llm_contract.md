@@ -9,6 +9,40 @@ request parameters are supplied by application configuration.
 Streaming is enabled only for the reasoning channel. The final structured
 response is assembled after generation completes.
 
+### Ollama-провайдер: обязательные параметры запроса
+
+Нативный клиент Ollama обязан передавать `"think": false` в теле **каждого**
+запроса `POST /api/chat`, включая потоковые запросы и повторы. Это обязательное
+значение протокола, а не пользовательская настройка. Отключение через
+`PARAMETER think false` в Modelfile Ollama не поддерживается: параметр задаётся
+в теле запроса. На клиент LM Studio и его OpenAI-совместимый endpoint это
+правило не распространяется; поле `think` в его запросы не добавляется.
+
+По результату ручной проверки `qwen3.5:9b` из описания задачи без параметра
+на ответ «Привет» было израсходовано `eval_count = 360` токенов, из которых
+около 350 находились в `message.thinking`. При `think=false` — `eval_count = 11`,
+`message.thinking` пуст и ответ находится в `message.content`. Эти цифры —
+наблюдение конкретного прогона, а не гарантированный результат для всех моделей.
+`message.thinking` — отдельный канал Ollama, не поле схемы `AnalysisResponse`;
+он может потратить лимит генерации до получения полного JSON в `message.content`.
+Само наличие отдельного поля не означает, что непустой корректный JSON в
+`content` автоматически становится невалидным.
+
+`infra/llm/ollama.py::OllamaClient` использует нативный API и при непустом
+`message.thinking` вопреки `think=false` завершает запрос ошибкой. Если сервер
+отклоняет параметр, клиент возвращает HTTP-ошибку без повторения запроса без
+него. Сервер, который молча игнорирует неизвестное поле и не возвращает
+`thinking`, обнаружить по такому ответу невозможно: совместимость версии и
+модели необходимо проверить отдельно. При `think=false` поток reasoning не
+ожидается; для анализа используется JSON из `message.content`.
+
+В стандартном `app.bootstrap` пока автоматически создаётся `LMStudioClient`:
+настройка провайдера Ollama через обычный конфиг не реализована. Для нативного
+Ollama вызывающий может явно создать `OllamaClient`, вызвать его `healthcheck()`
+и передать его через `bootstrap(..., llm_client=client)`; вызывающий отвечает
+за `aclose()`. Одной замены адреса LM Studio в настройках недостаточно: путь и
+формат нативного API Ollama отличаются.
+
 ## 2. AnalysisResponse schema (v1)
 
 | Field | Type | Required | Constraints |
