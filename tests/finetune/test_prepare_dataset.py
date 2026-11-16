@@ -132,6 +132,191 @@ def test_public_allowlist_and_schema(tmp_path):
     assert set(rec) == {"messages"}
 
 
+def test_message_from_dead_player_is_skipped_before_apply(tmp_path):
+    db = tmp_path / "dead-player.db"
+    make_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM events WHERE game_id=1")
+        events = [
+            (
+                10,
+                "2026-01-01T00:00:00+00:00",
+                "message",
+                {"author_id": 1, "author_name": "Аня", "text": "Первая реплика."},
+            ),
+            (
+                11,
+                "2026-01-01T00:01:00+00:00",
+                "death",
+                {"victim_id": 1, "victim_name": "Аня", "cause": "lynch"},
+            ),
+            (
+                12,
+                "2026-01-01T00:02:00+00:00",
+                "message",
+                {
+                    "author_id": 1,
+                    "author_name": "Аня",
+                    "text": "__Результат проверки: мирный.__",
+                },
+            ),
+        ]
+        conn.executemany(
+            "INSERT INTO events VALUES (?, 1, ?, ?, ?)",
+            [
+                (event_id, ts, kind, json.dumps(payload, ensure_ascii=False))
+                for event_id, ts, kind, payload in events
+            ],
+        )
+        record = build_record(
+            conn,
+            {"game_id": 1, "cutoff_event_id": 12, "response": answer("Доктор")},
+        )
+
+    input_text = json.dumps(record["messages"][:-1], ensure_ascii=False)
+    assert "Первая реплика." in input_text
+    assert "Результат проверки" not in input_text
+
+
+def _build_record_after_alive_list_name_change(tmp_path, name, player_id, game_id):
+    db = tmp_path / f"name-change-{game_id}.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "CREATE TABLE events (id INTEGER, game_id INTEGER, ts TEXT, kind TEXT, payload_json TEXT)"
+        )
+        events = [
+            (
+                1495,
+                "2026-01-01T00:00:00+00:00",
+                "message",
+                {"author_id": player_id, "author_name": name, "text": "Первая реплика."},
+            ),
+            (
+                1496,
+                "2026-01-01T00:01:00+00:00",
+                "message",
+                {
+                    "author_id": player_id,
+                    "author_name": f"user_{player_id}",
+                    "text": "Вторая реплика.",
+                },
+            ),
+            (
+                1506,
+                "2026-01-01T00:02:00+00:00",
+                "alive_list",
+                {"alive_player_names": [name]},
+            ),
+            (
+                1520,
+                "2026-01-01T00:03:00+00:00",
+                "death",
+                {"victim_id": player_id, "victim_name": name, "cause": "lynch"},
+            ),
+        ]
+        conn.executemany(
+            "INSERT INTO events VALUES (?, ?, ?, ?, ?)",
+            [
+                (event_id, game_id, ts, kind, json.dumps(payload, ensure_ascii=False))
+                for event_id, ts, kind, payload in events
+            ],
+        )
+        response = {
+            "analysis": [
+                {
+                    "player_id": player_id,
+                    "player_name": name,
+                    "suspected_role": "Доктор",
+                    "confidence": 0.5,
+                    "reason": "Есть реплики.",
+                    "reasons": ["Есть реплики."],
+                    "pattern_ids": [],
+                    "pattern_descriptions": [],
+                }
+            ],
+            "game_read": "Игра продолжается.",
+        }
+        return build_record(
+            conn,
+            {"game_id": game_id, "cutoff_event_id": 1520, "response": response},
+        )
+
+
+def test_name_change_to_user_prefix_does_not_mark_player_dead(tmp_path):
+    record = _build_record_after_alive_list_name_change(tmp_path, "Kizy", 6319004559, game_id=12)
+    assert (
+        AnalysisResponse.model_validate_json(record["messages"][-1]["content"])
+        .analysis[0]
+        .player_name
+        == "Kizy"
+    )
+
+
+def test_real_name_with_user_prefix_is_preserved(tmp_path):
+    name = "user_клубный_ник"
+    record = _build_record_after_alive_list_name_change(tmp_path, name, 80001, game_id=15)
+    prediction = AnalysisResponse.model_validate_json(record["messages"][-1]["content"]).analysis[0]
+    assert prediction.player_name == name
+
+
+@pytest.mark.parametrize(
+    ("name", "player_id", "game_id"),
+    [("Анна", 1743930626, 13), ("bl1ndii", 6335673414, 14)],
+)
+def test_same_for_other_players(tmp_path, name, player_id, game_id):
+    record = _build_record_after_alive_list_name_change(tmp_path, name, player_id, game_id)
+    prediction = AnalysisResponse.model_validate_json(record["messages"][-1]["content"]).analysis[0]
+    assert prediction.player_name == name
+
+
+def test_nonmonotonic_event_rows_are_sorted_by_timestamp_then_id(tmp_path):
+    db = tmp_path / "out-of-order.db"
+    make_db(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM events WHERE game_id=1")
+        events = [
+            (10, "2026-01-01T00:02:00+00:00", "Поздняя реплика."),
+            (11, "2026-01-01T00:01:00+00:00", "Ранняя реплика."),
+            (12, "2026-01-01T00:01:00+00:00", "Реплика с тем же временем."),
+        ]
+        conn.executemany(
+            "INSERT INTO events VALUES (?, 1, ?, 'message', ?)",
+            [
+                (
+                    event_id,
+                    ts,
+                    json.dumps(
+                        {"author_id": 1, "author_name": "Аня", "text": text},
+                        ensure_ascii=False,
+                    ),
+                )
+                for event_id, ts, text in events
+            ],
+        )
+        record = build_record(
+            conn,
+            {"game_id": 1, "cutoff_event_id": 12, "response": answer("Доктор")},
+        )
+
+    prompt_messages = json.dumps(record["messages"][:-1], ensure_ascii=False)
+    first = prompt_messages.index("Ранняя реплика.")
+    tied = prompt_messages.index("Реплика с тем же временем.")
+    last = prompt_messages.index("Поздняя реплика.")
+    assert first < tied < last
+
+
+def test_mock_game_builds_a_valid_training_record(tmp_path):
+    db, _, annotations = fixture_data(tmp_path)
+    with sqlite3.connect(db) as conn:
+        record = build_record(conn, annotations[0])
+
+    assert len(record["messages"]) == 3
+    assert record["messages"][0]["role"] == "system"
+    assert record["messages"][1]["role"] == "user"
+    assert record["messages"][2]["role"] == "assistant"
+    AnalysisResponse.model_validate_json(record["messages"][2]["content"])
+
+
 def test_prepare_splits_balance_and_validate(tmp_path):
     _, config, annotations = fixture_data(tmp_path)
     report = prepare(config, annotations)
